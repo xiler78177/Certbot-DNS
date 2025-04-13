@@ -38,14 +38,14 @@ fi
 
 echo -e "\n[4] 拷贝证书文件到 $CERT_DIR ..."
 mkdir -p "$CERT_DIR"
-cp -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_DIR/cert.pem"
-cp -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERT_DIR/key.pem"
+cp -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
+cp -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERT_DIR/privkey.pem"
 
 echo -e "\n[5] 写入 deploy-hook 自动续期同步脚本..."
 cat > /etc/letsencrypt/renewal-hooks/deploy/copy-cert.sh <<EOF
 #!/bin/bash
-cp -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_DIR/cert.pem"
-cp -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERT_DIR/key.pem"
+cp -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
+cp -f "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERT_DIR/privkey.pem"
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/copy-cert.sh
 
