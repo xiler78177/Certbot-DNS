@@ -1,61 +1,76 @@
 #!/bin/bash
 
-echo "=== Let's Encrypt 证书申请脚本（基于 Cloudflare DNS 验证）==="
+set -e
 
-# 获取用户输入
-read -p "请输入您要申请的域名: " DOMAIN
+echo -e "\n=== Let's Encrypt + Cloudflare 一键证书部署脚本 ===\n"
+
+# 1. 读取用户输入
+read -p "请输入您要申请的域名（如 example.com）: " DOMAIN
 read -p "请输入您的 Cloudflare API Token: " CF_API_TOKEN
 
-CERT_DST="/root/cert/$DOMAIN"
+CERT_PATH="/root/cert/${DOMAIN}"
 
-echo "[1] 安装必要组件..."
-apt update -y && apt install -y curl sudo cron python3-certbot-dns-cloudflare
+echo -e "\n[1] 安装必要组件..."
+apt update -y
+apt install -y certbot python3-certbot-dns-cloudflare curl jq cron
 
-echo "[2] 创建 API 凭证文件..."
-mkdir -p ~/.secrets
-CF_INI=~/.secrets/cloudflare.ini
-cat > "$CF_INI" <<EOF
+# 2. 创建 Cloudflare API 配置文件
+echo -e "\n[2] 创建 Cloudflare API 凭证配置..."
+CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
+cat > "$CLOUDFLARE_CREDENTIALS" <<EOF
 dns_cloudflare_api_token = $CF_API_TOKEN
 EOF
-chmod 600 "$CF_INI"
+chmod 600 "$CLOUDFLARE_CREDENTIALS"
 
-echo "[3] 申请证书中..."
-certbot certonly \
-  --dns-cloudflare \
-  --dns-cloudflare-credentials "$CF_INI" \
-  --dns-cloudflare-propagation-seconds 30 \
-  -d "$DOMAIN" \
-  --non-interactive \
-  --agree-tos \
-  -m your@mail.com
+# 3. 自动添加 A 记录到 Cloudflare
+echo -e "\n[3] 检查并自动添加 A 记录..."
+CF_API="https://api.cloudflare.com/client/v4"
+IP=$(curl -s https://api.ipify.org)
 
-if [ $? -ne 0 ]; then
-  echo "❌ 证书申请失败，请检查 Cloudflare API Token 和域名配置是否正确。"
-  exit 1
+# 获取 zone_id
+ZONE_NAME=$(echo "$DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
+ZONE_ID=$(curl -s -X GET "$CF_API/zones?name=$ZONE_NAME" \
+     -H "Authorization: Bearer $CF_API_TOKEN" \
+     -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+# 检查是否已存在记录
+RECORD_ID=$(curl -s -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=A&name=$DOMAIN" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then
+  echo "未找到 A 记录，正在创建..."
+  curl -s -X POST "$CF_API/zones/$ZONE_ID/dns_records" \
+    -H "Authorization: Bearer $CF_API_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "{\"type\":\"A\",\"name\":\"$DOMAIN\",\"content\":\"$IP\",\"ttl\":120,\"proxied\":false}" > /dev/null
+  echo "✅ A 记录创建成功：$DOMAIN -> $IP"
+else
+  echo "✅ 已存在 A 记录：$DOMAIN"
 fi
 
-echo "[4] 复制证书到 $CERT_DST ..."
-mkdir -p "$CERT_DST"
-cp /etc/letsencrypt/live/$DOMAIN/*.pem "$CERT_DST/"
+# 4. 申请证书
+echo -e "\n[4] 申请 SSL 证书..."
+certbot certonly --dns-cloudflare \
+  --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" \
+  -d "$DOMAIN" --email your@mail.com --agree-tos --no-eff-email --non-interactive
 
-echo "[5] 写入 deploy-hook 脚本以支持自动续期同步..."
-HOOK_SCRIPT="/root/certbot-deploy-hook.sh"
-cat > "$HOOK_SCRIPT" <<EOF
+# 5. 同步证书文件
+echo -e "\n[5] 复制证书文件到 $CERT_PATH"
+mkdir -p "$CERT_PATH"
+cp "/etc/letsencrypt/live/${DOMAIN}/"*.pem "$CERT_PATH/"
+
+# 6. 设置自动续期钩子
+echo -e "\n[6] 设置自动续期钩子脚本..."
+DEPLOY_HOOK="/root/cert-renew-hook-${DOMAIN}.sh"
+cat > "$DEPLOY_HOOK" <<EOF
 #!/bin/bash
-CERT_SRC="/etc/letsencrypt/live/$DOMAIN"
-CERT_DST="/root/cert/$DOMAIN"
-
-mkdir -p "\$CERT_DST"
-cp -f "\$CERT_SRC/privkey.pem" "\$CERT_DST/"
-cp -f "\$CERT_SRC/fullchain.pem" "\$CERT_DST/"
-cp -f "\$CERT_SRC/cert.pem" "\$CERT_DST/"
-cp -f "\$CERT_SRC/chain.pem" "\$CERT_DST/"
+cp /etc/letsencrypt/live/${DOMAIN}/*.pem $CERT_PATH/
 EOF
+chmod +x "$DEPLOY_HOOK"
 
-chmod +x "$HOOK_SCRIPT"
+# 7. 创建定时任务
+echo -e "\n[7] 配置定时任务自动续期..."
+(crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK\" > /dev/null 2>&1") | crontab -
 
-echo "[6] 添加定时续期任务（每天凌晨2点）..."
-(crontab -l 2>/dev/null; echo "0 2 * * * certbot renew --deploy-hook \"$HOOK_SCRIPT\" >> /var/log/letsencrypt/renew.log 2>&1") | crontab -
-
-echo "✅ 完成！证书文件已复制到: $CERT_DST"
-echo "📆 自动续期任务已添加，可通过 crontab -l 查看。"
+echo -e "\n✅ 所有操作完成！证书已申请并配置自动续期。\n证书位置: $CERT_PATH"
