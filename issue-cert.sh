@@ -1,150 +1,153 @@
 #!/bin/bash
 
-CERT_DIR="/root/cert"
-NGINX_CONF_DIR="/etc/nginx/conf.d"
-CONFIG_FILE="/root/ddns_config.json"
+set -e
 
-# 显示主菜单
-main_menu() {
-    while true; do
-        clear
-        echo "=============================="
-        echo "  证书自动化与反代管理脚本"
-        echo "=============================="
-        echo "1. 申请/续期证书"
-        echo "2. 自动添加 DNS 解析 (A/AAAA)"
-        echo "3. 启用 DDNS 动态域名解析"
-        echo "4. 配置 Nginx 反向代理"
-        echo "5. 查看当前配置"
-        echo "0. 退出脚本"
-        echo "=============================="
-        read -p "请输入选项: " choice
+CONFIG_DIR="/root/cert_toolkit"
+mkdir -p "$CONFIG_DIR"
 
-        case $choice in
-            1) issue_cert_menu ;;
-            2) dns_record_menu ;;
-            3) setup_ddns_menu ;;
-            4) nginx_menu ;;
-            5) show_config ;;
-            0) exit 0 ;;
-            *) echo "无效选项，按任意键返回菜单..." ; read ;;
-        esac
-    done
+function get_ip_info() {
+  IPV4=$(curl -s -4 https://api.ipify.org || echo "无")
+  IPV6=$(curl -s -6 https://api6.ipify.org || echo "无")
+
+  echo -e "\n当前主机 IP 信息："
+  echo "IPv4: $IPV4"
+  echo "IPv6: $IPV6"
 }
 
-# 证书申请子菜单
-issue_cert_menu() {
-    clear
-    echo "[申请证书]"
-    read -p "请输入要申请的域名: " DOMAIN
-    read -p "请输入 Cloudflare API Token: " CF_API_TOKEN
-
-    mkdir -p /root/.cf
-    echo "dns_cloudflare_api_token = $CF_API_TOKEN" > /root/.cf/cloudflare.ini
-    chmod 600 /root/.cf/cloudflare.ini
-
-    certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.cf/cloudflare.ini         --dns-cloudflare-propagation-seconds 30 -d "$DOMAIN"         --email your@mail.com --agree-tos --no-eff-email --non-interactive
-
-    mkdir -p "$CERT_DIR/$DOMAIN"
-    cp -L /etc/letsencrypt/live/$DOMAIN/* "$CERT_DIR/$DOMAIN/"
-
-    echo "证书申请完成，已保存到 $CERT_DIR/$DOMAIN"
-    echo "配置自动续期任务"
-    echo "0 4 * * * root certbot renew --deploy-hook 'cp -L /etc/letsencrypt/live/$DOMAIN/* $CERT_DIR/$DOMAIN/'" > /etc/cron.d/cert_renew
-    echo "按任意键返回菜单..." ; read
+function select_ip_version() {
+  get_ip_info
+  echo -e "\n请选择使用的 IP 版本："
+  echo "1) IPv4 ($IPV4)"
+  echo "2) IPv6 ($IPV6)"
+  read -p "请输入选项 [1-2]: " IP_CHOICE
+  if [[ "$IP_CHOICE" == "1" ]]; then
+    SELECTED_IP=$IPV4
+  else
+    SELECTED_IP=$IPV6
+  fi
 }
 
-# DNS 自动添加记录
-dns_record_menu() {
-    clear
-    echo "[DNS 添加记录]"
-    read -p "请输入域名: " DOMAIN
-    read -p "请输入 Cloudflare API Token: " CF_API_TOKEN
+function apply_cert() {
+  read -p "请输入您要申请的域名（如 example.com）: " DOMAIN
+  read -p "请输入您的 Cloudflare API Token: " CF_API_TOKEN
 
-    ipv4=$(curl -s4 ifconfig.co)
-    ipv6=$(curl -s6 ifconfig.co)
-    echo "检测到的 IP:"
-    echo "IPv4: ${ipv4:-无}"
-    echo "IPv6: ${ipv6:-无}"
-    echo "请选择绑定哪一个:"
-    echo "1. IPv4"
-    echo "2. IPv6"
-    echo "0. 返回上一级菜单"
-    read -p "选择 (1/2/0): " ip_choice
+  # 设置证书保存路径
+  DEFAULT_PATH="/root/cert/${DOMAIN}"
+  read -p "请输入证书保存路径（默认: ${DEFAULT_PATH}）: " CUSTOM_PATH
+  CERT_PATH=${CUSTOM_PATH:-$DEFAULT_PATH}
 
-    if [[ $ip_choice == "1" ]]; then
-        ip="$ipv4"
-        type="A"
-    elif [[ $ip_choice == "2" ]]; then
-        ip="$ipv6"
-        type="AAAA"
-    else
-        return
-    fi
+  select_ip_version
+  CLOUDFLARE_CREDENTIALS="$CONFIG_DIR/.cloudflare-${DOMAIN}.ini"
 
-    zone_id=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN#*.}"         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
-    curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records"         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"         --data "{"type":"$type","name":"$DOMAIN","content":"$ip","ttl":120,"proxied":false}" > /dev/null
+  echo -e "\n[1] 安装必要组件..."
+  apt update -y
+  apt install -y certbot python3-certbot-dns-cloudflare curl jq cron nginx
 
-    echo "$type 记录添加完成: $DOMAIN -> $ip"
-    echo "按任意键返回菜单..." ; read
+  echo -e "\n[2] 创建 Cloudflare API 凭证配置..."
+  echo "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CLOUDFLARE_CREDENTIALS"
+  chmod 600 "$CLOUDFLARE_CREDENTIALS"
+
+  echo -e "\n[3] 添加 DNS 记录..."
+  CF_API="https://api.cloudflare.com/client/v4"
+  ZONE_NAME=$(echo "$DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
+  ZONE_ID=$(curl -s -X GET "$CF_API/zones?name=$ZONE_NAME" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
+  RECORD_TYPE="A"
+  [[ "$SELECTED_IP" == *:* ]] && RECORD_TYPE="AAAA"
+  RECORD_ID=$(curl -s -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+  if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then
+    curl -s -X POST "$CF_API/zones/$ZONE_ID/dns_records" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{"type":"$RECORD_TYPE","name":"$DOMAIN","content":"$SELECTED_IP","ttl":120,"proxied":false}" > /dev/null
+    echo "✅ DNS记录创建成功：$DOMAIN -> $SELECTED_IP"
+  else
+    echo "✅ DNS记录已存在：$DOMAIN"
+  fi
+
+  echo -e "\n[4] 申请 SSL 证书..."
+  certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" -d "$DOMAIN" --email your@mail.com --agree-tos --no-eff-email --non-interactive
+
+  echo -e "\n[5] 复制证书文件到 $CERT_PATH..."
+  mkdir -p "$CERT_PATH"
+  cp "/etc/letsencrypt/live/${DOMAIN}/"*.pem "$CERT_PATH/"
+
+  echo -e "\n[6] 设置自动续期钩子..."
+  DEPLOY_HOOK="$CONFIG_DIR/cert-renew-hook-${DOMAIN}.sh"
+  echo "#!/bin/bash\ncp /etc/letsencrypt/live/${DOMAIN}/*.pem $CERT_PATH/" > "$DEPLOY_HOOK"
+  chmod +x "$DEPLOY_HOOK"
+
+  echo -e "\n[7] 配置自动续期任务..."
+  (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK\" > /dev/null 2>&1") | crontab -
+  echo -e "\n✅ 证书部署完成！"
 }
 
-# 配置 DDNS
-setup_ddns_menu() {
-    clear
-    echo "[设置 DDNS]"
-    read -p "请输入完整域名: " DOMAIN
-    read -p "请输入 Cloudflare API Token: " CF_API_TOKEN
-    read -p "请输入检测间隔时间（分钟）: " INTERVAL
+function ddns_daemon_systemd() {
+  read -p "请输入域名: " DOMAIN
+  read -p "请输入 Cloudflare API Token: " CF_API_TOKEN
+  CLOUDFLARE_CREDENTIALS="$CONFIG_DIR/.cloudflare-${DOMAIN}.ini"
+  echo "dns_cloudflare_api_token = $CF_API_TOKEN" > "$CLOUDFLARE_CREDENTIALS"
 
-    cat > /usr/local/bin/ddns_update.sh <<EOF
+  # 写 DDNS 脚本
+  DDNS_SCRIPT="$CONFIG_DIR/ddns-${DOMAIN}.sh"
+  cat > "$DDNS_SCRIPT" <<EOF
 #!/bin/bash
-IPV4=\$(curl -s4 ifconfig.co)
-RECORD_ID=\$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=\${DOMAIN#*.}" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
-curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/\$RECORD_ID/dns_records" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{"type":"A","name":"$DOMAIN","content":"\$IPV4","ttl":120,"proxied":false}" > /dev/null
+IP_FILE="/tmp/current_ip.txt"
+CF_API="https://api.cloudflare.com/client/v4"
+DOMAIN="$DOMAIN"
+ZONE_NAME=\$(echo "\$DOMAIN" | awk -F. '{print \$(NF-1)"."\$NF}')
+ZONE_ID=\$(curl -s -X GET "\$CF_API/zones?name=\$ZONE_NAME" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+while true; do
+  NEW_IP=\$(curl -s https://api.ipify.org)
+  OLD_IP=\$(cat \$IP_FILE 2>/dev/null)
+  if [[ "\$NEW_IP" != "\$OLD_IP" ]]; then
+    RECORD_ID=\$(curl -s -X GET "\$CF_API/zones/\$ZONE_ID/dns_records?type=A&name=\$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id')
+    curl -s -X PUT "\$CF_API/zones/\$ZONE_ID/dns_records/\$RECORD_ID" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{"type":"A","name":"\$DOMAIN","content":"\$NEW_IP","ttl":120,"proxied":false}"
+    echo "\$NEW_IP" > \$IP_FILE
+    echo "[\$(date)] IP已更新为 \$NEW_IP"
+  fi
+  sleep 300
+done
 EOF
 
-    chmod +x /usr/local/bin/ddns_update.sh
-    echo "*/$INTERVAL * * * * root /usr/local/bin/ddns_update.sh" > /etc/cron.d/ddns_update
-    echo "DDNS 配置完成，每 $INTERVAL 分钟自动更新 IP"
-    echo "按任意键返回菜单..." ; read
-}
+  chmod +x "$DDNS_SCRIPT"
 
-# Nginx 配置
-nginx_menu() {
-    clear
-    echo "[反向代理配置]"
-    read -p "请输入要反代的域名: " DOMAIN
-    read -p "请输入要反代的 IP:PORT（如 192.168.1.100:8000）: " TARGET
+  # 写 systemd service 文件
+  SERVICE_FILE="/etc/systemd/system/ddns-${DOMAIN}.service"
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=DDNS Update for $DOMAIN
+After=network.target
 
-    cat > "$NGINX_CONF_DIR/$DOMAIN.conf" <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
-    location / {
-        proxy_pass http://$TARGET;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-    }
-}
+[Service]
+ExecStart=$DDNS_SCRIPT
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-    nginx -t && systemctl reload nginx
-    echo "反向代理配置已写入: $NGINX_CONF_DIR/$DOMAIN.conf"
-    echo "按任意键返回菜单..." ; read
+  systemctl daemon-reexec
+  systemctl daemon-reload
+  systemctl enable ddns-${DOMAIN}
+  systemctl start ddns-${DOMAIN}
+  echo -e "\n✅ DDNS 守护进程已启动并注册为 systemd 服务: ddns-${DOMAIN}"
 }
 
-# 查看配置
-show_config() {
-    clear
-    echo "[当前配置信息]"
-    echo "- 已申请证书目录:"
-    ls "$CERT_DIR" 2>/dev/null || echo "暂无证书"
-    echo "- 当前 Nginx 配置:"
-    ls "$NGINX_CONF_DIR" 2>/dev/null || echo "暂无反代配置"
-    echo "- DDNS 配置:"
-    cat /etc/cron.d/ddns_update 2>/dev/null || echo "未配置"
-    echo "按任意键返回菜单..." ; read
+function main_menu() {
+  while true; do
+    echo -e "\n=== Let's Encrypt Toolkit 增强版 v3 ==="
+    echo "1) 申请新证书（含 DNS 设置）"
+    echo "2) 启用动态 DNS 守护进程（Systemd 模式）"
+    echo "3) 查看本机 IP 信息"
+    echo "0) 退出"
+    read -p "请选择操作: " CHOICE
+    case $CHOICE in
+      1) apply_cert ;;
+      2) ddns_daemon_systemd ;;
+      3) get_ip_info ;;
+      0) exit 0 ;;
+      *) echo "无效选项，请重试。" ;;
+    esac
+  done
 }
 
 main_menu
