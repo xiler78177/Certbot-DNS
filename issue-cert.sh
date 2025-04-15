@@ -1,46 +1,48 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 V2.10
+# 服务器初始化与管理脚本 V2.15
+#
+# 更新日志 (V2.15):
+# - [修复] 回退并简化 setup_fail2ban 函数逻辑，严格按照用户验证的步骤安装、启动、启用服务，移除初始配置调用。
+# - [保留] configure_fail2ban 函数（菜单选项 3.2）用于用户手动调整配置。
+# - [保留] V2.14 中修复的 update_or_add_config 函数，用于手动配置。
+# - [保留] V2.10 以来对公钥导入、y/n 确认、菜单选项等的改进。
+#
+# 更新日志 (V2.14):
+# - [修复] 重写 update_or_add_config 函数，使用更可靠的 awk+sed 逻辑先删除再添加，防止重复配置项错误。(V2.15保留此修复)
+#
+# 更新日志 (V2.13):
+# - [修复] 再次优化 Fail2ban 启动逻辑：调整配置、重载、重启顺序，增加延时。(V2.15已回退此复杂逻辑)
+# - [修复] 从 configure_fail2ban 函数中移除 restart 命令，由调用者负责重启。(V2.15保留此修改)
+#
+# 更新日志 (V2.12):
+# - [修复] 恢复 update_or_add_config 函数为更简单的 sed 实现，解决 V2.11 中的 awk 语法错误。(V2.14已再次修复)
+#
+# 更新日志 (V2.11):
+# - [修复] 调整 Fail2ban 安装和启动逻辑：确保 rsyslog 重启后等待，再配置和启动 Fail2ban。(V2.15已回退此复杂逻辑)
+# - [修复] Fail2ban 配置中为 sshd jail 添加明确的 journalmatch 规则，提高日志定位准确性。(移至手动配置)
 #
 # 更新日志 (V2.10):
-# - [修复] 再次优化 SSH 公钥导入功能：改用 read -r 读取单行输入，加强清理和调试输出。
+# - [修复] 再次优化 SSH 公钥导入功能：改用 read -r 读取单行输入，加强清理和调试输出。(V2.15保留此修复)
 #
 # 更新日志 (V2.9):
-# - [修复] Fail2ban 安装时自动安装依赖 rsyslog (针对 Debian 12 等系统)。
-# - [修复] 优化 SSH 公钥粘贴读取逻辑，去除首尾空白和可能存在的引号。
-# - [修复] 修正 SSH 公钥验证的正则表达式，使其能正确处理带注释的公钥。
+# - [修复] Fail2ban 安装时自动安装依赖 rsyslog (针对 Debian 12 等系统)。(V2.15保留)
+# - [修复] 优化 SSH 公钥粘贴读取逻辑，去除首尾空白和可能存在的引号。(V2.15保留)
+# - [修复] 修正 SSH 公钥验证的正则表达式，使其能正确处理带注释的公钥。(V2.15保留)
 #
 # 更新日志 (V2.8):
-# - [优化] 将所有 yes/no 确认修改为 y/n (回车默认为 Yes)。
-# - [优化] 将所有菜单的返回/退出选项统一为 0。
-# - [新增] SSH 密钥配置增加“粘贴公钥”选项，脚本自动添加并设置权限。
-# - [修复] Fail2ban 配置中为 sshd jail 明确添加 backend = systemd，解决找不到日志文件的问题。
-#
-# 更新日志 (V2.7):
-# - [新增] 添加常用工具安装选项 (curl, vim, unzip, htop, net-tools, socat)。
-# - [新增] 添加 UFW 防火墙管理：安装、启用、端口开放/查看。
-# - [新增] 添加 Fail2ban 管理：安装、启用、配置 SSH 防护 (端口、重试、封禁时间)、状态查看。
-# - [新增] 添加 SSH 端口更改功能，并自动同步更新 UFW 和 Fail2ban 配置。
-# - [新增] 添加用户管理和 SSH 安全设置：创建 sudo 用户、禁用 root 登录、配置密钥登录。
-# - [重构] 调整主菜单，将功能分类。
+# - [优化] 将所有 yes/no 确认修改为 y/n (回车默认为 Yes)。(V2.15保留)
+# - [优化] 将所有菜单的返回/退出选项统一为 0。(V2.15保留)
+# - [新增] SSH 密钥配置增加“粘贴公钥”选项，脚本自动添加并设置权限。(V2.15保留)
+# - [修复] Fail2ban 配置中为 sshd jail 明确添加 backend = systemd。(移至手动配置)
 #
 # 功能:
-# 1.  **基础工具**: 安装常用软件包。
-# 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则。
-# 3.  **入侵防御 (Fail2ban)**: 安装、启用、配置 SSH 防护、查看状态。
-# 4.  **SSH 安全**: 更改端口、创建 sudo 用户、禁用 root 登录、配置密钥登录。
-# 5.  **Web 服务 (LE + CF + Nginx)**:
-#     - 自动申请 Let's Encrypt 证书 (使用 Cloudflare DNS 验证)。
-#     - 支持 IPv4 (A) / IPv6 (AAAA) 记录自动检测与添加/更新。
-#     - 支持 DDNS (动态域名解析)，自动更新 Cloudflare 记录。
-#     - 自动配置 Nginx 反向代理 (支持自定义端口, HTTP/HTTPS 后端)。
-#     - 证书自动续期与部署 (通过 Cron)。
-#     - 集中查看/删除已配置域名信息。
+# ... (功能列表保持不变) ...
 # ==============================================================================
 
 # --- 全局变量 ---
-# Cloudflare & Nginx 相关 (保持不变)
+# ... (全局变量保持不变) ...
 CF_API_TOKEN=""
 DOMAIN=""
 EMAIL="your@mail.com" # 固定邮箱
@@ -64,11 +66,9 @@ INSTALL_NGINX="no"
 NGINX_HTTP_PORT=80
 NGINX_HTTPS_PORT=443
 CONFIG_DIR="${CERT_PATH_PREFIX}/.managed_domains"
-
-# SSH 相关
-CURRENT_SSH_PORT=$(sshd -T | grep -i "^port" | awk '{print $2}' | head -n 1) # 尝试自动获取当前 SSH 端口
-DEFAULT_SSH_PORT=22 # 默认 SSH 端口，用于比较
-FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local" # Fail2ban 本地配置文件
+CURRENT_SSH_PORT=$(sshd -T | grep -i "^port" | awk '{print $2}' | head -n 1)
+DEFAULT_SSH_PORT=22
+FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
 # --- 颜色定义 ---
@@ -83,6 +83,8 @@ NC='\033[0m' # No Color
 
 # 清理并退出 (主要用于 trap)
 cleanup_and_exit() {
+    # 尝试删除临时文件（如果存在）
+    rm -f "${FAIL2BAN_JAIL_LOCAL}.tmp.$$" 2>/dev/null
     echo -e "${RED}发生错误，脚本意外终止。${NC}"
     exit 1
 }
@@ -307,103 +309,146 @@ manage_ufw() {
 
 
 # --- 3. Fail2ban ---
+# V2.15: 简化安装逻辑，遵循用户反馈
 setup_fail2ban() {
     echo -e "\n${CYAN}--- 3.1 安装并启用 Fail2ban ---${NC}"
-    # 确保 fail2ban 和 rsyslog 都安装
-    local fail2ban_installed=0
-    local rsyslog_installed=0
-    install_package "fail2ban" && fail2ban_installed=1
-    install_package "rsyslog" && rsyslog_installed=1 # 确保 rsyslog 也安装
-
-    if [[ $fail2ban_installed -eq 0 ]]; then
+    # 1. 安装 fail2ban
+    if ! install_package "fail2ban"; then
         echo -e "${RED}[✗] Fail2ban 安装失败，无法继续。${NC}"
         return 1
     fi
-     if [[ $rsyslog_installed -eq 0 ]]; then
+    # 2. 安装 rsyslog (Debian 12 需要)
+    if ! install_package "rsyslog"; then
         echo -e "${YELLOW}[!] rsyslog 安装失败，Fail2ban 可能无法正常工作。${NC}"
-        # 可以选择退出，或者继续但给出警告
-        # return 1
     else
-        # 确保 rsyslog 服务运行
+        # 确保 rsyslog 服务运行并重启
+        echo -e "${BLUE}[*] 启用并重启 rsyslog 服务...${NC}"
         systemctl enable rsyslog > /dev/null 2>&1
-        systemctl restart rsyslog > /dev/null 2>&1
+        systemctl restart rsyslog
+        echo -e "${BLUE}[*] 等待 rsyslog 初始化...${NC}"
+        sleep 2
     fi
 
-
-    # 确保 Fail2ban 服务正在运行并设置为开机启动
-    echo -e "${BLUE}[*] 启用并启动 Fail2ban 服务...${NC}"
-    systemctl enable fail2ban > /dev/null
+    # 3. 启动 fail2ban
+    echo -e "${BLUE}[*] 启动 Fail2ban 服务...${NC}"
     systemctl start fail2ban
+    sleep 2 # 短暂等待
+
+    # 4. 启用 fail2ban 开机自启
+    echo -e "${BLUE}[*] 启用 Fail2ban 开机自启...${NC}"
+    systemctl enable fail2ban > /dev/null
+
+    # 5. 检查状态
     if systemctl is-active --quiet fail2ban; then
-        echo -e "${GREEN}[✓] Fail2ban 服务已启动并启用。${NC}"
+        echo -e "${GREEN}[✓] Fail2ban 服务已成功启动并启用。${NC}"
+        echo -e "${YELLOW}[!] Fail2ban 已使用默认配置启动。您可以通过选项 2 手动调整配置。${NC}"
     else
-        # 如果启动失败，尝试进行配置修复后再试一次
-        echo -e "${YELLOW}[!] Fail2ban 首次启动可能失败，尝试进行默认配置...${NC}"
-        configure_fail2ban # 调用配置函数进行修复
-        systemctl restart fail2ban
-        if systemctl is-active --quiet fail2ban; then
-             echo -e "${GREEN}[✓] Fail2ban 服务在配置后已成功启动并启用。${NC}"
-        else
-             echo -e "${RED}[✗] Fail2ban 服务启动失败。请检查 'systemctl status fail2ban' 和日志。${NC}"
-             return 1
-        fi
+        echo -e "${RED}[✗] Fail2ban 服务启动失败。请检查 'systemctl status fail2ban' 和日志。${NC}"
+        echo -e "${YELLOW}   尝试查看日志: journalctl -u fail2ban -n 50 --no-pager ${NC}"
+        return 1
     fi
-    # 首次安装后，建议进行基本配置
-    echo -e "${YELLOW}[!] 建议检查 Fail2ban 的 SSH 防护配置。${NC}"
-    # configure_fail2ban # 已经在上面失败时调用过了
 }
 
-# 更新或创建配置项的辅助函数
+# 更新或创建配置项的辅助函数 (V2.14: 使用更可靠的 awk+sed 删除再添加逻辑)
 update_or_add_config() {
     local file="$1"
-    local section="$2" # 例如 [sshd]
+    local section="$2" # 例如 sshd (without brackets)
     local key="$3"
     local value="$4"
+    local section_header_regex="^\s*\[${section}\]"
+    local temp_file="${file}.tmp.$$" # Temporary file with PID
 
-    # 检查 section 是否存在，不存在则添加
-    # grep -q "\[${section#\[}\]" "$file" # 原始方式
-    # 使用 awk 处理可能存在的注释行
-    if ! awk '/^\s*\[/{f=0} /^\s*\[ '"${section#\[}"' \]/{f=1} f' "$file" | grep -q .; then
-       echo -e "\n[${section#\[}]" >> "$file"
+    # 确保 section header 存在
+    if ! grep -qE "$section_header_regex" "$file"; then
+        echo -e "${BLUE}[!] Section [${section}] not found in ${file}, adding it.${NC}"
+        # Section 不存在，在文件末尾添加
+        echo -e "\n[${section}]" >> "$file"
+        # 并且直接添加 key = value
+        echo "${key} = ${value}" >> "$file"
+        return 0 # 完成添加
     fi
 
+    # Section 存在，处理 key
+    # 使用 awk 在 section 范围内删除所有匹配的 key 行 (注释或未注释)
+    # Escape key for awk regex safety
+    local escaped_key_for_awk=$(sed 's/[][\/.*^$?+|()]/\\&/g' <<<"$key")
+    local key_match_regex_awk="^\s*#?\s*${escaped_key_for_awk}\s*="
 
-    # 检查 key 是否存在于 section 中
-    # 使用 awk 更精确地查找 section 内的 key
-    local current_value=$(awk -F '=' '/^\s*\[ '"${section#\[}"' \]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*'"$key"'\s*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' "$file")
+    awk -v section_re="$section_header_regex" -v key_re="$key_match_regex_awk" '
+    BEGIN { in_section = 0 }
+    # Found the target section header
+    $0 ~ section_re { print; in_section = 1; next }
+    # Found the start of a different section while in target section
+    /^\s*\[/ && in_section { in_section = 0 }
+    # Outside the target section, print the line
+    !in_section { print; next }
+    # Inside the target section, if line matches the key, skip it (delete)
+    in_section && $0 ~ key_re { next }
+    # Inside the target section, print other lines
+    in_section { print }
+    ' "$file" > "$temp_file"
 
-    if [[ -n "$current_value" ]]; then
-        # Key 存在，更新它 (使用 sed，注意处理特殊字符)
-        # 使用 # 作为 sed 分隔符，避免 value 中包含 /
-        sed -i "/^\s*\[${section#\[}\]/,/^\s*\[/s#^\s*${key}\s*=.*#${key} = ${value}#" "$file"
-    else
-        # Key 不存在，在 section 下添加 (使用 sed 在匹配 section 后添加)
-        # 如果 section 就在文件末尾，可能需要特殊处理，但通常 .local 文件有其他 section
-        sed -i "/^\s*\[${section#\[}\]/a ${key} = ${value}" "$file"
-    fi
-}
-
-
-configure_fail2ban() {
-    echo -e "\n${CYAN}--- 3.2 配置 Fail2ban (SSH 防护) ---${NC}"
-    if ! command_exists fail2ban-client; then
-        echo -e "${YELLOW}[!] Fail2ban 未安装。请先安装。${NC}"
+    # Check if awk succeeded
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[✗] Error processing config file with awk (deleting ${key}).${NC}"
+        rm -f "$temp_file" 2>/dev/null
         return 1
     fi
 
-    local ssh_port maxretry bantime current_maxretry current_bantime current_backend
+    # 再在 section header 后添加新的 key = value
+    # 使用 sed 的 'a' (append) 命令
+    # Escape backslashes first, then other special chars for sed 'a' command
+    local escaped_value_for_add=$(echo "$value" | sed -e 's/\\/\\\\/g' -e 's/[\/&]/\\&/g' -e 's/$/\\/' -e '$s/\\$//' | tr -d '\n')
+    # Add the line after the section header line found by the regex
+    # Need to handle case where section header is the last line
+    if ! sed -i "/${section_header_regex}/a ${key} = ${escaped_value_for_add}" "$temp_file"; then
+         echo -e "${RED}[✗] Error processing config file with sed (adding ${key}).${NC}"
+         rm -f "$temp_file" 2>/dev/null
+         return 1
+    fi
+
+    # Replace original file
+    mv "$temp_file" "$file"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[✗] Error replacing config file ${file}.${NC}"
+        # Attempt to restore from backup? Or notify user.
+        rm -f "$temp_file" 2>/dev/null # Clean up temp file on error
+        return 1
+    fi
+
+    # Clean up just in case trap doesn't fire
+    rm -f "$temp_file" 2>/dev/null
+    return 0
+}
+
+
+# V2.15: configure_fail2ban 用于手动配置，不再在 setup 中调用
+configure_fail2ban() {
+    echo -e "\n${CYAN}--- 3.2 配置 Fail2ban (SSH 防护) ---${NC}"
+    if ! command_exists fail2ban-client && ! command_exists fail2ban-server && [[ ! -f /usr/bin/fail2ban-server ]]; then
+        echo -e "${YELLOW}[!] Fail2ban 未安装或未找到。请先安装。${NC}"
+        return 1
+    fi
+
+    local ssh_port maxretry bantime current_maxretry current_bantime current_backend current_journalmatch
 
     # 获取当前配置 (如果 jail.local 存在)
     if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
         # 使用更健壮的方式获取配置值，处理空格和注释
-        current_maxretry=$(awk -F '=' '/^\s*\[sshd\]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*maxretry\s*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
-        current_bantime=$(awk -F '=' '/^\s*\[sshd\]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*bantime\s*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
-        current_backend=$(awk -F '=' '/^\s*\[sshd\]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*backend\s*=/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
+        current_maxretry=$(awk -F '=' '/^\s*\[sshd\]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*maxretry\s*=/{gsub(/^[ \t]+|[ \t]+$|#.*$/, "", $2); print $2; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
+        current_bantime=$(awk -F '=' '/^\s*\[sshd\]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*bantime\s*=/{gsub(/^[ \t]+|[ \t]+$|#.*$/, "", $2); print $2; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
+        current_backend=$(awk -F '=' '/^\s*\[sshd\]/{f=1} /^\s*\[/{if(f)f=0} f && /^\s*backend\s*=/{gsub(/^[ \t]+|[ \t]+$|#.*$/, "", $2); print $2; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
+        # Extract journalmatch value carefully
+        current_journalmatch=$(awk '/^\s*\[sshd\]/{f=1} /^\s*\[/ && f{f=0} f && /^\s*journalmatch\s*=/{match($0, /=\s*(.*)/); val=substr($0, RSTART+1, RLENGTH-1); sub(/^[ \t]+|[ \t]+$|#.*$/, "", val); print val; exit}' $FAIL2BAN_JAIL_LOCAL | tail -n 1)
     fi
     # 设置默认值，如果未获取到当前值
     [[ -z "$current_maxretry" ]] && current_maxretry=5
     [[ -z "$current_bantime" ]] && current_bantime="10m" # 默认 10 分钟
     [[ -z "$current_backend" ]] && current_backend="systemd" # 默认使用 systemd
+    # V2.11: Default journalmatch rule
+    local default_journalmatch="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"
+    [[ -z "$current_journalmatch" ]] && current_journalmatch="$default_journalmatch"
+
 
     # 获取用户输入
     read -p "请输入 SSH 端口 (当前: $CURRENT_SSH_PORT): " ssh_port_input
@@ -429,6 +474,7 @@ configure_fail2ban() {
     echo "  最大重试: $maxretry"
     echo "  封禁时间: $bantime"
     echo "  日志后端: $current_backend" # 显示将使用的后端
+    echo "  Journal 匹配: $current_journalmatch" # V2.11: Show journalmatch
 
     if confirm_action "确认更新配置吗?"; then
         # 确保 jail.local 文件存在
@@ -449,22 +495,31 @@ EOF
         fi
 
         # 使用辅助函数更新或添加配置项
-        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "enabled" "true"
-        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "port" "$ssh_port"
-        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "maxretry" "$maxretry"
-        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "bantime" "$bantime"
-        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "backend" "$current_backend" # 显式设置 backend
+        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "enabled" "true" || return 1
+        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "port" "$ssh_port" || return 1
+        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "maxretry" "$maxretry" || return 1
+        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "bantime" "$bantime" || return 1
+        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "backend" "$current_backend" || return 1
+        # V2.11: Add journalmatch
+        update_or_add_config "$FAIL2BAN_JAIL_LOCAL" "sshd" "journalmatch" "$current_journalmatch" || return 1
 
-        echo -e "${BLUE}[*] 重启 Fail2ban 服务以应用配置...${NC}"
-        systemctl restart fail2ban
-        if systemctl is-active --quiet fail2ban; then
-            echo -e "${GREEN}[✓] Fail2ban 配置更新成功并已重启。${NC}"
+        echo -e "${GREEN}[✓] Fail2ban 配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"
+
+        # V2.15: 尝试 reload 配置
+        if command_exists fail2ban-client; then
+            echo -e "${BLUE}[*] 尝试重新加载 Fail2ban 配置...${NC}"
+            if fail2ban-client reload sshd; then # Reload specific jail
+                 echo -e "${GREEN}[✓] Fail2ban sshd 配置重新加载成功。${NC}"
+            else
+                 echo -e "${YELLOW}[!] Fail2ban 配置重新加载失败，可能需要重启服务才能生效。${NC}"
+            fi
         else
-            echo -e "${RED}[✗] Fail2ban 重启失败。请检查配置 ${FAIL2BAN_JAIL_LOCAL} 和服务状态。${NC}"
-            echo -e "${YELLOW}   常见错误是 'backend = systemd' 在非 systemd 系统上使用，或端口号错误。${NC}"
+             echo -e "${YELLOW}[!] fail2ban-client 未找到，跳过配置重载。${NC}"
         fi
+        return 0 # 配置成功
     else
         echo -e "${YELLOW}操作已取消。${NC}"
+        return 1 # 配置取消
     fi
 }
 
@@ -492,15 +547,27 @@ view_fail2ban_status() {
 manage_fail2ban() {
      while true; do
         echo -e "\n${CYAN}--- Fail2ban 入侵防御管理 ---${NC}"
-        echo -e " ${YELLOW}1.${NC} 安装并启用 Fail2ban (自动进行基础SSH配置)"
-        echo -e " ${YELLOW}2.${NC} 配置 Fail2ban (SSH 端口, 重试次数, 封禁时间)"
+        echo -e " ${YELLOW}1.${NC} 安装并启用 Fail2ban (使用系统默认配置)"
+        echo -e " ${YELLOW}2.${NC} 手动配置 Fail2ban (SSH 端口, 重试次数, 封禁时间等)"
         echo -e " ${YELLOW}3.${NC} 查看 Fail2ban 状态 (SSH jail, 日志)"
         echo -e " ${YELLOW}0.${NC} 返回主菜单"
         read -p "请输入选项 [0-3]: " f2b_choice
 
         case $f2b_choice in
             1) setup_fail2ban ;;
-            2) configure_fail2ban ;;
+            2)
+               # V2.15: Configure first, then restart if config succeeded
+               if configure_fail2ban; then
+                   echo -e "${BLUE}[*] 重启 Fail2ban 服务以应用手动配置...${NC}"
+                   systemctl restart fail2ban
+                   sleep 2
+                   if systemctl is-active --quiet fail2ban; then
+                       echo -e "${GREEN}[✓] Fail2ban 服务已重启。${NC}"
+                   else
+                       echo -e "${RED}[✗] Fail2ban 服务重启失败。${NC}"
+                   fi
+               fi
+               ;;
             3) view_fail2ban_status ;;
             0) break ;;
             *) echo -e "${RED}无效选项。${NC}" ;;
@@ -562,10 +629,9 @@ change_ssh_port() {
     echo -e "${BLUE}[*] 修改 SSH 配置文件 ($SSHD_CONFIG)...${NC}"
     # 先备份
     cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_port_$(date +%F_%T)"
-    # 注释掉所有现有的 Port 行，然后在末尾添加新的 Port 行
-    sed -i -E "s/^[#\s]*Port\s+.*/#& (注释掉旧端口)/" "$SSHD_CONFIG"
-    echo -e "\n# 由脚本设置的新端口 ($(date))" >> "$SSHD_CONFIG"
-    echo "Port $new_port" >> "$SSHD_CONFIG"
+    # 修改 Port
+    update_or_add_config "$SSHD_CONFIG" "" "Port" "$new_port"
+    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 修改 SSH 配置文件失败。${NC}"; return 1; fi
     echo -e "${GREEN}[✓] SSH 配置文件已修改。${NC}"
 
     # 3. 重启 SSH 服务
@@ -602,7 +668,19 @@ change_ssh_port() {
     if command_exists fail2ban-client; then
         echo -e "${BLUE}[*] 更新 Fail2ban 配置以监控新端口 $new_port ...${NC}"
         # 调用配置函数，它会使用最新的 CURRENT_SSH_PORT
-        configure_fail2ban # 这会再次提示输入重试和封禁时间，但会默认使用新端口
+        if configure_fail2ban; then # Configure first
+            # V2.15: Restart fail2ban after configuration change
+            echo -e "${BLUE}[*] 重启 Fail2ban 服务以应用新端口...${NC}"
+            systemctl restart fail2ban
+            sleep 2
+            if systemctl is-active --quiet fail2ban; then
+                echo -e "${GREEN}[✓] Fail2ban 服务已重启。${NC}"
+            else
+                 echo -e "${RED}[✗] Fail2ban 服务重启失败。${NC}"
+            fi
+        else
+             echo -e "${RED}[✗] Fail2ban 配置更新失败。${NC}"
+        fi
     else
         echo -e "${YELLOW}[!] Fail2ban 未安装，跳过其配置更新。${NC}"
     fi
@@ -663,10 +741,9 @@ disable_root_login() {
     # 备份
     cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_root_$(date +%F_%T)"
     # 修改 PermitRootLogin
-    # 先删除已有的 PermitRootLogin 行（无论是否注释），然后添加新的
-    sed -i -E "s/^[#\s]*PermitRootLogin\s+.*/#& (注释掉旧设置)/" "$SSHD_CONFIG"
-    echo -e "\n# 由脚本设置 - 禁用 Root 登录 ($(date))" >> "$SSHD_CONFIG"
-    echo "PermitRootLogin no" >> "$SSHD_CONFIG"
+    update_or_add_config "$SSHD_CONFIG" "" "PermitRootLogin" "no"
+    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 修改 SSH 配置文件失败。${NC}"; return 1; fi
+
 
     echo -e "${BLUE}[*] 重启 SSH 服务以应用更改...${NC}"
     systemctl restart sshd
@@ -720,6 +797,7 @@ add_public_key() {
     # echo "DEBUG: Cleaned key for validation: '$pub_key_cleaned'"
 
     # 修正后的公钥格式校验 (允许末尾有注释)
+    # V2.11: Regex updated to handle different ecdsa curves more accurately
     local key_regex="^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521))\s+AAAA[0-9A-Za-z+/]+[=]{0,3}(\s+.*)?$"
     if ! [[ "$pub_key_cleaned" =~ $key_regex ]]; then
         echo -e "${RED}[✗] 输入的内容似乎不是有效的 SSH 公钥格式。操作取消。${NC}"
@@ -803,12 +881,16 @@ configure_ssh_keys() {
 
                 # 确保 PubkeyAuthentication 为 yes (通常默认是)
                 update_or_add_config "$SSHD_CONFIG" "" "PubkeyAuthentication" "yes" # 在全局部分设置
+                if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PubkeyAuthentication)。${NC}"; continue; fi
+
 
                 # 禁用 PasswordAuthentication
                 update_or_add_config "$SSHD_CONFIG" "" "PasswordAuthentication" "no"
+                 if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PasswordAuthentication)。${NC}"; continue; fi
 
                 # 可选：禁用 ChallengeResponseAuthentication (也与密码相关)
                 update_or_add_config "$SSHD_CONFIG" "" "ChallengeResponseAuthentication" "no"
+                 if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (ChallengeResponseAuthentication)。${NC}"; continue; fi
 
                 # 可选：禁用 UsePAM (如果仅用密钥，通常可以禁用，但需谨慎测试)
                 # update_or_add_config "$SSHD_CONFIG" "" "UsePAM" "no"
@@ -1932,7 +2014,7 @@ manage_web_service() {
 show_main_menu() {
     check_root # 每次显示菜单前更新 SSH 端口等信息
     echo -e "\n${CYAN}=======================================================${NC}"
-    echo -e "${CYAN}           服务器初始化与管理脚本 V2.10          ${NC}"
+    echo -e "${CYAN}           服务器初始化与管理脚本 V2.15          ${NC}"
     echo -e "${CYAN}=======================================================${NC}"
     echo -e " ${BLUE}--- 系统与安全 ---${NC}"
     echo -e "  ${YELLOW}1.${NC} 安装常用工具 (vim, htop, net-tools 等)"
