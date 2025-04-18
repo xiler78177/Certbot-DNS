@@ -1445,11 +1445,12 @@ setup_nginx_proxy() {
     # 询问后端服务地址和端口
     while [[ -z "$LOCAL_PROXY_PASS" ]]; do
         read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080 或 192.168.1.10:3000): " addr_input
-        # 简单校验格式：包含字母数字点横线，后跟冒号和数字
-        if [[ "$addr_input" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]]; then
+        # V2.18 Fix: Updated regex to support [IPv6]:port format
+        # 校验格式：支持 hostname:port, IPv4:port, [IPv6]:port
+        if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then
             LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"
             echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"
-        else echo -e "${YELLOW}地址格式似乎不正确，请确保是 '地址:端口' 格式。${NC}"; LOCAL_PROXY_PASS=""; fi
+        else echo -e "${YELLOW}地址格式似乎不正确，请确保是 '地址:端口' 或 '[IPv6地址]:端口' 格式。${NC}"; LOCAL_PROXY_PASS=""; fi
     done
 
     echo -e "${BLUE}[*] 生成 Nginx 配置文件: $NGINX_CONF_PATH ...${NC}"
