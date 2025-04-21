@@ -1,4 +1,4 @@
-apt-get update && apt-get install -y curl && bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/issue-cert.sh)
+apt-get update && apt-get install -y curl && bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/v4.sh)
 # 服务器初始化与管理脚本
 # 功能:
 # 1.  **基础工具**: 安装常用软件包。
