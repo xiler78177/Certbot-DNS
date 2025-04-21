@@ -573,16 +573,16 @@ EOF
     echo -e "${GREEN}[✓] Nginx 配置文件已生成并启用: ${NGINX_CONF_PATH}${NC}"; echo -e "${YELLOW}[!] Nginx 配置将在证书申请成功后进行测试和重载。${NC}"; return 0
 }
 
-# 创建 DDNS 更新脚本 (v4: 保留代理状态)
+# 创建 DDNS 更新脚本 (v4.1: 修复 URL 列表处理 Bug)
 create_ddns_script() {
     if [[ "$DDNS_FREQUENCY" -le 0 ]]; then echo "${YELLOW}DDNS 已禁用，跳过创建 DDNS 更新脚本。${NC}"; if [[ -f "$DDNS_SCRIPT_PATH" ]]; then echo "${YELLOW}检测到旧的 DDNS 脚本 $DDNS_SCRIPT_PATH，正在删除...${NC}"; rm -f "$DDNS_SCRIPT_PATH"; fi; return 0; fi
-    echo -e "${BLUE}[*] 创建 DDNS 更新脚本 (v4): $DDNS_SCRIPT_PATH ...${NC}"; mkdir -p "$(dirname "$DDNS_SCRIPT_PATH")"
+    echo -e "${BLUE}[*] 创建 DDNS 更新脚本 (v4.1): $DDNS_SCRIPT_PATH ...${NC}"; mkdir -p "$(dirname "$DDNS_SCRIPT_PATH")"
     local current_token; if [[ -f "$CLOUDFLARE_CREDENTIALS" ]]; then current_token=$(grep dns_cloudflare_api_token "$CLOUDFLARE_CREDENTIALS" | awk '{print $3}'); fi; if [[ -z "$current_token" ]]; then echo -e "${RED}[✗] 无法从 $CLOUDFLARE_CREDENTIALS 读取 API Token，无法创建 DDNS 脚本。${NC}"; return 1; fi
 
-    # DDNS 更新脚本模板 (包含 get_current_ip 修复 和 保留代理状态)
+    # DDNS 更新脚本模板 (修复了 get_current_ip 中的 URL 循环)
     cat > "$DDNS_SCRIPT_PATH" <<EOF
 #!/bin/bash
-# --- DDNS 更新脚本 for ${DOMAIN} (v4 - 保留代理状态) ---
+# --- DDNS 更新脚本 for ${DOMAIN} (v4.1 - 修复 URL 列表 Bug) ---
 
 # --- 配置 ---
 CF_CREDENTIALS_FILE="${CLOUDFLARE_CREDENTIALS}"
@@ -592,27 +592,56 @@ ZONE_ID="${ZONE_ID}"
 CF_API="https://api.cloudflare.com/client/v4"
 LOG_FILE="/var/log/cf_ddns_update_${DOMAIN}.log"
 TIMEOUT=10
+# 定义 IP 查询 URL 列表
 IPV4_URLS=("https://api.ipify.org" "https://ifconfig.me/ip" "https://ipv4.icanhazip.com")
 IPV6_URLS=("https://api64.ipify.org" "https://ifconfig.me/ip" "https://ipv6.icanhazip.com")
 
 # --- 函数 ---
 log_message() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
-# 获取当前公网 IP (包含修复和调试日志)
+# 获取当前公网 IP (修复了 URL 循环)
 get_current_ip() {
-    local type=\$1; local urls; local curl_opt; local curl_ua="Bash-DDNS-Script/1.0"
-    if [[ "\$type" == "A" ]]; then urls=("${IPV4_URLS[@]}"); curl_opt="-4"; elif [[ "\$type" == "AAAA" ]]; then urls=("${IPV6_URLS[@]}"); curl_opt="-6"; else log_message "错误：指定的记录类型无效: \$type"; return 1; fi
-    local ip=""; local raw_output=""
-    for url in "\${urls[@]}"; do
-        log_message "调试：正在查询 \$url ..."; raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1); local curl_exit_status=\$?
-        if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi
-        ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"
-        if [[ -n "\$ip" ]]; then
-            if [[ "\$type" == "A" && "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then log_message "调试：找到有效的 IPv4: \$ip"; echo "\$ip"; return 0; fi
-            if [[ "\$type" == "AAAA" && "\$ip" =~ ^([0-9a-fA-F:]+)$ && "\$ip" == *":"* ]]; then log_message "调试：找到有效的 IPv6: \$ip"; echo "\$ip"; return 0; fi
-            log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'";
-        else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1
-    done; log_message "错误：尝试所有 URL 后，未能从所有来源获取当前的公共 \$type IP 地址。"; return 1
+    local type=\$1
+    local curl_opt
+    local curl_ua="Bash-DDNS-Script/1.0"
+    local ip=""
+    local raw_output=""
+
+    if [[ "\$type" == "A" ]]; then
+        curl_opt="-4"
+        # 直接遍历 IPV4_URLS 数组
+        for url in "\${IPV4_URLS[@]}"; do
+            log_message "调试：正在查询 \$url (IPv4)..."
+            raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1)
+            local curl_exit_status=\$?
+            if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi
+            ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"
+            if [[ -n "\$ip" ]]; then
+                if [[ "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then log_message "调试：找到有效的 IPv4: \$ip"; echo "\$ip"; return 0; fi
+                log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'";
+            else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1
+        done
+    elif [[ "\$type" == "AAAA" ]]; then
+        curl_opt="-6"
+        # 直接遍历 IPV6_URLS 数组
+        for url in "\${IPV6_URLS[@]}"; do
+            log_message "调试：正在查询 \$url (IPv6)..."
+            raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1)
+            local curl_exit_status=\$?
+             if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi
+             ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"
+             if [[ -n "\$ip" ]]; then
+                 if [[ "\$ip" =~ ^([0-9a-fA-F:]+)$ && "\$ip" == *":"* ]]; then log_message "调试：找到有效的 IPv6: \$ip"; echo "\$ip"; return 0; fi
+                 log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'";
+             else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1
+        done
+    else
+        log_message "错误：指定的记录类型无效: \$type"
+        return 1
+    fi
+
+    log_message "错误：尝试所有 URL 后，未能从所有来源获取当前的公共 \$type IP 地址。"
+    return 1
 }
 
 # 获取 Cloudflare DNS 记录信息
@@ -625,16 +654,11 @@ get_cf_record() {
 # 更新 Cloudflare DNS 记录 (v4: 接受代理状态参数)
 update_cf_record() {
     local cf_token=\$1; local record_id=\$2; local new_ip=\$3; local current_proxied_status=\$4 # 新增参数：当前代理状态
-    # 检查代理状态是否为 true 或 false，否则设为 false (安全默认)
-    if [[ "\$current_proxied_status" != "true" && "\$current_proxied_status" != "false" ]]; then
-        log_message "警告：无效的代理状态 '\$current_proxied_status'，将强制设为 false。"
-        current_proxied_status="false"
-    fi
+    if [[ "\$current_proxied_status" != "true" && "\$current_proxied_status" != "false" ]]; then log_message "警告：无效的代理状态 '\$current_proxied_status'，将强制设为 false。"; current_proxied_status="false"; fi
     log_message "调试：准备更新记录 \$record_id，IP: \$new_ip，代理状态: \$current_proxied_status"
     UPDATE_RESULT=\$(curl -s --max-time \$TIMEOUT -X PUT "\$CF_API/zones/\$ZONE_ID/dns_records/\$record_id" \
         -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json" \
         --data "{\"type\":\"\$RECORD_TYPE\",\"name\":\"\$DOMAIN\",\"content\":\"\$new_ip\",\"ttl\":120,\"proxied\":\${current_proxied_status}}") # 使用传入的代理状态
-
     if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (更新记录 - 网络/超时)"; return 1; fi
     if ! echo "\$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (更新记录): \$err_msg"; return 1; fi
     return 0
@@ -666,7 +690,7 @@ fi
 exit 0
 EOF
     # --- DDNS 更新脚本模板结束 ---
-    chmod +x "$DDNS_SCRIPT_PATH"; echo -e "${GREEN}[✓] DDNS 更新脚本 (v4) 创建成功: $DDNS_SCRIPT_PATH ${NC}"; return 0
+    chmod +x "$DDNS_SCRIPT_PATH"; echo -e "${GREEN}[✓] DDNS 更新脚本 (v4.1) 创建成功: $DDNS_SCRIPT_PATH ${NC}"; return 0
 }
 
 # 设置 Cron 定时任务 (证书续期和 DDNS)
