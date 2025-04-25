@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v4 - CF代理切换+DDNS修复)
+# 服务器初始化与管理脚本 (v5 - UFW 交互修复)
 # 功能:
 # 1.  **基础工具**: 安装常用软件包。
-# 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查)。
+# 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 移除 expect 依赖。
 # 3.  **入侵防御 (Fail2ban)**: 安装并配置 SSH 防护、重新配置、查看状态。
 # 4.  **SSH 安全**: 更改端口、创建 sudo 用户、禁用 root 登录、配置密钥登录。
 # 5.  **Web 服务 (LE + CF + Nginx)**:
@@ -138,7 +138,8 @@ install_package() {
 # --- 1. 基础工具 ---
 install_common_tools() {
     echo -e "\n${CYAN}--- 1. 安装基础依赖工具 ---${NC}"
-    local tools="curl jq expect unzip"
+    # 移除 expect，因为它不再被 UFW 部分使用
+    local tools="curl jq unzip"
     local failed=0
     local installed_count=0
     local already_installed_count=0
@@ -170,22 +171,28 @@ install_common_tools() {
     else echo -e "${RED}[✗] 部分基础工具安装失败，请检查上面的错误信息。${NC}"; fi
 }
 
-# --- 2. UFW 防火墙 ---
-# (UFW functions setup_ufw, add_ufw_rule, delete_ufw_rule, view_ufw_rules, ufw_allow_all, ufw_reset_default, manage_ufw 基本不变)
-# ... (代码省略以保持简洁，参考上一版本) ...
+# --- 2. UFW 防火墙 (v5: 移除 expect 依赖) ---
 setup_ufw() {
     echo -e "\n${CYAN}--- 2.1 安装并启用 UFW 防火墙 ---${NC}"
+    # 安装 UFW
     if ! install_package "ufw"; then return 1; fi
-    if ! command_exists expect; then
-        if ! install_package "expect"; then
-            echo -e "${RED}[✗] expect 工具安装失败，可能无法自动处理 UFW 启用确认。${NC}"
-        fi
+
+    # 检查 firewalld 是否活动，如果活动则提示并退出
+    if systemctl is-active --quiet firewalld; then
+        echo -e "${RED}[✗] 检测到 firewalld 正在运行。UFW 不能与 firewalld 同时运行。${NC}"
+        echo -e "${YELLOW}   请先禁用 firewalld: 'sudo systemctl stop firewalld && sudo systemctl disable firewalld'${NC}"
+        return 1
     fi
+
+    # 设置默认规则
     echo -e "${BLUE}[*] 设置 UFW 默认规则 (deny incoming, allow outgoing)...${NC}"
     ufw default deny incoming > /dev/null
     ufw default allow outgoing > /dev/null
+    # 允许当前 SSH 端口
     echo -e "${BLUE}[*] 允许当前 SSH 端口 ($CURRENT_SSH_PORT)...${NC}"
     ufw allow $CURRENT_SSH_PORT/tcp comment "SSH Access (Current)" > /dev/null
+
+    # 询问额外端口
     local extra_ports_input; local extra_ports_array
     read -p "是否需要额外开放其他端口 (例如 80 443 8080，用空格隔开) [留空则跳过]: " extra_ports_input
     if [[ -n "$extra_ports_input" ]]; then
@@ -199,16 +206,27 @@ setup_ufw() {
             else echo -e "  ${YELLOW}[!] '$port' 不是有效的端口号，已跳过。${NC}"; fi
         done
     fi
+
+    # 启用 UFW (直接调用，需要用户手动确认)
     echo -e "${YELLOW}[!] 准备启用 UFW。这将断开除已允许端口外的所有连接。${NC}"
-    if confirm_action "确认启用 UFW 吗?"; then
-        if command_exists expect; then
-            expect -c "set timeout 10; spawn ufw enable; expect { \"Command may disrupt existing ssh connections. Proceed with operation (y|n)?\" { send \"y\r\"; exp_continue } eof }" > /dev/null
-        else ufw enable; fi
-        if ufw status | grep -q "Status: active"; then echo -e "${GREEN}[✓] UFW 已成功启用。${NC}"; ufw status verbose;
-        else echo -e "${RED}[✗] UFW 启用失败。请检查错误信息。${NC}"; return 1; fi
-    else echo -e "${YELLOW}UFW 未启用。${NC}"; fi
+    echo -e "${YELLOW}   您可能需要在下一个提示中输入 'y' 来确认。${NC}"
+    # 直接执行 ufw enable，让用户交互
+    ufw enable
+    local ufw_enable_status=$? # 获取 ufw enable 的退出状态码
+
+    # 检查退出状态码和 UFW 状态
+    if [[ $ufw_enable_status -eq 0 ]] && ufw status | grep -q "Status: active"; then
+        echo -e "${GREEN}[✓] UFW 已成功启用。${NC}"
+        ufw status verbose # 显示详细状态
+    else
+        echo -e "${RED}[✗] UFW 启用失败。请检查上面的错误信息或 UFW 日志。${NC}"
+        # 如果 ufw enable 命令本身失败，状态码通常非 0
+        # 如果用户输入 'n' 取消，状态码通常也是 0，但 status 不会是 active
+        return 1 # 启用失败返回错误
+    fi
     return 0
 }
+
 add_ufw_rule() {
     echo -e "\n${CYAN}--- 2.2 添加 UFW 规则 ---${NC}"
     local port protocol comment rule
@@ -217,10 +235,15 @@ add_ufw_rule() {
     read -p "请输入端口用途备注 (例如 'Web Server HTTP', 'Game Server UDP'): " comment; [[ -z "$comment" ]] && comment="Rule added by script"
     rule="${port}/${protocol}"
     echo -e "${BLUE}[*] 准备添加规则: ufw allow ${rule} comment '${comment}'${NC}"
-    if confirm_action "确认添加此规则吗?"; then
-        ufw allow $rule comment "$comment"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] 规则已添加。请运行 '查看 UFW 规则' 确认。${NC}"; else echo -e "${RED}[✗] 添加规则失败。${NC}"; fi
-    else echo -e "${YELLOW}操作已取消。${NC}"; fi
+    # 直接调用 ufw allow，不需要 expect
+    ufw allow $rule comment "$comment"
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}[✓] 规则已添加。请运行 '查看 UFW 规则' 确认。${NC}"
+    else
+        echo -e "${RED}[✗] 添加规则失败。${NC}"
+    fi
 }
+
 delete_ufw_rule() {
     echo -e "\n${CYAN}--- 2.4 删除 UFW 规则 ---${NC}"
     if ! command_exists ufw || ! ufw status | grep -q "Status: active"; then echo -e "${YELLOW}[!] UFW 未安装或未启用。${NC}"; return; fi
@@ -233,23 +256,40 @@ delete_ufw_rule() {
     for num in "${nums_array[@]}"; do if [[ "$num" =~ ^[1-9][0-9]*$ ]]; then if [[ "$num" -le "$highest_num" ]]; then valid_nums+=("$num"); else echo -e "${YELLOW}[!] 规则编号 '$num' 超出最大范围 ($highest_num)，已忽略。${NC}"; fi; else echo -e "${YELLOW}[!] '$num' 不是有效的规则编号，已忽略。${NC}"; fi; done
     if [[ ${#valid_nums[@]} -eq 0 ]]; then echo -e "${YELLOW}没有有效的规则编号被选中，操作取消。${NC}"; return; fi
     IFS=$'\n' sorted_nums=($(sort -nr <<<"${valid_nums[*]}")); unset IFS
+
     echo -e "${BLUE}[*] 准备删除以下规则编号: ${sorted_nums[*]} ${NC}"
-    if confirm_action "确认删除这些规则吗?"; then
-        local delete_failed=0
-        for num_to_delete in "${sorted_nums[@]}"; do
-            echo -n "  删除规则 $num_to_delete ... "
-            if command_exists expect; then expect -c "set timeout 10; spawn ufw delete $num_to_delete; expect { \"Proceed with operation (y|n)?\" { send \"y\r\"; exp_continue } eof }" > /dev/null; echo -e "${GREEN}已执行删除命令。${NC}";
-            else ufw delete $num_to_delete; if [[ $? -eq 0 ]]; then echo -e "${GREEN}成功。${NC}"; else echo -e "${RED}失败。${NC}"; delete_failed=1; fi; fi
-        done
-        if [[ $delete_failed -eq 0 ]]; then echo -e "${GREEN}[✓] 选定的规则已删除 (或已尝试删除)。${NC}"; else echo -e "${RED}[✗] 部分规则删除失败。${NC}"; fi
-        echo -e "${BLUE}请再次查看规则列表确认结果。${NC}"; view_ufw_rules
-    else echo -e "${YELLOW}操作已取消。${NC}"; fi
+    echo -e "${YELLOW}   您可能需要在下一个提示中为每个规则输入 'y' 来确认删除。${NC}"
+
+    local delete_failed=0
+    # 循环删除选中的规则 (直接调用 ufw delete)
+    for num_to_delete in "${sorted_nums[@]}"; do
+        echo -n "  尝试删除规则 $num_to_delete ... "
+        # 直接执行 ufw delete，让用户交互确认
+        ufw delete $num_to_delete
+        local delete_status=$? # 获取退出状态码
+        if [[ $delete_status -eq 0 ]]; then
+             echo -e "${GREEN}命令执行完毕 (请检查 UFW 输出确认是否成功删除)。${NC}"
+             # 注意：即使用户输入 'n' 取消，ufw delete 也可能返回 0
+        else
+             echo -e "${RED}命令执行失败 (状态码: $delete_status)。${NC}"
+             delete_failed=1
+        fi
+    done
+
+    # 提示用户检查结果，因为脚本无法确切知道是否真的删除了
+    echo -e "\n${BLUE}删除命令已执行完毕。请再次查看规则列表确认结果。${NC}"
+    if [[ $delete_failed -ne 0 ]]; then
+        echo -e "${RED}[✗] 部分删除命令执行失败。${NC}"
+    fi
+    view_ufw_rules # 显示更新后的规则
 }
+
 view_ufw_rules() {
     echo -e "\n${CYAN}--- 2.3 查看 UFW 规则 ---${NC}"
     if ! command_exists ufw; then echo -e "${YELLOW}[!] UFW 未安装。${NC}"; return; fi
     echo -e "${BLUE}当前 UFW 状态和规则:${NC}"; ufw status verbose; echo -e "\n${BLUE}带编号的规则列表 (用于删除):${NC}"; ufw status numbered
 }
+
 ufw_allow_all() {
     echo -e "\n${CYAN}--- 2.5 允许所有 UFW 入站连接 (危险) ---${NC}"; echo -e "${RED}[!] 警告：此操作将允许来自任何源的任何入站连接，会显著降低服务器安全性！${NC}"; echo -e "${YELLOW}   仅在您完全了解风险并有特定需求时（例如临时调试）才执行此操作。${NC}"; echo -e "${YELLOW}   强烈建议在完成后立即恢复默认拒绝规则 (选项 6)。${NC}"
     if ! command_exists ufw || ! ufw status | grep -q "Status: active"; then echo -e "${YELLOW}[!] UFW 未安装或未启用。无法更改默认策略。${NC}"; return; fi
@@ -257,6 +297,7 @@ ufw_allow_all() {
         echo -e "${BLUE}[*] 正在设置默认入站策略为 ALLOW...${NC}"; ufw default allow incoming; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] UFW 默认入站策略已设置为 ALLOW。${NC}"; echo -e "${RED}   请注意：现在所有端口都对外部开放！${NC}"; ufw status verbose; else echo -e "${RED}[✗] 设置默认入站策略失败。${NC}"; fi
     else echo -e "${YELLOW}操作已取消。${NC}"; fi
 }
+
 ufw_reset_default() {
     echo -e "\n${CYAN}--- 2.6 重置 UFW 为默认拒绝规则 ---${NC}"; echo -e "${BLUE}[*] 此操作将执行以下步骤:${NC}"; echo "  1. 设置默认入站策略为 DENY (拒绝)。"; echo "  2. 设置默认出站策略为 ALLOW (允许)。"; echo "  3. 确保当前 SSH 端口 ($CURRENT_SSH_PORT/tcp) 规则存在。"; echo "  4. 重新加载 UFW 规则。"; echo -e "${YELLOW}   注意：除了 SSH 端口外，所有其他之前手动添加的 'allow' 规则将保持不变。${NC}"
     if ! command_exists ufw; then echo -e "${YELLOW}[!] UFW 未安装。无法重置。${NC}"; return; fi
@@ -265,12 +306,14 @@ ufw_reset_default() {
         if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] UFW 已成功重置为默认拒绝策略并重新加载。${NC}"; ufw status verbose; else echo -e "${RED}[✗] UFW 重置或重新加载失败。${NC}"; fi
     else echo -e "${YELLOW}操作已取消。${NC}"; fi
 }
+
 manage_ufw() {
-    while true; do echo -e "\n${CYAN}--- UFW 防火墙管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并启用 UFW (设置默认规则, 允许当前SSH, 可选额外端口)"; echo -e " ${YELLOW}2.${NC} 添加允许规则 (开放端口)"; echo -e " ${YELLOW}3.${NC} 查看当前 UFW 规则"; echo -e " ${YELLOW}4.${NC} 删除 UFW 规则 (按编号)"; echo -e " ${YELLOW}5.${NC} ${RED}允许所有入站连接 (危险!)${NC}"; echo -e " ${YELLOW}6.${NC} 重置为默认拒绝规则 (保留 SSH)"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-6]: " ufw_choice
+    while true; do echo -e "\n${CYAN}--- UFW 防火墙管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并启用 UFW (手动确认启用)"; echo -e " ${YELLOW}2.${NC} 添加允许规则 (开放端口)"; echo -e " ${YELLOW}3.${NC} 查看当前 UFW 规则"; echo -e " ${YELLOW}4.${NC} 删除 UFW 规则 (手动确认删除)"; echo -e " ${YELLOW}5.${NC} ${RED}允许所有入站连接 (危险!)${NC}"; echo -e " ${YELLOW}6.${NC} 重置为默认拒绝规则 (保留 SSH)"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-6]: " ufw_choice
         case $ufw_choice in 1) setup_ufw ;; 2) add_ufw_rule ;; 3) view_ufw_rules ;; 4) delete_ufw_rule ;; 5) ufw_allow_all ;; 6) ufw_reset_default ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $ufw_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
 }
+
 
 # --- 3. Fail2ban ---
 # (Fail2ban functions setup_fail2ban, update_or_add_config, configure_fail2ban, view_fail2ban_status, manage_fail2ban 基本不变)
@@ -462,84 +505,21 @@ get_zone_id() {
 
 # 管理 Cloudflare DNS 记录 (创建或更新, 强制 proxied=false)
 manage_cloudflare_record() {
-    local action="$1" # 操作描述 (例如 "设置")
-    local force_proxy_status="false" # 强制设置为 DNS Only
-    echo -e "${BLUE}[*] ${action} Cloudflare DNS 记录 ($RECORD_TYPE) 并确保代理关闭...${NC}"
-    echo "正在检查 $DOMAIN 的 $RECORD_TYPE 记录..."
-
-    # 获取当前记录信息
-    local RECORD_INFO=$(curl -s --max-time 10 -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$DOMAIN" \
-        -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
-    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (获取记录) 失败。${NC}"; return 1; fi
-    if ! echo "$RECORD_INFO" | jq -e '.success == true' > /dev/null; then echo -e "${RED}[✗] Cloudflare API 返回错误 (获取记录): $(echo "$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
-
-    local RECORD_ID=$(echo "$RECORD_INFO" | jq -r '.result[0].id');
-    local CURRENT_IP=$(echo "$RECORD_INFO" | jq -r '.result[0].content')
-    local CURRENT_PROXIED=$(echo "$RECORD_INFO" | jq -r '.result[0].proxied')
-
-    # 如果记录不存在，则创建 (强制 proxied=false)
-    if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then
-        echo "未找到 $RECORD_TYPE 记录，正在创建 (代理状态: ${force_proxy_status})..."
-        local CREATE_RESULT=$(curl -s --max-time 10 -X POST "$CF_API/zones/$ZONE_ID/dns_records" \
-            -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-            --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$DOMAIN\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":${force_proxy_status}}")
-        if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (创建记录) 失败。${NC}"; return 1; fi
-        if echo "$CREATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] $RECORD_TYPE 记录创建成功: $DOMAIN -> $SELECTED_IP (代理: ${force_proxy_status})${NC}";
-        else echo -e "${RED}[✗] 创建 $RECORD_TYPE 记录失败: $(echo "$CREATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
-    else
-        # 记录已存在，检查 IP 和代理状态是否都需要更新
-        echo "找到 $RECORD_TYPE 记录 (ID: $RECORD_ID)，当前 IP: $CURRENT_IP, 当前代理: $CURRENT_PROXIED"
-        if [[ "$CURRENT_IP" != "$SELECTED_IP" || "$CURRENT_PROXIED" != "$force_proxy_status" ]]; then
-            echo "IP 或代理状态不符，正在更新 (目标 IP: $SELECTED_IP, 目标代理: ${force_proxy_status})..."
-            local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-                -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-                --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$DOMAIN\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":${force_proxy_status}}")
-            if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (更新记录) 失败。${NC}"; return 1; fi
-            if echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] $RECORD_TYPE 记录更新成功: $DOMAIN -> $SELECTED_IP (代理: ${force_proxy_status})${NC}";
-            else echo -e "${RED}[✗] 更新 $RECORD_TYPE 记录失败: $(echo "$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
-        else
-            echo -e "${GREEN}[✓] $RECORD_TYPE 记录已是最新 ($CURRENT_IP, 代理: ${force_proxy_status})，无需更新。${NC}";
-        fi
-    fi
-    return 0
+    local action="$1"; local force_proxy_status="false"; echo -e "${BLUE}[*] ${action} Cloudflare DNS 记录 ($RECORD_TYPE) 并确保代理关闭...${NC}"; echo "正在检查 $DOMAIN 的 $RECORD_TYPE 记录..."
+    local RECORD_INFO=$(curl -s --max-time 10 -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (获取记录) 失败。${NC}"; return 1; fi; if ! echo "$RECORD_INFO" | jq -e '.success == true' > /dev/null; then echo -e "${RED}[✗] Cloudflare API 返回错误 (获取记录): $(echo "$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
+    local RECORD_ID=$(echo "$RECORD_INFO" | jq -r '.result[0].id'); local CURRENT_IP=$(echo "$RECORD_INFO" | jq -r '.result[0].content'); local CURRENT_PROXIED=$(echo "$RECORD_INFO" | jq -r '.result[0].proxied')
+    if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then echo "未找到 $RECORD_TYPE 记录，正在创建 (代理状态: ${force_proxy_status})..."; local CREATE_RESULT=$(curl -s --max-time 10 -X POST "$CF_API/zones/$ZONE_ID/dns_records" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$DOMAIN\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":${force_proxy_status}}"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (创建记录) 失败。${NC}"; return 1; fi; if echo "$CREATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] $RECORD_TYPE 记录创建成功: $DOMAIN -> $SELECTED_IP (代理: ${force_proxy_status})${NC}"; else echo -e "${RED}[✗] 创建 $RECORD_TYPE 记录失败: $(echo "$CREATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
+    else echo "找到 $RECORD_TYPE 记录 (ID: $RECORD_ID)，当前 IP: $CURRENT_IP, 当前代理: $CURRENT_PROXIED"; if [[ "$CURRENT_IP" != "$SELECTED_IP" || "$CURRENT_PROXIED" != "$force_proxy_status" ]]; then echo "IP 或代理状态不符，正在更新 (目标 IP: $SELECTED_IP, 目标代理: ${force_proxy_status})..."; local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$DOMAIN\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":${force_proxy_status}}"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (更新记录) 失败。${NC}"; return 1; fi; if echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] $RECORD_TYPE 记录更新成功: $DOMAIN -> $SELECTED_IP (代理: ${force_proxy_status})${NC}"; else echo -e "${RED}[✗] 更新 $RECORD_TYPE 记录失败: $(echo "$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi; else echo -e "${GREEN}[✓] $RECORD_TYPE 记录已是最新 ($CURRENT_IP, 代理: ${force_proxy_status})，无需更新。${NC}"; fi; fi; return 0
 }
 
-# 新增：开启 Cloudflare 代理状态
+# 开启 Cloudflare 代理状态
 enable_cloudflare_proxy() {
-    local domain_to_proxy="$1"
-    echo -e "${BLUE}[*] 尝试为域名 $domain_to_proxy 开启 Cloudflare 代理 (橙色云朵)...${NC}"
-
-    # 需要 ZONE_ID, RECORD_TYPE, CF_API_TOKEN, SELECTED_IP (当前IP)
-    # 这些变量应该在调用此函数时仍然有效 (在 add_new_domain 流程中)
-    if [[ -z "$ZONE_ID" || -z "$RECORD_TYPE" || -z "$CF_API_TOKEN" || -z "$SELECTED_IP" || -z "$domain_to_proxy" ]]; then
-        echo -e "${RED}[✗] 缺少必要信息 (Zone ID, Record Type, Token, IP, Domain)，无法开启代理。${NC}"
-        return 1
-    fi
-
-    # 1. 获取记录 ID (确保记录确实存在)
-    local RECORD_INFO=$(curl -s --max-time 10 -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$domain_to_proxy" \
-        -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
-    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (获取记录 ID) 失败。${NC}"; return 1; fi
-    if ! echo "$RECORD_INFO" | jq -e '.success == true' > /dev/null; then echo -e "${RED}[✗] Cloudflare API 返回错误 (获取记录 ID): $(echo "$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
-    local RECORD_ID=$(echo "$RECORD_INFO" | jq -r '.result[0].id');
-    if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then echo -e "${RED}[✗] 未找到域名 $domain_to_proxy 的 $RECORD_TYPE 记录，无法开启代理。${NC}"; return 1; fi
-
-    # 2. 更新记录，设置 proxied=true
-    echo "正在更新记录 $RECORD_ID，设置 proxied=true ..."
-    local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" \
-        -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-        --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$domain_to_proxy\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":true}") # 设置 proxied 为 true
-
-    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (设置代理) 失败。${NC}"; return 1; fi
-    if echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then
-        echo -e "${GREEN}[✓] 成功为 $domain_to_proxy ($RECORD_TYPE) 开启 Cloudflare 代理。${NC}";
-        return 0
-    else
-        echo -e "${RED}[✗] 开启 Cloudflare 代理失败: $(echo "$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}";
-        return 1
-    fi
+    local domain_to_proxy="$1"; echo -e "${BLUE}[*] 尝试为域名 $domain_to_proxy 开启 Cloudflare 代理 (橙色云朵)...${NC}"
+    if [[ -z "$ZONE_ID" || -z "$RECORD_TYPE" || -z "$CF_API_TOKEN" || -z "$SELECTED_IP" || -z "$domain_to_proxy" ]]; then echo -e "${RED}[✗] 缺少必要信息 (Zone ID, Record Type, Token, IP, Domain)，无法开启代理。${NC}"; return 1; fi
+    local RECORD_INFO=$(curl -s --max-time 10 -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$domain_to_proxy" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (获取记录 ID) 失败。${NC}"; return 1; fi; if ! echo "$RECORD_INFO" | jq -e '.success == true' > /dev/null; then echo -e "${RED}[✗] Cloudflare API 返回错误 (获取记录 ID): $(echo "$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi; local RECORD_ID=$(echo "$RECORD_INFO" | jq -r '.result[0].id'); if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then echo -e "${RED}[✗] 未找到域名 $domain_to_proxy 的 $RECORD_TYPE 记录，无法开启代理。${NC}"; return 1; fi
+    echo "正在更新记录 $RECORD_ID，设置 proxied=true ..."; local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$domain_to_proxy\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":true}") # 设置 proxied 为 true
+    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (设置代理) 失败。${NC}"; return 1; fi; if echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] 成功为 $domain_to_proxy ($RECORD_TYPE) 开启 Cloudflare 代理。${NC}"; return 0; else echo -e "${RED}[✗] 开启 Cloudflare 代理失败: $(echo "$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
 }
-
 
 # 申请 Let's Encrypt 证书
 request_certificate() {
@@ -582,7 +562,7 @@ create_ddns_script() {
     # DDNS 更新脚本模板 (修复了 get_current_ip 中的 URL 循环)
     cat > "$DDNS_SCRIPT_PATH" <<EOF
 #!/bin/bash
-# --- DDNS 更新脚本 for ${DOMAIN} (v4.1 - 修复 URL 列表 Bug) ---
+# --- DDNS 更新脚本 for ${DOMAIN} (v4.1 - 修复 URL 列表 Bug & 保留代理状态) ---
 
 # --- 配置 ---
 CF_CREDENTIALS_FILE="${CLOUDFLARE_CREDENTIALS}"
@@ -601,92 +581,33 @@ log_message() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 
 # 获取当前公网 IP (修复了 URL 循环)
 get_current_ip() {
-    local type=\$1
-    local curl_opt
-    local curl_ua="Bash-DDNS-Script/1.0"
-    local ip=""
-    local raw_output=""
-
-    if [[ "\$type" == "A" ]]; then
-        curl_opt="-4"
-        # 直接遍历 IPV4_URLS 数组
-        for url in "\${IPV4_URLS[@]}"; do
-            log_message "调试：正在查询 \$url (IPv4)..."
-            raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1)
-            local curl_exit_status=\$?
-            if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi
-            ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"
-            if [[ -n "\$ip" ]]; then
-                if [[ "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then log_message "调试：找到有效的 IPv4: \$ip"; echo "\$ip"; return 0; fi
-                log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'";
-            else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1
-        done
-    elif [[ "\$type" == "AAAA" ]]; then
-        curl_opt="-6"
-        # 直接遍历 IPV6_URLS 数组
-        for url in "\${IPV6_URLS[@]}"; do
-            log_message "调试：正在查询 \$url (IPv6)..."
-            raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1)
-            local curl_exit_status=\$?
-             if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi
-             ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"
-             if [[ -n "\$ip" ]]; then
-                 if [[ "\$ip" =~ ^([0-9a-fA-F:]+)$ && "\$ip" == *":"* ]]; then log_message "调试：找到有效的 IPv6: \$ip"; echo "\$ip"; return 0; fi
-                 log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'";
-             else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1
-        done
-    else
-        log_message "错误：指定的记录类型无效: \$type"
-        return 1
-    fi
-
-    log_message "错误：尝试所有 URL 后，未能从所有来源获取当前的公共 \$type IP 地址。"
-    return 1
+    local type=\$1; local curl_opt; local curl_ua="Bash-DDNS-Script/1.0"; local ip=""; local raw_output=""
+    if [[ "\$type" == "A" ]]; then curl_opt="-4"; for url in "\${IPV4_URLS[@]}"; do log_message "调试：正在查询 \$url (IPv4)..."; raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1); local curl_exit_status=\$?; if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi; ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"; if [[ -n "\$ip" ]]; then if [[ "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then log_message "调试：找到有效的 IPv4: \$ip"; echo "\$ip"; return 0; fi; log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'"; else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1; done
+    elif [[ "\$type" == "AAAA" ]]; then curl_opt="-6"; for url in "\${IPV6_URLS[@]}"; do log_message "调试：正在查询 \$url (IPv6)..."; raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1); local curl_exit_status=\$?; if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi; ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"; if [[ -n "\$ip" ]]; then if [[ "\$ip" =~ ^([0-9a-fA-F:]+)$ && "\$ip" == *":"* ]]; then log_message "调试：找到有效的 IPv6: \$ip"; echo "\$ip"; return 0; fi; log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'"; else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1; done
+    else log_message "错误：指定的记录类型无效: \$type"; return 1; fi
+    log_message "错误：尝试所有 URL 后，未能从所有来源获取当前的公共 \$type IP 地址。"; return 1
 }
 
 # 获取 Cloudflare DNS 记录信息
 get_cf_record() {
-    local cf_token=\$1; RECORD_INFO=\$(curl -s --max-time \$TIMEOUT -X GET "\$CF_API/zones/\$ZONE_ID/dns_records?type=\$RECORD_TYPE&name=\$DOMAIN" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json")
-    if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (获取记录 - 网络/超时)"; return 1; fi; if ! echo "\$RECORD_INFO" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (获取记录): \$err_msg"; return 1; fi
+    local cf_token=\$1; RECORD_INFO=\$(curl -s --max-time \$TIMEOUT -X GET "\$CF_API/zones/\$ZONE_ID/dns_records?type=\$RECORD_TYPE&name=\$DOMAIN" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json"); if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (获取记录 - 网络/超时)"; return 1; fi; if ! echo "\$RECORD_INFO" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (获取记录): \$err_msg"; return 1; fi
     echo "\$RECORD_INFO"; return 0
 }
 
 # 更新 Cloudflare DNS 记录 (v4: 接受代理状态参数)
 update_cf_record() {
-    local cf_token=\$1; local record_id=\$2; local new_ip=\$3; local current_proxied_status=\$4 # 新增参数：当前代理状态
-    if [[ "\$current_proxied_status" != "true" && "\$current_proxied_status" != "false" ]]; then log_message "警告：无效的代理状态 '\$current_proxied_status'，将强制设为 false。"; current_proxied_status="false"; fi
+    local cf_token=\$1; local record_id=\$2; local new_ip=\$3; local current_proxied_status=\$4; if [[ "\$current_proxied_status" != "true" && "\$current_proxied_status" != "false" ]]; then log_message "警告：无效的代理状态 '\$current_proxied_status'，将强制设为 false。"; current_proxied_status="false"; fi
     log_message "调试：准备更新记录 \$record_id，IP: \$new_ip，代理状态: \$current_proxied_status"
-    UPDATE_RESULT=\$(curl -s --max-time \$TIMEOUT -X PUT "\$CF_API/zones/\$ZONE_ID/dns_records/\$record_id" \
-        -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json" \
-        --data "{\"type\":\"\$RECORD_TYPE\",\"name\":\"\$DOMAIN\",\"content\":\"\$new_ip\",\"ttl\":120,\"proxied\":\${current_proxied_status}}") # 使用传入的代理状态
-    if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (更新记录 - 网络/超时)"; return 1; fi
-    if ! echo "\$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (更新记录): \$err_msg"; return 1; fi
-    return 0
+    UPDATE_RESULT=\$(curl -s --max-time \$TIMEOUT -X PUT "\$CF_API/zones/\$ZONE_ID/dns_records/\$record_id" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json" --data "{\"type\":\"\$RECORD_TYPE\",\"name\":\"\$DOMAIN\",\"content\":\"\$new_ip\",\"ttl\":120,\"proxied\":\${current_proxied_status}}")
+    if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (更新记录 - 网络/超时)"; return 1; fi; if ! echo "\$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (更新记录): \$err_msg"; return 1; fi; return 0
 }
 
 # --- DDNS 脚本主逻辑 ---
-mkdir -p \$(dirname "\$LOG_FILE")
-if [[ ! -f "\$CF_CREDENTIALS_FILE" ]]; then log_message "错误：找不到 Cloudflare 凭证文件: \$CF_CREDENTIALS_FILE"; exit 1; fi
-CF_API_TOKEN=\$(grep dns_cloudflare_api_token "\$CF_CREDENTIALS_FILE" | awk '{print \$3}'); if [[ -z "\$CF_API_TOKEN" ]]; then log_message "错误：无法从 \$CF_CREDENTIALS_FILE 读取 Cloudflare API Token"; exit 1; fi
-
-CURRENT_IP=\$(get_current_ip "\$RECORD_TYPE"); if [[ \$? -ne 0 ]]; then exit 1; fi
-
-RECORD_INFO_JSON=\$(get_cf_record "\$CF_API_TOKEN"); if [[ \$? -ne 0 ]]; then exit 1; fi
-
-CF_IP=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].content'); RECORD_ID=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].id'); CF_PROXIED=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].proxied') # 获取当前的代理状态
-
-if [[ -z "\$RECORD_ID" || "\$RECORD_ID" == "null" ]]; then log_message "错误：无法在 Cloudflare 上找到 \$DOMAIN 的 \$RECORD_TYPE 记录。"; exit 1; fi
-if [[ -z "\$CF_IP" || "\$CF_IP" == "null" ]]; then log_message "错误：无法从 Cloudflare 记录中解析 IP 地址 (\$DOMAIN)。"; exit 1; fi
-if [[ -z "\$CF_PROXIED" || "\$CF_PROXIED" == "null" ]]; then log_message "警告：无法从 Cloudflare 记录中解析代理状态 (\$DOMAIN)，将默认为 false。"; CF_PROXIED="false"; fi
-
-if [[ "\$CURRENT_IP" == "\$CF_IP" ]]; then exit 0; # IP 相同，无需更新
-else
-    log_message "信息：IP 地址不匹配。当前: \$CURRENT_IP, Cloudflare: \$CF_IP。正在更新 Cloudflare (代理状态将保持为: \$CF_PROXIED)..."
-    # 调用更新函数，传入获取到的代理状态
-    update_cf_record "\$CF_API_TOKEN" "\$RECORD_ID" "\$CURRENT_IP" "\$CF_PROXIED"
-    if [[ \$? -eq 0 ]]; then log_message "成功：Cloudflare DNS 记录 (\$DOMAIN) 已成功更新为 \$CURRENT_IP (代理状态: \$CF_PROXIED)。"; exit 0;
-    else exit 1; fi # update_cf_record 内部已记录错误
-fi
+mkdir -p \$(dirname "\$LOG_FILE"); if [[ ! -f "\$CF_CREDENTIALS_FILE" ]]; then log_message "错误：找不到 Cloudflare 凭证文件: \$CF_CREDENTIALS_FILE"; exit 1; fi; CF_API_TOKEN=\$(grep dns_cloudflare_api_token "\$CF_CREDENTIALS_FILE" | awk '{print \$3}'); if [[ -z "\$CF_API_TOKEN" ]]; then log_message "错误：无法从 \$CF_CREDENTIALS_FILE 读取 Cloudflare API Token"; exit 1; fi
+CURRENT_IP=\$(get_current_ip "\$RECORD_TYPE"); if [[ \$? -ne 0 ]]; then exit 1; fi; RECORD_INFO_JSON=\$(get_cf_record "\$CF_API_TOKEN"); if [[ \$? -ne 0 ]]; then exit 1; fi
+CF_IP=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].content'); RECORD_ID=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].id'); CF_PROXIED=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].proxied')
+if [[ -z "\$RECORD_ID" || "\$RECORD_ID" == "null" ]]; then log_message "错误：无法在 Cloudflare 上找到 \$DOMAIN 的 \$RECORD_TYPE 记录。"; exit 1; fi; if [[ -z "\$CF_IP" || "\$CF_IP" == "null" ]]; then log_message "错误：无法从 Cloudflare 记录中解析 IP 地址 (\$DOMAIN)。"; exit 1; fi; if [[ -z "\$CF_PROXIED" || "\$CF_PROXIED" == "null" ]]; then log_message "警告：无法从 Cloudflare 记录中解析代理状态 (\$DOMAIN)，将默认为 false。"; CF_PROXIED="false"; fi
+if [[ "\$CURRENT_IP" == "\$CF_IP" ]]; then exit 0; else log_message "信息：IP 地址不匹配。当前: \$CURRENT_IP, Cloudflare: \$CF_IP。正在更新 Cloudflare (代理状态将保持为: \$CF_PROXIED)..."; update_cf_record "\$CF_API_TOKEN" "\$RECORD_ID" "\$CURRENT_IP" "\$CF_PROXIED"; if [[ \$? -eq 0 ]]; then log_message "成功：Cloudflare DNS 记录 (\$DOMAIN) 已成功更新为 \$CURRENT_IP (代理状态: \$CF_PROXIED)。"; exit 0; else exit 1; fi; fi
 exit 0
 EOF
     # --- DDNS 更新脚本模板结束 ---
@@ -751,7 +672,7 @@ delete_domain_config() {
     echo -e "${GREEN}[✓] 域名 ${DOMAIN_TO_DELETE} 的所有相关本地配置已成功删除！${NC}"; DOMAIN="" CF_API_TOKEN="" EMAIL="your@mail.com" CERT_PATH="" CLOUDFLARE_CREDENTIALS="" DEPLOY_HOOK_SCRIPT="" DDNS_SCRIPT_PATH="" DDNS_FREQUENCY=5 RECORD_TYPE="" ZONE_ID="" NGINX_CONF_PATH="" LOCAL_PROXY_PASS="" BACKEND_PROTOCOL="http" NGINX_HTTP_PORT=80 NGINX_HTTPS_PORT=443
 }
 
-# 添加新 Web 服务域名的主流程 (v4)
+# 添加新 Web 服务域名的主流程 (v5)
 add_new_domain() {
     echo -e "\n${CYAN}--- 5.1 添加新 Web 服务域名配置 ---${NC}"
     local overall_success=0 # 0 = success, 1 = failure
@@ -762,35 +683,26 @@ add_new_domain() {
 
     # --- 开始配置流程 ---
     get_user_input_initial || { echo -e "${RED}[✗] 获取用户输入失败。${NC}"; return 1; }
-    # 设置 Nginx (失败不中止，但标记)
     setup_nginx_proxy || { echo -e "${RED}[✗] Nginx 代理配置步骤失败。${NC}"; overall_success=1; }
-    # 创建 CF 凭证 (关键)
     create_cf_credentials || { echo -e "${RED}[✗] 创建 Cloudflare 凭证失败。${NC}"; return 1; }
-    # 检测 IP (关键)
     detect_public_ip || { echo -e "${RED}[✗] 检测公网 IP 失败。${NC}"; return 1; }
-    # 选择记录类型 (关键)
     select_record_type || { echo -e "${RED}[✗] 选择记录类型失败。${NC}"; return 1; }
-    # 获取 Zone ID (关键)
     get_zone_id || { echo -e "${RED}[✗] 获取 Cloudflare Zone ID 失败。${NC}"; return 1; }
-    # 设置 DNS 记录 (强制关闭代理) (关键)
+    # 确保 DNS 记录存在且代理关闭，为证书申请做准备
     manage_cloudflare_record "设置" || { echo -e "${RED}[✗] 设置 Cloudflare DNS 记录失败。${NC}"; return 1; }
 
     # --- 证书申请与后续步骤 ---
     if request_certificate; then
         # 证书申请成功
-        copy_certificate || overall_success=1 # 复制失败不中止，但标记
-
-        # *** 新增：询问并开启 Cloudflare 代理 ***
+        copy_certificate || overall_success=1
+        # 询问并开启 Cloudflare 代理
         if confirm_action "证书申请成功！是否要在 Cloudflare 上为此域名开启代理（橙色云朵）？"; then
-            enable_cloudflare_proxy "$DOMAIN" || overall_success=1 # 开启代理失败不中止，但标记
-        else
-            echo -e "${YELLOW}用户选择不开启 Cloudflare 代理。${NC}"
-        fi
-        # *** 修改结束 ***
-
-        create_ddns_script || overall_success=1 # DDNS 失败不中止，但标记
-        setup_cron_jobs || overall_success=1 # Cron 失败不中止，但标记
-        save_domain_config || overall_success=1 # 保存配置失败不中止，但标记
+            enable_cloudflare_proxy "$DOMAIN" || overall_success=1
+        else echo -e "${YELLOW}用户选择不开启 Cloudflare 代理。${NC}"; fi
+        # 创建 DDNS 脚本 (使用修复后的模板)
+        create_ddns_script || overall_success=1
+        setup_cron_jobs || overall_success=1
+        save_domain_config || overall_success=1
 
         # 测试并重载 Nginx (如果配置了 Nginx)
         if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then
@@ -830,7 +742,7 @@ manage_web_service() {
 # --- 主菜单 ---
 show_main_menu() {
     check_root; local certbot_vsn="未知"; if command_exists certbot; then certbot_vsn=$(certbot --version 2>&1 | awk '{print $2}'); fi
-    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v4 - CF 代理切换)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 安装基础依赖工具 (curl, jq, expect, unzip, snapd)"; echo -e "  ${YELLOW}2.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}3.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}4.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}5.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-5]: " main_choice
+    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v5 - UFW 交互修复)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 安装基础依赖工具 (curl, jq, unzip, snapd)"; echo -e "  ${YELLOW}2.${NC} UFW 防火墙管理 (手动确认)"; echo -e "  ${YELLOW}3.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}4.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}5.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-5]: " main_choice
 }
 
 # --- 脚本入口 ---
