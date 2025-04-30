@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v6 - Zone ID 修复)
+# 服务器初始化与管理脚本 (v7 - 语法修复)
 # 功能:
 # 1.  **基础工具**: 安装常用软件包。
 # 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 移除 expect 依赖。
@@ -174,15 +174,7 @@ install_common_tools() {
 
 # --- 2. UFW 防火墙 (v5: 移除 expect 依赖) ---
 setup_ufw() {
-    echo -e "\n${CYAN}--- 2.1 安装并启用 UFW 防火墙 ---${NC}"
-    if ! install_package "ufw"; then return 1; fi
-    if systemctl is-active --quiet firewalld; then echo -e "${RED}[✗] 检测到 firewalld 正在运行。UFW 不能与 firewalld 同时运行。${NC}"; echo -e "${YELLOW}   请先禁用 firewalld: 'sudo systemctl stop firewalld && sudo systemctl disable firewalld'${NC}"; return 1; fi
-    echo -e "${BLUE}[*] 设置 UFW 默认规则 (deny incoming, allow outgoing)...${NC}"; ufw default deny incoming > /dev/null; ufw default allow outgoing > /dev/null
-    echo -e "${BLUE}[*] 允许当前 SSH 端口 ($CURRENT_SSH_PORT)...${NC}"; ufw allow $CURRENT_SSH_PORT/tcp comment "SSH Access (Current)" > /dev/null
-    local extra_ports_input; local extra_ports_array; read -p "是否需要额外开放其他端口 (例如 80 443 8080，用空格隔开) [留空则跳过]: " extra_ports_input
-    if [[ -n "$extra_ports_input" ]]; then read -a extra_ports_array <<< "$extra_ports_input"; echo -e "${BLUE}[*] 尝试开放额外端口: ${extra_ports_array[*]} (默认TCP)...${NC}"; for port in "${extra_ports_array[@]}"; do if [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]]; then ufw allow $port/tcp comment "Extra port added during setup" > /dev/null; if [[ $? -eq 0 ]]; then echo -e "  ${GREEN}[✓] 端口 $port/tcp 已添加规则。${NC}"; else echo -e "  ${RED}[✗] 添加端口 $port/tcp 规则失败。${NC}"; fi; else echo -e "  ${YELLOW}[!] '$port' 不是有效的端口号，已跳过。${NC}"; fi; done; fi
-    echo -e "${YELLOW}[!] 准备启用 UFW。这将断开除已允许端口外的所有连接。${NC}"; echo -e "${YELLOW}   您可能需要在下一个提示中输入 'y' 来确认。${NC}"; ufw enable; local ufw_enable_status=$?
-    if [[ $ufw_enable_status -eq 0 ]] && ufw status | grep -q "Status: active"; then echo -e "${GREEN}[✓] UFW 已成功启用。${NC}"; ufw status verbose; else echo -e "${RED}[✗] UFW 启用失败。请检查上面的错误信息或 UFW 日志。${NC}"; return 1; fi; return 0
+    echo -e "\n${CYAN}--- 2.1 安装并启用 UFW 防火墙 ---${NC}"; if ! install_package "ufw"; then return 1; fi; if systemctl is-active --quiet firewalld; then echo -e "${RED}[✗] 检测到 firewalld 正在运行。UFW 不能与 firewalld 同时运行。${NC}"; echo -e "${YELLOW}   请先禁用 firewalld: 'sudo systemctl stop firewalld && sudo systemctl disable firewalld'${NC}"; return 1; fi; echo -e "${BLUE}[*] 设置 UFW 默认规则 (deny incoming, allow outgoing)...${NC}"; ufw default deny incoming > /dev/null; ufw default allow outgoing > /dev/null; echo -e "${BLUE}[*] 允许当前 SSH 端口 ($CURRENT_SSH_PORT)...${NC}"; ufw allow $CURRENT_SSH_PORT/tcp comment "SSH Access (Current)" > /dev/null; local extra_ports_input; local extra_ports_array; read -p "是否需要额外开放其他端口 (例如 80 443 8080，用空格隔开) [留空则跳过]: " extra_ports_input; if [[ -n "$extra_ports_input" ]]; then read -a extra_ports_array <<< "$extra_ports_input"; echo -e "${BLUE}[*] 尝试开放额外端口: ${extra_ports_array[*]} (默认TCP)...${NC}"; for port in "${extra_ports_array[@]}"; do if [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]]; then ufw allow $port/tcp comment "Extra port added during setup" > /dev/null; if [[ $? -eq 0 ]]; then echo -e "  ${GREEN}[✓] 端口 $port/tcp 已添加规则。${NC}"; else echo -e "  ${RED}[✗] 添加端口 $port/tcp 规则失败。${NC}"; fi; else echo -e "  ${YELLOW}[!] '$port' 不是有效的端口号，已跳过。${NC}"; fi; done; fi; echo -e "${YELLOW}[!] 准备启用 UFW。这将断开除已允许端口外的所有连接。${NC}"; echo -e "${YELLOW}   您可能需要在下一个提示中输入 'y' 来确认。${NC}"; ufw enable; local ufw_enable_status=$?; if [[ $ufw_enable_status -eq 0 ]] && ufw status | grep -q "Status: active"; then echo -e "${GREEN}[✓] UFW 已成功启用。${NC}"; ufw status verbose; else echo -e "${RED}[✗] UFW 启用失败。请检查上面的错误信息或 UFW 日志。${NC}"; return 1; fi; return 0
 }
 add_ufw_rule() {
     echo -e "\n${CYAN}--- 2.2 添加 UFW 规则 ---${NC}"; local port protocol comment rule; while true; do read -p "请输入要开放的端口号 (例如 80, 443, 8080): " port; if [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]]; then break; else echo -e "${YELLOW}无效的端口号。请输入 1-65535 之间的数字。${NC}"; fi; done; while true; do read -p "请选择协议 [1] TCP (默认) [2] UDP : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then protocol="tcp"; break; elif [[ "$proto_choice" == "2" ]]; then protocol="udp"; break; else echo -e "${YELLOW}无效输入，请输入 1 或 2。${NC}"; fi; done; read -p "请输入端口用途备注 (例如 'Web Server HTTP', 'Game Server UDP'): " comment; [[ -z "$comment" ]] && comment="Rule added by script"; rule="${port}/${protocol}"; echo -e "${BLUE}[*] 准备添加规则: ufw allow ${rule} comment '${comment}'${NC}"; ufw allow $rule comment "$comment"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] 规则已添加。请运行 '查看 UFW 规则' 确认。${NC}"; else echo -e "${RED}[✗] 添加规则失败。${NC}"; fi
@@ -204,16 +196,24 @@ manage_ufw() {
 }
 
 # --- 3. Fail2ban ---
-# (Fail2ban functions setup_fail2ban, update_or_add_config, configure_fail2ban, view_fail2ban_status, manage_fail2ban 基本不变)
-# ... (代码省略以保持简洁，参考上一版本) ...
 setup_fail2ban() {
     echo -e "\n${CYAN}--- 3.1 安装并配置 Fail2ban ---${NC}"; if ! install_package "fail2ban"; then echo -e "${RED}[✗] Fail2ban 安装失败，无法继续。${NC}"; return 1; fi; if ! install_package "rsyslog"; then echo -e "${YELLOW}[!] rsyslog 安装失败，Fail2ban 可能无法正常工作。${NC}"; else echo -e "${BLUE}[*] 启用并重启 rsyslog 服务...${NC}"; systemctl enable rsyslog > /dev/null 2>&1; systemctl restart rsyslog; echo -e "${BLUE}[*] 等待 rsyslog 初始化...${NC}"; sleep 2; fi; echo -e "${BLUE}[*] 进行 Fail2ban 初始配置 (${FAIL2BAN_JAIL_LOCAL})...${NC}"; if ! configure_fail2ban; then echo -e "${RED}[✗] Fail2ban 初始配置失败。${NC}"; return 1; fi; echo -e "${GREEN}[✓] Fail2ban 初始配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"; echo -e "${BLUE}[*] 启用并重启 Fail2ban 服务...${NC}"; systemctl enable fail2ban > /dev/null; systemctl restart fail2ban; sleep 3; if systemctl is-active --quiet fail2ban; then echo -e "${GREEN}[✓] Fail2ban 服务已成功启动并启用。${NC}"; else echo -e "${RED}[✗] Fail2ban 服务启动失败。请检查 'systemctl status fail2ban' 和日志。${NC}"; echo -e "${YELLOW}   尝试查看日志: journalctl -u fail2ban -n 50 --no-pager ${NC}"; return 1; fi; return 0
 }
 update_or_add_config() {
     local file="$1"; local section="$2"; local key="$3"; local value="$4"; local section_header_regex="^\s*\[${section}\]"; local temp_file_del="${file}.tmp_del.$$" ; local temp_file_add="${file}.tmp_add.$$" ; if [[ -n "$section" ]] && ! grep -qE "$section_header_regex" "$file"; then echo -e "${YELLOW}[!] 段落 [${section}] 在 ${file} 中未找到，将在末尾添加。${NC}"; echo -e "\n[${section}]" >> "$file"; fi; local escaped_key_for_grep=$(sed 's/[.^$*]/\\&/g' <<< "$key"); local key_match_regex_grep="^\s*#?\s*${escaped_key_for_grep}\s*="; grep -vE "$key_match_regex_grep" "$file" > "$temp_file_del"; local grep_status=$?; if [[ $grep_status -gt 1 ]]; then echo -e "${RED}[✗] 使用 grep -v 处理配置文件时出错 (删除 ${key})。状态码: $grep_status${NC}"; rm -f "$temp_file_del" 2>/dev/null; return 1; fi; local escaped_value_for_awk=$(echo "$value" | sed 's/\\/\\\\/g'); local new_line; if [[ "$file" == "$SSHD_CONFIG" ]]; then new_line="${key} ${escaped_value_for_awk}"; else new_line="${key} = ${escaped_value_for_awk}"; fi; if [[ -n "$section" ]]; then awk -v section_re="$section_header_regex" -v new_line="${new_line}" '$0 ~ section_re { print; print new_line; added=1; next } { print } END { if (!added) { print "\n[" section "]\n" new_line } }' "$temp_file_del" > "$temp_file_add"; else cat "$temp_file_del" > "$temp_file_add"; echo "$new_line" >> "$temp_file_add"; fi; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 使用 awk/cat 处理配置文件时出错 (添加 ${key})。${NC}"; rm -f "$temp_file_del" "$temp_file_add" 2>/dev/null; return 1; fi; mv "$temp_file_add" "$file"; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 替换配置文件 ${file} 失败。${NC}"; rm -f "$temp_file_del" "$temp_file_add" 2>/dev/null; return 1; fi; rm -f "$temp_file_del" 2>/dev/null; return 0
 }
+# 配置 Fail2ban (v7: 简化 if/else 结构)
 configure_fail2ban() {
-    echo -e "\n${CYAN}--- 配置 Fail2ban (SSH 防护) ---${NC}"; local ssh_port maxretry bantime backend journalmatch; read -p "请输入要监控的 SSH 端口 (当前: $CURRENT_SSH_PORT): " ssh_port_input; ssh_port=${ssh_port_input:-$CURRENT_SSH_PORT}; read -p "请输入最大重试次数 [默认 5]: " maxretry_input; maxretry=${maxretry_input:-5}; read -p "请输入封禁时间 (例如 60m, 1h, 1d, -1 表示永久) [默认 10m]: " bantime_input; bantime=${bantime_input:-"10m"}; backend="systemd"; journalmatch="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"; if ! [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -gt 0 && "$ssh_port" -le 65535 ]]; then echo -e "${RED}[✗] 无效的 SSH 端口。${NC}"; return 1; fi; if ! [[ "$maxretry" =~ ^[0-9]+$ && "$maxretry" -gt 0 ]]; then echo -e "${RED}[✗] 最大重试次数必须是正整数。${NC}"; return 1; fi; echo -e "${BLUE}[*] 准备使用以下配置覆盖 ${FAIL2BAN_JAIL_LOCAL}:${NC}"; echo "  [sshd]"; echo "  enabled = true"; echo "  port = $ssh_port"; echo "  maxretry = $maxretry"; echo "  bantime = $bantime"; echo "  backend = $backend"; echo "  journalmatch = $journalmatch"; if confirm_action "确认使用此配置覆盖 jail.local 吗?"; then cat > "$FAIL2BAN_JAIL_LOCAL" <<EOF
+    echo -e "\n${CYAN}--- 配置 Fail2ban (SSH 防护) ---${NC}"; local ssh_port maxretry bantime backend journalmatch
+    read -p "请输入要监控的 SSH 端口 (当前: $CURRENT_SSH_PORT): " ssh_port_input; ssh_port=${ssh_port_input:-$CURRENT_SSH_PORT}
+    read -p "请输入最大重试次数 [默认 5]: " maxretry_input; maxretry=${maxretry_input:-5}
+    read -p "请输入封禁时间 (例如 60m, 1h, 1d, -1 表示永久) [默认 10m]: " bantime_input; bantime=${bantime_input:-"10m"}
+    backend="systemd"; journalmatch="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"
+    if ! [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -gt 0 && "$ssh_port" -le 65535 ]]; then echo -e "${RED}[✗] 无效的 SSH 端口。${NC}"; return 1; fi
+    if ! [[ "$maxretry" =~ ^[0-9]+$ && "$maxretry" -gt 0 ]]; then echo -e "${RED}[✗] 最大重试次数必须是正整数。${NC}"; return 1; fi
+    echo -e "${BLUE}[*] 准备使用以下配置覆盖 ${FAIL2BAN_JAIL_LOCAL}:${NC}"; echo "  [sshd]"; echo "  enabled = true"; echo "  port = $ssh_port"; echo "  maxretry = $maxretry"; echo "  bantime = $bantime"; echo "  backend = $backend"; echo "  journalmatch = $journalmatch"
+    if confirm_action "确认使用此配置覆盖 jail.local 吗?"; then
+        cat > "$FAIL2BAN_JAIL_LOCAL" <<EOF
 # Configuration generated by script $(date)
 [DEFAULT]
 bantime = 10m
@@ -226,7 +226,19 @@ bantime = $bantime
 backend = $backend
 journalmatch = $journalmatch
 EOF
-; if [[ $? -eq 0 ]]; then chmod 644 "$FAIL2BAN_JAIL_LOCAL"; echo -e "${GREEN}[✓] Fail2ban 配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"; return 0; else echo -e "${RED}[✗] 写入 Fail2ban 配置文件失败。${NC}"; return 1; fi; else echo -e "${YELLOW}操作已取消。${NC}"; return 1; fi
+        # 检查写入状态并设置权限 (拆分到多行)
+        if [[ $? -eq 0 ]]; then
+            chmod 644 "$FAIL2BAN_JAIL_LOCAL"
+            echo -e "${GREEN}[✓] Fail2ban 配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"
+            return 0
+        else
+            echo -e "${RED}[✗] 写入 Fail2ban 配置文件失败。${NC}"
+            return 1
+        fi
+    else
+        echo -e "${YELLOW}操作已取消。${NC}"
+        return 1
+    fi
 }
 view_fail2ban_status() {
     echo -e "\n${CYAN}--- 3.3 查看 Fail2ban 状态 (SSH) ---${NC}"; if ! command_exists fail2ban-client; then echo -e "${YELLOW}[!] Fail2ban 未安装。${NC}"; return 1; fi; echo -e "${BLUE}Fail2ban SSH jail 状态:${NC}"; fail2ban-client status sshd; echo -e "\n${BLUE}查看 Fail2ban 日志 (最近 20 条):${NC}"; if command_exists journalctl; then journalctl -u fail2ban -n 20 --no-pager --quiet; elif [[ -f /var/log/fail2ban.log ]]; then tail -n 20 /var/log/fail2ban.log; else echo -e "${YELLOW}无法找到 Fail2ban 日志。${NC}"; fi; return 0
@@ -297,41 +309,7 @@ select_record_type() {
 
 # 获取 Cloudflare Zone ID (v6: 使用完整域名查询)
 get_zone_id() {
-    echo -e "${BLUE}[*] 获取 Cloudflare Zone ID (使用域名: $DOMAIN)...${NC}"
-    # 直接使用用户输入的完整域名查询 Zone ID
-    ZONE_ID_JSON=$(curl -s --max-time 10 -X GET "$CF_API/zones?name=$DOMAIN&status=active" \
-         -H "Authorization: Bearer $CF_API_TOKEN" \
-         -H "Content-Type: application/json")
-
-    if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API 失败 (网络错误或超时)。${NC}"; return 1; fi
-    if ! echo "$ZONE_ID_JSON" | jq -e '.success == true' > /dev/null; then
-        local error_msg=$(echo "$ZONE_ID_JSON" | jq -r '.errors[0].message // "未知 API 错误"')
-        echo -e "${RED}[✗] Cloudflare API 返回错误: ${error_msg}${NC}"; return 1;
-    fi
-
-    # 尝试提取第一个结果的 ID
-    ZONE_ID=$(echo "$ZONE_ID_JSON" | jq -r '.result[0].id')
-
-    # 检查是否成功获取 Zone ID
-    if [[ "$ZONE_ID" == "null" || -z "$ZONE_ID" ]]; then
-        # 如果用完整域名找不到，尝试用猜测的根域名再找一次 (作为后备)
-        local guessed_zone=$(echo "$DOMAIN" | awk -F. '{if (NF>2) print $(NF-1)"."$NF; else print $0}')
-        echo -e "${YELLOW}[!] 使用完整域名未直接找到 Zone ID，尝试使用猜测的根域名: $guessed_zone ...${NC}"
-        ZONE_ID_JSON=$(curl -s --max-time 10 -X GET "$CF_API/zones?name=$guessed_zone&status=active" \
-             -H "Authorization: Bearer $CF_API_TOKEN" \
-             -H "Content-Type: application/json")
-        if [[ $? -eq 0 ]] && echo "$ZONE_ID_JSON" | jq -e '.success == true' > /dev/null; then
-             ZONE_ID=$(echo "$ZONE_ID_JSON" | jq -r '.result[0].id')
-        fi
-        # 再次检查
-        if [[ "$ZONE_ID" == "null" || -z "$ZONE_ID" ]]; then
-             echo -e "${RED}[✗] 无法找到与域名 $DOMAIN 或 $guessed_zone 对应的活动 Zone ID。请检查域名和 API Token 是否正确且有 Zone:Read 权限。${NC}"; return 1;
-        fi
-         echo -e "${GREEN}[✓] 通过猜测的根域名找到 Zone ID: $ZONE_ID${NC}"
-    else
-        echo -e "${GREEN}[✓] 通过完整域名找到 Zone ID: $ZONE_ID${NC}"
-    fi
-    return 0
+    echo -e "${BLUE}[*] 获取 Cloudflare Zone ID (使用域名: $DOMAIN)...${NC}"; ZONE_ID_JSON=$(curl -s --max-time 10 -X GET "$CF_API/zones?name=$DOMAIN&status=active" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API 失败 (网络错误或超时)。${NC}"; return 1; fi; if ! echo "$ZONE_ID_JSON" | jq -e '.success == true' > /dev/null; then local error_msg=$(echo "$ZONE_ID_JSON" | jq -r '.errors[0].message // "未知 API 错误"'); echo -e "${RED}[✗] Cloudflare API 返回错误: ${error_msg}${NC}"; return 1; fi; ZONE_ID=$(echo "$ZONE_ID_JSON" | jq -r '.result[0].id'); if [[ "$ZONE_ID" == "null" || -z "$ZONE_ID" ]]; then local guessed_zone=$(echo "$DOMAIN" | awk -F. '{if (NF>2) print $(NF-1)"."$NF; else print $0}'); echo -e "${YELLOW}[!] 使用完整域名未直接找到 Zone ID，尝试使用猜测的根域名: $guessed_zone ...${NC}"; ZONE_ID_JSON=$(curl -s --max-time 10 -X GET "$CF_API/zones?name=$guessed_zone&status=active" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -eq 0 ]] && echo "$ZONE_ID_JSON" | jq -e '.success == true' > /dev/null; then ZONE_ID=$(echo "$ZONE_ID_JSON" | jq -r '.result[0].id'); fi; if [[ "$ZONE_ID" == "null" || -z "$ZONE_ID" ]]; then echo -e "${RED}[✗] 无法找到与域名 $DOMAIN 或 $guessed_zone 对应的活动 Zone ID。请检查域名和 API Token 是否正确且有 Zone:Read 权限。${NC}"; return 1; fi; echo -e "${GREEN}[✓] 通过猜测的根域名找到 Zone ID: $ZONE_ID${NC}"; else echo -e "${GREEN}[✓] 通过完整域名找到 Zone ID: $ZONE_ID${NC}"; fi; return 0
 }
 
 # 管理 Cloudflare DNS 记录 (创建或更新, 强制 proxied=false)
