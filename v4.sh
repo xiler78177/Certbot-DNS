@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v7 - 语法修复)
+# 服务器初始化与管理脚本 (v8 - 语法修复 2)
 # 功能:
 # 1.  **基础工具**: 安装常用软件包。
 # 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 移除 expect 依赖。
@@ -138,38 +138,7 @@ install_package() {
 
 # --- 1. 基础工具 ---
 install_common_tools() {
-    echo -e "\n${CYAN}--- 1. 安装基础依赖工具 ---${NC}"
-    # 移除 expect
-    local tools="curl jq unzip"
-    local failed=0
-    local installed_count=0
-    local already_installed_count=0
-
-    echo -e "${BLUE}[*] 检查并安装基础工具: ${tools}...${NC}"
-    for tool in $tools; do
-        if dpkg -s "$tool" &> /dev/null; then
-            echo -e "${YELLOW}[!] $tool 已安装。${NC}"
-            already_installed_count=$((already_installed_count + 1))
-        else
-            install_package "$tool"
-            if [[ $? -ne 0 ]]; then failed=1; else installed_count=$((installed_count + 1)); fi
-        fi
-    done
-
-    # 检查 snapd
-    echo -e "${BLUE}[*] 检查 snapd 是否安装...${NC}"
-    if ! command_exists snap; then
-        echo -e "${YELLOW}[!] snap 命令未找到。尝试安装 snapd...${NC}"
-        install_package "snapd"
-        if ! command_exists snap; then echo -e "${RED}[✗] snapd 安装失败。Certbot 可能无法通过 Snap 安装。${NC}";
-        else echo -e "${GREEN}[✓] snapd 安装成功。${NC}"; sleep 2; fi
-    else echo -e "${GREEN}[✓] snap 命令已找到。${NC}"; fi
-
-    echo -e "\n${CYAN}--- 基础工具安装总结 ---${NC}"
-    echo -e "  新安装: ${GREEN}${installed_count}${NC} 个"
-    echo -e "  已存在: ${YELLOW}${already_installed_count}${NC} 个"
-    if [[ $failed -eq 0 ]]; then echo -e "${GREEN}[✓] 基础工具检查/安装完成。${NC}";
-    else echo -e "${RED}[✗] 部分基础工具安装失败，请检查上面的错误信息。${NC}"; fi
+    echo -e "\n${CYAN}--- 1. 安装基础依赖工具 ---${NC}"; local tools="curl jq unzip"; local failed=0; local installed_count=0; local already_installed_count=0; echo -e "${BLUE}[*] 检查并安装基础工具: ${tools}...${NC}"; for tool in $tools; do if dpkg -s "$tool" &> /dev/null; then echo -e "${YELLOW}[!] $tool 已安装。${NC}"; already_installed_count=$((already_installed_count + 1)); else install_package "$tool"; if [[ $? -ne 0 ]]; then failed=1; else installed_count=$((installed_count + 1)); fi; fi; done; echo -e "${BLUE}[*] 检查 snapd 是否安装...${NC}"; if ! command_exists snap; then echo -e "${YELLOW}[!] snap 命令未找到。尝试安装 snapd...${NC}"; install_package "snapd"; if ! command_exists snap; then echo -e "${RED}[✗] snapd 安装失败。Certbot 可能无法通过 Snap 安装。${NC}"; else echo -e "${GREEN}[✓] snapd 安装成功。${NC}"; sleep 2; fi; else echo -e "${GREEN}[✓] snap 命令已找到。${NC}"; fi; echo -e "\n${CYAN}--- 基础工具安装总结 ---${NC}"; echo -e "  新安装: ${GREEN}${installed_count}${NC} 个"; echo -e "  已存在: ${YELLOW}${already_installed_count}${NC} 个"; if [[ $failed -eq 0 ]]; then echo -e "${GREEN}[✓] 基础工具检查/安装完成。${NC}"; else echo -e "${RED}[✗] 部分基础工具安装失败，请检查上面的错误信息。${NC}"; fi
 }
 
 # --- 2. UFW 防火墙 (v5: 移除 expect 依赖) ---
@@ -204,16 +173,7 @@ update_or_add_config() {
 }
 # 配置 Fail2ban (v7: 简化 if/else 结构)
 configure_fail2ban() {
-    echo -e "\n${CYAN}--- 配置 Fail2ban (SSH 防护) ---${NC}"; local ssh_port maxretry bantime backend journalmatch
-    read -p "请输入要监控的 SSH 端口 (当前: $CURRENT_SSH_PORT): " ssh_port_input; ssh_port=${ssh_port_input:-$CURRENT_SSH_PORT}
-    read -p "请输入最大重试次数 [默认 5]: " maxretry_input; maxretry=${maxretry_input:-5}
-    read -p "请输入封禁时间 (例如 60m, 1h, 1d, -1 表示永久) [默认 10m]: " bantime_input; bantime=${bantime_input:-"10m"}
-    backend="systemd"; journalmatch="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"
-    if ! [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -gt 0 && "$ssh_port" -le 65535 ]]; then echo -e "${RED}[✗] 无效的 SSH 端口。${NC}"; return 1; fi
-    if ! [[ "$maxretry" =~ ^[0-9]+$ && "$maxretry" -gt 0 ]]; then echo -e "${RED}[✗] 最大重试次数必须是正整数。${NC}"; return 1; fi
-    echo -e "${BLUE}[*] 准备使用以下配置覆盖 ${FAIL2BAN_JAIL_LOCAL}:${NC}"; echo "  [sshd]"; echo "  enabled = true"; echo "  port = $ssh_port"; echo "  maxretry = $maxretry"; echo "  bantime = $bantime"; echo "  backend = $backend"; echo "  journalmatch = $journalmatch"
-    if confirm_action "确认使用此配置覆盖 jail.local 吗?"; then
-        cat > "$FAIL2BAN_JAIL_LOCAL" <<EOF
+    echo -e "\n${CYAN}--- 配置 Fail2ban (SSH 防护) ---${NC}"; local ssh_port maxretry bantime backend journalmatch; read -p "请输入要监控的 SSH 端口 (当前: $CURRENT_SSH_PORT): " ssh_port_input; ssh_port=${ssh_port_input:-$CURRENT_SSH_PORT}; read -p "请输入最大重试次数 [默认 5]: " maxretry_input; maxretry=${maxretry_input:-5}; read -p "请输入封禁时间 (例如 60m, 1h, 1d, -1 表示永久) [默认 10m]: " bantime_input; bantime=${bantime_input:-"10m"}; backend="systemd"; journalmatch="_SYSTEMD_UNIT=sshd.service + _COMM=sshd"; if ! [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -gt 0 && "$ssh_port" -le 65535 ]]; then echo -e "${RED}[✗] 无效的 SSH 端口。${NC}"; return 1; fi; if ! [[ "$maxretry" =~ ^[0-9]+$ && "$maxretry" -gt 0 ]]; then echo -e "${RED}[✗] 最大重试次数必须是正整数。${NC}"; return 1; fi; echo -e "${BLUE}[*] 准备使用以下配置覆盖 ${FAIL2BAN_JAIL_LOCAL}:${NC}"; echo "  [sshd]"; echo "  enabled = true"; echo "  port = $ssh_port"; echo "  maxretry = $maxretry"; echo "  bantime = $bantime"; echo "  backend = $backend"; echo "  journalmatch = $journalmatch"; if confirm_action "确认使用此配置覆盖 jail.local 吗?"; then cat > "$FAIL2BAN_JAIL_LOCAL" <<EOF
 # Configuration generated by script $(date)
 [DEFAULT]
 bantime = 10m
@@ -226,19 +186,7 @@ bantime = $bantime
 backend = $backend
 journalmatch = $journalmatch
 EOF
-        # 检查写入状态并设置权限 (拆分到多行)
-        if [[ $? -eq 0 ]]; then
-            chmod 644 "$FAIL2BAN_JAIL_LOCAL"
-            echo -e "${GREEN}[✓] Fail2ban 配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"
-            return 0
-        else
-            echo -e "${RED}[✗] 写入 Fail2ban 配置文件失败。${NC}"
-            return 1
-        fi
-    else
-        echo -e "${YELLOW}操作已取消。${NC}"
-        return 1
-    fi
+; local write_status=$?; if [[ $write_status -eq 0 ]]; then chmod 644 "$FAIL2BAN_JAIL_LOCAL"; echo -e "${GREEN}[✓] Fail2ban 配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"; return 0; else echo -e "${RED}[✗] 写入 Fail2ban 配置文件失败。${NC}"; return 1; fi; else echo -e "${YELLOW}操作已取消。${NC}"; return 1; fi
 }
 view_fail2ban_status() {
     echo -e "\n${CYAN}--- 3.3 查看 Fail2ban 状态 (SSH) ---${NC}"; if ! command_exists fail2ban-client; then echo -e "${YELLOW}[!] Fail2ban 未安装。${NC}"; return 1; fi; echo -e "${BLUE}Fail2ban SSH jail 状态:${NC}"; fail2ban-client status sshd; echo -e "\n${BLUE}查看 Fail2ban 日志 (最近 20 条):${NC}"; if command_exists journalctl; then journalctl -u fail2ban -n 20 --no-pager --quiet; elif [[ -f /var/log/fail2ban.log ]]; then tail -n 20 /var/log/fail2ban.log; else echo -e "${YELLOW}无法找到 Fail2ban 日志。${NC}"; fi; return 0
@@ -286,7 +234,7 @@ update_paths_for_domain() {
     local current_domain="$1"; CERT_PATH="${CERT_PATH_PREFIX}/${current_domain}"; CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${current_domain}.ini"; DEPLOY_HOOK_SCRIPT="/root/cert-renew-hook-${current_domain}.sh"; DDNS_SCRIPT_PATH="/usr/local/bin/cf_ddns_update_${current_domain}.sh"; NGINX_CONF_PATH="/etc/nginx/sites-available/${current_domain}.conf"
 }
 
-# 创建 Cloudflare API Token 凭证文件 (用于 Certbot)
+# 创建 Cloudflare API Token 凭证文件 (用于 Certbot) (v8: 语法修复)
 create_cf_credentials() {
     echo -e "${BLUE}[*] 创建 Cloudflare API Token 凭证文件...${NC}"; mkdir -p "$(dirname "$CLOUDFLARE_CREDENTIALS")"; cat > "$CLOUDFLARE_CREDENTIALS" <<EOF
 # Cloudflare API credentials used by Certbot for domain: ${DOMAIN}
@@ -294,7 +242,15 @@ create_cf_credentials() {
 # Using API Token authentication method
 dns_cloudflare_api_token = $CF_API_TOKEN
 EOF
-; chmod 600 "$CLOUDFLARE_CREDENTIALS"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] 凭证文件创建成功: ${CLOUDFLARE_CREDENTIALS}${NC}"; return 0; else echo -e "${RED}[✗] 创建凭证文件失败 (权限设置?)。${NC}"; return 1; fi
+    # 设置权限并检查
+    chmod 600 "$CLOUDFLARE_CREDENTIALS"
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}[✓] 凭证文件创建成功: ${CLOUDFLARE_CREDENTIALS}${NC}"
+        return 0
+    else
+        echo -e "${RED}[✗] 创建凭证文件失败 (权限设置?)。${NC}"
+        return 1
+    fi
 }
 
 # 检测公网 IP 地址 (IPv4 和 IPv6)
