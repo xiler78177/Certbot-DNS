@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v5 - UFW 交互修复)
+# 服务器初始化与管理脚本 (v5.1 - 优化 Certbot 安装与增加卸载选项)
 # 功能:
 # 1.  **基础工具**: 安装常用软件包。
-# 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 移除 expect 依赖。
-# 3.  **入侵防御 (Fail2ban)**: 安装并配置 SSH 防护、重新配置、查看状态。
+# 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 新增卸载选项。
+# 3.  **入侵防御 (Fail2ban)**: 安装并配置 SSH 防护、重新配置、查看状态 - 新增卸载选项。
 # 4.  **SSH 安全**: 更改端口、创建 sudo 用户、禁用 root 登录、配置密钥登录。
 # 5.  **Web 服务 (LE + CF + Nginx)**:
-#     - 优先使用 Snap 安装/更新 Certbot 以提高兼容性。
+#     - 优化 Certbot 安装逻辑，优先使用 apt 以降低资源占用。
 #     - 自动申请 Let's Encrypt 证书 (使用 Cloudflare DNS 验证 - API Token)。
 #     - 证书申请成功后，可选自动开启 Cloudflare 代理（橙色云朵）。
 #     - 支持 IPv4 (A) / IPv6 (AAAA) 记录自动检测与添加/更新。
@@ -307,17 +307,43 @@ ufw_reset_default() {
     else echo -e "${YELLOW}操作已取消。${NC}"; fi
 }
 
+# 新增 UFW 卸载函数
+uninstall_ufw() {
+    echo -e "\n${RED}--- 警告：即将卸载 UFW 防火墙 ---${NC}"
+    echo -e "${YELLOW}[!] 此操作会移除 UFW 及其所有规则，您的服务器将完全暴露在公网！${NC}"
+    if ! command_exists ufw; then
+        echo -e "${YELLOW}[!] UFW 未安装，无需卸载。${NC}"
+        return 0
+    fi
+    if ! confirm_action "您确定要卸载 UFW 吗？"; then
+        echo -e "${YELLOW}操作已取消。${NC}"
+        return 0
+    fi
+    echo -e "${BLUE}[*] 正在禁用 UFW...${NC}"
+    ufw disable
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[✗] 禁用 UFW 失败。请手动执行 'sudo ufw disable'。${NC}"
+        return 1
+    fi
+    echo -e "${BLUE}[*] 正在彻底移除 UFW...${NC}"
+    apt remove --purge ufw -y
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[✗] 卸载 UFW 失败。请手动执行 'sudo apt remove --purge ufw'。${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[✓] UFW 已成功卸载。${NC}"
+    return 0
+}
+
 manage_ufw() {
-    while true; do echo -e "\n${CYAN}--- UFW 防火墙管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并启用 UFW (手动确认启用)"; echo -e " ${YELLOW}2.${NC} 添加允许规则 (开放端口)"; echo -e " ${YELLOW}3.${NC} 查看当前 UFW 规则"; echo -e " ${YELLOW}4.${NC} 删除 UFW 规则 (手动确认删除)"; echo -e " ${YELLOW}5.${NC} ${RED}允许所有入站连接 (危险!)${NC}"; echo -e " ${YELLOW}6.${NC} 重置为默认拒绝规则 (保留 SSH)"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-6]: " ufw_choice
-        case $ufw_choice in 1) setup_ufw ;; 2) add_ufw_rule ;; 3) view_ufw_rules ;; 4) delete_ufw_rule ;; 5) ufw_allow_all ;; 6) ufw_reset_default ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
+    while true; do echo -e "\n${CYAN}--- UFW 防火墙管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并启用 UFW (手动确认启用)"; echo -e " ${YELLOW}2.${NC} 添加允许规则 (开放端口)"; echo -e " ${YELLOW}3.${NC} 查看当前 UFW 规则"; echo -e " ${YELLOW}4.${NC} 删除 UFW 规则 (手动确认删除)"; echo -e " ${YELLOW}5.${NC} ${RED}允许所有入站连接 (危险!)${NC}"; echo -e " ${YELLOW}6.${NC} 重置为默认拒绝规则 (保留 SSH)"; echo -e " ${YELLOW}7.${NC} ${RED}卸载 UFW 防火墙 (高危!)${NC}"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-7]: " ufw_choice
+        case $ufw_choice in 1) setup_ufw ;; 2) add_ufw_rule ;; 3) view_ufw_rules ;; 4) delete_ufw_rule ;; 5) ufw_allow_all ;; 6) ufw_reset_default ;; 7) uninstall_ufw ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $ufw_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
 }
 
 
 # --- 3. Fail2ban ---
-# (Fail2ban functions setup_fail2ban, update_or_add_config, configure_fail2ban, view_fail2ban_status, manage_fail2ban 基本不变)
-# ... (代码省略以保持简洁，参考上一版本) ...
 setup_fail2ban() {
     echo -e "\n${CYAN}--- 3.1 安装并配置 Fail2ban ---${NC}"
     if ! install_package "fail2ban"; then echo -e "${RED}[✗] Fail2ban 安装失败，无法继续。${NC}"; return 1; fi
@@ -375,16 +401,45 @@ view_fail2ban_status() {
     echo -e "${BLUE}Fail2ban SSH jail 状态:${NC}"; fail2ban-client status sshd; echo -e "\n${BLUE}查看 Fail2ban 日志 (最近 20 条):${NC}"
     if command_exists journalctl; then journalctl -u fail2ban -n 20 --no-pager --quiet; elif [[ -f /var/log/fail2ban.log ]]; then tail -n 20 /var/log/fail2ban.log; else echo -e "${YELLOW}无法找到 Fail2ban 日志。${NC}"; fi; return 0
 }
+
+# 新增 Fail2ban 卸载函数
+uninstall_fail2ban() {
+    echo -e "\n${RED}--- 警告：即将卸载 Fail2ban 入侵防御 ---${NC}"
+    echo -e "${YELLOW}[!] 此操作会移除 Fail2ban 服务，您的 SSH 等服务将不再受到自动暴力破解防御。${NC}"
+    if ! command_exists fail2ban-client; then
+        echo -e "${YELLOW}[!] Fail2ban 未安装，无需卸载。${NC}"
+        return 0
+    fi
+    if ! confirm_action "您确定要卸载 Fail2ban 吗？"; then
+        echo -e "${YELLOW}操作已取消。${NC}"
+        return 0
+    fi
+    echo -e "${BLUE}[*] 正在停止并禁用 Fail2ban 服务...${NC}"
+    systemctl stop fail2ban > /dev/null 2>&1
+    systemctl disable fail2ban > /dev/null 2>&1
+    echo -e "${BLUE}[*] 正在彻底移除 Fail2ban...${NC}"
+    apt remove --purge fail2ban -y
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}[✗] 卸载 Fail2ban 失败。请手动执行 'sudo apt remove --purge fail2ban'。${NC}"
+        return 1
+    fi
+    # 尝试删除脚本生成的配置文件
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+        echo -e "${BLUE}[*] 删除脚本生成的配置文件: ${FAIL2BAN_JAIL_LOCAL}...${NC}"
+        rm -f "$FAIL2BAN_JAIL_LOCAL"
+    fi
+    echo -e "${GREEN}[✓] Fail2ban 已成功卸载。${NC}"
+    return 0
+}
+
 manage_fail2ban() {
-     while true; do echo -e "\n${CYAN}--- Fail2ban 入侵防御管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并配置 Fail2ban (交互式设置 SSH 防护)"; echo -e " ${YELLOW}2.${NC} 重新配置 Fail2ban (覆盖 jail.local, 重启服务)"; echo -e " ${YELLOW}3.${NC} 查看 Fail2ban 状态 (SSH jail, 日志)"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-3]: " f2b_choice
-        case $f2b_choice in 1) setup_fail2ban ;; 2) if configure_fail2ban; then echo -e "${BLUE}[*] 重启 Fail2ban 服务以应用新配置...${NC}"; systemctl restart fail2ban; sleep 2; if systemctl is-active --quiet fail2ban; then echo -e "${GREEN}[✓] Fail2ban 服务已重启。${NC}"; else echo -e "${RED}[✗] Fail2ban 服务重启失败。${NC}"; fi; fi ;; 3) view_fail2ban_status ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
+     while true; do echo -e "\n${CYAN}--- Fail2ban 入侵防御管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并配置 Fail2ban (交互式设置 SSH 防护)"; echo -e " ${YELLOW}2.${NC} 重新配置 Fail2ban (覆盖 jail.local, 重启服务)"; echo -e " ${YELLOW}3.${NC} 查看 Fail2ban 状态 (SSH jail, 日志)"; echo -e " ${YELLOW}4.${NC} ${RED}卸载 Fail2ban${NC}"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-4]: " f2b_choice
+        case $f2b_choice in 1) setup_fail2ban ;; 2) if configure_fail2ban; then echo -e "${BLUE}[*] 重启 Fail2ban 服务以应用新配置...${NC}"; systemctl restart fail2ban; sleep 2; if systemctl is-active --quiet fail2ban; then echo -e "${GREEN}[✓] Fail2ban 服务已重启。${NC}"; else echo -e "${RED}[✗] Fail2ban 服务重启失败。${NC}"; fi; fi ;; 3) view_fail2ban_status ;; 4) uninstall_fail2ban ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $f2b_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
 }
 
 # --- 4. SSH 安全 ---
-# (SSH functions change_ssh_port, create_sudo_user, disable_root_login, add_public_key, configure_ssh_keys, manage_ssh_security 基本不变)
-# ... (代码省略以保持简洁，参考上一版本) ...
 change_ssh_port() {
     echo -e "\n${CYAN}--- 4.1 更改 SSH 端口 ---${NC}"; local new_port old_port; old_port=$CURRENT_SSH_PORT; echo "当前 SSH 端口是: $old_port"
     while true; do read -p "请输入新的 SSH 端口号 (建议 10000-65535): " new_port; if [[ "$new_port" =~ ^[0-9]+$ && "$new_port" -gt 0 && "$new_port" -le 65535 ]]; then if [[ "$new_port" -eq "$old_port" ]]; then echo -e "${YELLOW}新端口与当前端口相同，无需更改。${NC}"; return; fi; break; else echo -e "${YELLOW}无效的端口号。请输入 1-65535 之间的数字。${NC}"; fi; done
@@ -439,17 +494,62 @@ manage_ssh_security() {
 
 # --- 5. Web 服务 (Let's Encrypt + Cloudflare + Nginx) ---
 
-# 处理 Certbot 安装/更新 (优先 Snap)
-install_or_update_certbot_snap() {
-    echo -e "${BLUE}[*] 检查 Certbot 安装情况并优先使用 Snap 版本...${NC}"; local certbot_path certbot_installer="" cf_plugin_snap_name="certbot-dns-cloudflare"
-    if command_exists certbot; then certbot_path=$(command -v certbot); if [[ "$certbot_path" == /snap/* ]]; then echo -e "${GREEN}[✓] 检测到 Certbot (Snap) 已安装在 $certbot_path。${NC}"; certbot_installer="snap"; elif [[ "$certbot_path" == /usr/bin/* || "$certbot_path" == /usr/local/bin/* ]]; then echo -e "${YELLOW}[!] 检测到 Certbot (非 Snap) 已安装在 $certbot_path。此版本可能在旧系统上不兼容 Cloudflare API Token。${NC}"; certbot_installer="apt/other"; else echo -e "${YELLOW}[!] 检测到 Certbot 在未知路径 $certbot_path。${NC}"; certbot_installer="unknown"; fi; else echo -e "${YELLOW}[!] 未检测到 Certbot。${NC}"; certbot_installer="none"; fi
-    if [[ "$certbot_installer" == "apt/other" ]]; then if command_exists snap; then if confirm_action "是否尝试移除当前 Certbot 并安装推荐的 Snap 版本以提高兼容性？"; then echo -e "${BLUE}[*] 正在尝试移除 apt 版本的 Certbot 及 Cloudflare 插件...${NC}"; apt remove -y certbot python3-certbot-* > /dev/null 2>&1; apt autoremove -y > /dev/null 2>&1; echo -e "${BLUE}[*] 开始安装 Certbot (Snap)...${NC}"; if snap install --classic certbot; then ln -sf /snap/bin/certbot /usr/bin/certbot; snap set certbot trust-plugin-with-root=ok; echo -e "${GREEN}[✓] Certbot (Snap) 安装成功。${NC}"; certbot_installer="snap"; else echo -e "${RED}[✗] Certbot (Snap) 安装失败。请检查 snap 错误。脚本将继续，但证书申请可能失败。${NC}"; certbot_installer="failed"; fi; else echo -e "${YELLOW}用户选择不替换为 Snap 版本。将继续使用当前版本，但 Cloudflare 认证可能失败。${NC}"; fi; else echo -e "${YELLOW}[!] Snap 命令不可用，无法自动替换为 Snap 版本。将继续使用当前版本。${NC}"; fi; fi
-    if [[ "$certbot_installer" == "none" ]]; then if command_exists snap; then echo -e "${BLUE}[*] 尝试使用 Snap 安装 Certbot...${NC}"; if snap install --classic certbot; then ln -sf /snap/bin/certbot /usr/bin/certbot; snap set certbot trust-plugin-with-root=ok; echo -e "${GREEN}[✓] Certbot (Snap) 安装成功。${NC}"; certbot_installer="snap"; else echo -e "${RED}[✗] Certbot (Snap) 安装失败。${NC}"; echo -e "${YELLOW}[!] Snap 安装失败，尝试使用 apt 安装 Certbot...${NC}"; if install_package "certbot"; then certbot_installer="apt/other"; fi; fi; else echo -e "${YELLOW}[!] Snap 命令不可用，尝试使用 apt 安装 Certbot...${NC}"; if install_package "certbot"; then certbot_installer="apt/other"; fi; fi; fi
-    if [[ "$certbot_installer" == "snap" ]]; then echo -e "${BLUE}[*] 检查/安装 Certbot Cloudflare 插件 (Snap)...${NC}"; if ! snap list | grep -q "$cf_plugin_snap_name"; then if snap install "$cf_plugin_snap_name"; then echo -e "${GREEN}[✓] Cloudflare 插件 (Snap) 安装成功。${NC}"; else echo -e "${RED}[✗] Cloudflare 插件 (Snap) 安装失败！证书申请将失败。${NC}"; return 1; fi; else echo -e "${GREEN}[✓] Cloudflare 插件 (Snap) 已安装。${NC}"; fi; echo -e "${BLUE}[*] 尝试连接 Certbot 插件...${NC}"; snap connect certbot:plugin certbot-dns-cloudflare &>/dev/null || echo -e "${YELLOW}[!] 无法自动连接插件，可能需要手动执行: sudo snap connect certbot:plugin certbot-dns-cloudflare ${NC}"; snap connect certbot-dns-cloudflare:snapd-access certbot:snapd-access &>/dev/null || true;
-    elif [[ "$certbot_installer" == "apt/other" ]]; then echo -e "${BLUE}[*] 检查/安装 Certbot Cloudflare 插件 (apt)...${NC}"; install_package "python3-certbot-dns-cloudflare" || { echo -e "${RED}[✗] Cloudflare 插件 (apt) 安装失败！证书申请将失败。${NC}"; return 1; }
-    elif [[ "$certbot_installer" == "failed" || "$certbot_installer" == "none" || "$certbot_installer" == "unknown" ]]; then echo -e "${RED}[✗] Certbot 未能成功安装或识别。无法继续 Web 服务配置。${NC}"; return 1; fi
-    if ! command_exists certbot; then echo -e "${RED}[✗] Certbot 命令最终仍未找到！请手动安装 Certbot 及其 Cloudflare 插件。${NC}"; return 1; fi
-    echo -e "${GREEN}[✓] Certbot 环境检查完成。${NC}"; return 0
+# 处理 Certbot 安装/更新 (v5.1: 优化逻辑，优先 apt)
+install_or_update_certbot() {
+    echo -e "${BLUE}[*] 检查 Certbot 安装情况并优先使用 apt 版本...${NC}"
+    local apt_certbot_pkg="certbot"
+    local apt_cf_plugin_pkg="python3-certbot-dns-cloudflare"
+    local snap_certbot_name="certbot"
+    local snap_cf_plugin_name="certbot-dns-cloudflare"
+
+    # 1. 尝试使用 apt 安装
+    if dpkg -s "$apt_certbot_pkg" &> /dev/null && dpkg -s "$apt_cf_plugin_pkg" &> /dev/null; then
+        echo -e "${GREEN}[✓] Certbot 和 Cloudflare 插件 (apt) 已安装。${NC}"
+        return 0
+    else
+        echo -e "${BLUE}[*] 尝试使用 apt 安装 Certbot 及其 Cloudflare 插件...${NC}"
+        if install_package "$apt_certbot_pkg" && install_package "$apt_cf_plugin_pkg"; then
+            echo -e "${GREEN}[✓] Certbot 和 Cloudflare 插件 (apt) 安装成功。${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}[!] apt 安装失败。尝试使用 snap 安装...${NC}"
+            # apt 安装失败，继续到 snap 逻辑
+        fi
+    fi
+
+    # 2. 如果 apt 失败，尝试使用 snap
+    if command_exists snap; then
+        echo -e "${BLUE}[*] 尝试使用 Snap 安装 Certbot...${NC}"
+        if snap install --classic "$snap_certbot_name"; then
+            echo -e "${GREEN}[✓] Certbot (Snap) 安装成功。${NC}"
+            echo -e "${BLUE}[*] 检查/安装 Certbot Cloudflare 插件 (Snap)...${NC}"
+            if snap install "$snap_cf_plugin_name"; then
+                echo -e "${GREEN}[✓] Cloudflare 插件 (Snap) 安装成功。${NC}"
+                echo -e "${BLUE}[*] 尝试连接 Certbot 插件...${NC}"
+                snap connect "$snap_certbot_name:plugin" "$snap_cf_plugin_name" &>/dev/null || echo -e "${YELLOW}[!] 无法自动连接插件，可能需要手动执行: sudo snap connect certbot:plugin certbot-dns-cloudflare ${NC}"
+                snap connect "$snap_cf_plugin_name:snapd-access" "$snap_certbot_name:snapd-access" &>/dev/null || true;
+                # 创建软链接，确保 certbot 命令可用
+                if ! command_exists certbot; then
+                    echo -e "${BLUE}[*] 创建 certbot 软链接...${NC}"
+                    ln -sf /snap/bin/certbot /usr/bin/certbot
+                fi
+                snap set certbot trust-plugin-with-root=ok
+                return 0
+            else
+                echo -e "${RED}[✗] Cloudflare 插件 (Snap) 安装失败！证书申请将失败。${NC}"
+                return 1
+            fi
+        else
+            echo -e "${RED}[✗] Certbot (Snap) 安装失败。${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}[✗] snap 命令不可用，且 apt 安装失败。无法安装 Certbot。${NC}"
+        return 1
+    fi
+    
+    echo -e "${RED}[✗] Certbot 最终未能成功安装。请手动安装 Certbot 及其 Cloudflare 插件。${NC}"
+    return 1
 }
 
 # 获取 Web 服务配置的初始用户输入
@@ -672,13 +772,13 @@ delete_domain_config() {
     echo -e "${GREEN}[✓] 域名 ${DOMAIN_TO_DELETE} 的所有相关本地配置已成功删除！${NC}"; DOMAIN="" CF_API_TOKEN="" EMAIL="your@mail.com" CERT_PATH="" CLOUDFLARE_CREDENTIALS="" DEPLOY_HOOK_SCRIPT="" DDNS_SCRIPT_PATH="" DDNS_FREQUENCY=5 RECORD_TYPE="" ZONE_ID="" NGINX_CONF_PATH="" LOCAL_PROXY_PASS="" BACKEND_PROTOCOL="http" NGINX_HTTP_PORT=80 NGINX_HTTPS_PORT=443
 }
 
-# 添加新 Web 服务域名的主流程 (v5)
+# 添加新 Web 服务域名的主流程 (v5.1)
 add_new_domain() {
     echo -e "\n${CYAN}--- 5.1 添加新 Web 服务域名配置 ---${NC}"
     local overall_success=0 # 0 = success, 1 = failure
 
-    # 0. 确保 Certbot (优先 Snap) 和 Nginx 已安装
-    if ! install_or_update_certbot_snap; then echo -e "${RED}[✗] Certbot 环境设置失败，无法继续。${NC}"; return 1; fi
+    # 0. 确保 Certbot 和 Nginx 已安装
+    if ! install_or_update_certbot; then echo -e "${RED}[✗] Certbot 环境设置失败，无法继续。${NC}"; return 1; fi
     echo -e "${BLUE}[*] 检查并安装 Nginx...${NC}"; if ! install_package "nginx"; then echo -e "${RED}[✗] Nginx 安装失败，无法继续配置 Web 服务。${NC}"; return 1; fi
 
     # --- 开始配置流程 ---
@@ -742,7 +842,7 @@ manage_web_service() {
 # --- 主菜单 ---
 show_main_menu() {
     check_root; local certbot_vsn="未知"; if command_exists certbot; then certbot_vsn=$(certbot --version 2>&1 | awk '{print $2}'); fi
-    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v5 - UFW 交互修复)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 安装基础依赖工具 (curl, jq, unzip, snapd)"; echo -e "  ${YELLOW}2.${NC} UFW 防火墙管理 (手动确认)"; echo -e "  ${YELLOW}3.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}4.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}5.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-5]: " main_choice
+    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v5.1)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 安装基础依赖工具 (curl, jq, unzip, snapd)"; echo -e "  ${YELLOW}2.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}3.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}4.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}5.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-5]: " main_choice
 }
 
 # --- 脚本入口 ---
