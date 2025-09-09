@@ -1,13 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v5.1 - 优化 Certbot 安装与增加卸载选项)
+# 服务器初始化与管理脚本 (v5.7 - 修复DNS服务启动检查问题)
 # 功能:
-# 1.  **基础工具**: 安装常用软件包。
-# 2.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 新增卸载选项。
-# 3.  **入侵防御 (Fail2ban)**: 安装并配置 SSH 防护、重新配置、查看状态 - 新增卸载选项。
-# 4.  **SSH 安全**: 更改端口、创建 sudo 用户、禁用 root 登录、配置密钥登录。
-# 5.  **Web 服务 (LE + CF + Nginx)**:
+# 1.  **系统信息查询**: 快速获取服务器的详细运行状态。
+# 2.  **基础工具**: 安装常用软件包。
+# 3.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 新增卸载选项。
+# 4.  **入侵防御 (Fail2ban)**: 安装并配置 SSH 防护、重新配置、查看状态 - 新增卸载选项。
+# 5.  **SSH 安全**: 更改端口、创建 sudo 用户、禁用 root 登录、配置密钥登录。
+# 6.  **DNS 配置管理**: 智能识别 systemd-resolved，安全修改 DNS 设置。
+# 7.  **网络优化 (BBR+FQ)**: 开启 BBR 拥塞控制和 FQ 队列调度。
+# 8.  **时区调整**: 快速设置系统时区。
+# 9.  **Web 服务 (LE + CF + Nginx)**:
 #     - 优化 Certbot 安装逻辑，优先使用 apt 以降低资源占用。
 #     - 自动申请 Let's Encrypt 证书 (使用 Cloudflare DNS 验证 - API Token)。
 #     - 证书申请成功后，可选自动开启 Cloudflare 代理（橙色云朵）。
@@ -50,7 +54,8 @@ if ! [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]]; then
     CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
 fi
 FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
-
+RESOLV_CONF="/etc/resolv.conf"
+SYSTEMD_RESOLVED_CONF="/etc/systemd/resolved.conf"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -135,9 +140,9 @@ install_package() {
     fi
 }
 
-# --- 1. 基础工具 ---
+# --- 2. 基础工具 ---
 install_common_tools() {
-    echo -e "\n${CYAN}--- 1. 安装基础依赖工具 ---${NC}"
+    echo -e "\n${CYAN}--- 2. 安装基础依赖工具 ---${NC}"
     # 移除 expect，因为它不再被 UFW 部分使用
     local tools="curl jq unzip"
     local failed=0
@@ -147,7 +152,7 @@ install_common_tools() {
     echo -e "${BLUE}[*] 检查并安装基础工具: ${tools}...${NC}"
     for tool in $tools; do
         if dpkg -s "$tool" &> /dev/null; then
-            echo -e "${YELLOW}[!] $tool 已安装。${NC}"
+            echo -e "${YELLOW}[!] $tool 似乎已安装。${NC}"
             already_installed_count=$((already_installed_count + 1))
         else
             install_package "$tool"
@@ -171,9 +176,9 @@ install_common_tools() {
     else echo -e "${RED}[✗] 部分基础工具安装失败，请检查上面的错误信息。${NC}"; fi
 }
 
-# --- 2. UFW 防火墙 (v5: 移除 expect 依赖) ---
+# --- 3. UFW 防火墙 (v5: 移除 expect 依赖) ---
 setup_ufw() {
-    echo -e "\n${CYAN}--- 2.1 安装并启用 UFW 防火墙 ---${NC}"
+    echo -e "\n${CYAN}--- 3.1 安装并启用 UFW 防火墙 ---${NC}"
     # 安装 UFW
     if ! install_package "ufw"; then return 1; fi
 
@@ -228,7 +233,7 @@ setup_ufw() {
 }
 
 add_ufw_rule() {
-    echo -e "\n${CYAN}--- 2.2 添加 UFW 规则 ---${NC}"
+    echo -e "\n${CYAN}--- 3.2 添加 UFW 规则 ---${NC}"
     local port protocol comment rule
     while true; do read -p "请输入要开放的端口号 (例如 80, 443, 8080): " port; if [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]]; then break; else echo -e "${YELLOW}无效的端口号。请输入 1-65535 之间的数字。${NC}"; fi; done
     while true; do read -p "请选择协议 [1] TCP (默认) [2] UDP : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then protocol="tcp"; break; elif [[ "$proto_choice" == "2" ]]; then protocol="udp"; break; else echo -e "${YELLOW}无效输入，请输入 1 或 2。${NC}"; fi; done
@@ -245,7 +250,7 @@ add_ufw_rule() {
 }
 
 delete_ufw_rule() {
-    echo -e "\n${CYAN}--- 2.4 删除 UFW 规则 ---${NC}"
+    echo -e "\n${CYAN}--- 3.4 删除 UFW 规则 ---${NC}"
     if ! command_exists ufw || ! ufw status | grep -q "Status: active"; then echo -e "${YELLOW}[!] UFW 未安装或未启用。${NC}"; return; fi
     echo -e "${BLUE}当前 UFW 规则列表 (带编号):${NC}"; ufw status numbered
     local nums_input; local nums_array=(); local valid_nums=(); local num
@@ -285,13 +290,13 @@ delete_ufw_rule() {
 }
 
 view_ufw_rules() {
-    echo -e "\n${CYAN}--- 2.3 查看 UFW 规则 ---${NC}"
+    echo -e "\n${CYAN}--- 3.3 查看 UFW 规则 ---${NC}"
     if ! command_exists ufw; then echo -e "${YELLOW}[!] UFW 未安装。${NC}"; return; fi
     echo -e "${BLUE}当前 UFW 状态和规则:${NC}"; ufw status verbose; echo -e "\n${BLUE}带编号的规则列表 (用于删除):${NC}"; ufw status numbered
 }
 
 ufw_allow_all() {
-    echo -e "\n${CYAN}--- 2.5 允许所有 UFW 入站连接 (危险) ---${NC}"; echo -e "${RED}[!] 警告：此操作将允许来自任何源的任何入站连接，会显著降低服务器安全性！${NC}"; echo -e "${YELLOW}   仅在您完全了解风险并有特定需求时（例如临时调试）才执行此操作。${NC}"; echo -e "${YELLOW}   强烈建议在完成后立即恢复默认拒绝规则 (选项 6)。${NC}"
+    echo -e "\n${CYAN}--- 3.5 允许所有 UFW 入站连接 (危险) ---${NC}"; echo -e "${RED}[!] 警告：此操作将允许来自任何源的任何入站连接，会显著降低服务器安全性！${NC}"; echo -e "${YELLOW}   仅在您完全了解风险并有特定需求时（例如临时调试）才执行此操作。${NC}"; echo -e "${YELLOW}   强烈建议在完成后立即恢复默认拒绝规则 (选项 6)。${NC}"
     if ! command_exists ufw || ! ufw status | grep -q "Status: active"; then echo -e "${YELLOW}[!] UFW 未安装或未启用。无法更改默认策略。${NC}"; return; fi
     if confirm_action "您确定要将 UFW 默认入站策略更改为 ALLOW (允许所有) 吗?"; then
         echo -e "${BLUE}[*] 正在设置默认入站策略为 ALLOW...${NC}"; ufw default allow incoming; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] UFW 默认入站策略已设置为 ALLOW。${NC}"; echo -e "${RED}   请注意：现在所有端口都对外部开放！${NC}"; ufw status verbose; else echo -e "${RED}[✗] 设置默认入站策略失败。${NC}"; fi
@@ -299,7 +304,7 @@ ufw_allow_all() {
 }
 
 ufw_reset_default() {
-    echo -e "\n${CYAN}--- 2.6 重置 UFW 为默认拒绝规则 ---${NC}"; echo -e "${BLUE}[*] 此操作将执行以下步骤:${NC}"; echo "  1. 设置默认入站策略为 DENY (拒绝)。"; echo "  2. 设置默认出站策略为 ALLOW (允许)。"; echo "  3. 确保当前 SSH 端口 ($CURRENT_SSH_PORT/tcp) 规则存在。"; echo "  4. 重新加载 UFW 规则。"; echo -e "${YELLOW}   注意：除了 SSH 端口外，所有其他之前手动添加的 'allow' 规则将保持不变。${NC}"
+    echo -e "\n${CYAN}--- 3.6 重置 UFW 为默认拒绝规则 ---${NC}"; echo -e "${BLUE}[*] 此操作将执行以下步骤:${NC}"; echo "  1. 设置默认入站策略为 DENY (拒绝)。"; echo "  2. 设置默认出站策略为 ALLOW (允许)。"; echo "  3. 确保当前 SSH 端口 ($CURRENT_SSH_PORT/tcp) 规则存在。"; echo "  4. 重新加载 UFW 规则。"; echo -e "${YELLOW}   注意：除了 SSH 端口外，所有其他之前手动添加的 'allow' 规则将保持不变。${NC}"
     if ! command_exists ufw; then echo -e "${YELLOW}[!] UFW 未安装。无法重置。${NC}"; return; fi
     if confirm_action "确认要将 UFW 重置为默认拒绝策略 (并保留 SSH 端口) 吗?"; then
         echo -e "${BLUE}[*] 设置默认入站策略为 DENY...${NC}"; ufw default deny incoming > /dev/null; echo -e "${BLUE}[*] 设置默认出站策略为 ALLOW...${NC}"; ufw default allow outgoing > /dev/null; echo -e "${BLUE}[*] 确保当前 SSH 端口 ($CURRENT_SSH_PORT/tcp) 允许...${NC}"; ufw allow $CURRENT_SSH_PORT/tcp comment "SSH Access (Current)" > /dev/null; echo -e "${BLUE}[*] 重新加载 UFW 规则...${NC}"; ufw reload > /dev/null
@@ -343,9 +348,9 @@ manage_ufw() {
 }
 
 
-# --- 3. Fail2ban ---
+# --- 4. Fail2ban ---
 setup_fail2ban() {
-    echo -e "\n${CYAN}--- 3.1 安装并配置 Fail2ban ---${NC}"
+    echo -e "\n${CYAN}--- 4.1 安装并配置 Fail2ban ---${NC}"
     if ! install_package "fail2ban"; then echo -e "${RED}[✗] Fail2ban 安装失败，无法继续。${NC}"; return 1; fi
     if ! install_package "rsyslog"; then echo -e "${YELLOW}[!] rsyslog 安装失败，Fail2ban 可能无法正常工作。${NC}";
     else echo -e "${BLUE}[*] 启用并重启 rsyslog 服务...${NC}"; systemctl enable rsyslog > /dev/null 2>&1; systemctl restart rsyslog; echo -e "${BLUE}[*] 等待 rsyslog 初始化...${NC}"; sleep 2; fi
@@ -397,7 +402,7 @@ EOF
     else echo -e "${YELLOW}操作已取消。${NC}"; return 1; fi
 }
 view_fail2ban_status() {
-    echo -e "\n${CYAN}--- 3.3 查看 Fail2ban 状态 (SSH) ---${NC}"; if ! command_exists fail2ban-client; then echo -e "${YELLOW}[!] Fail2ban 未安装。${NC}"; return 1; fi
+    echo -e "\n${CYAN}--- 4.3 查看 Fail2ban 状态 (SSH) ---${NC}"; if ! command_exists fail2ban-client; then echo -e "${YELLOW}[!] Fail2ban 未安装。${NC}"; return 1; fi
     echo -e "${BLUE}Fail2ban SSH jail 状态:${NC}"; fail2ban-client status sshd; echo -e "\n${BLUE}查看 Fail2ban 日志 (最近 20 条):${NC}"
     if command_exists journalctl; then journalctl -u fail2ban -n 20 --no-pager --quiet; elif [[ -f /var/log/fail2ban.log ]]; then tail -n 20 /var/log/fail2ban.log; else echo -e "${YELLOW}无法找到 Fail2ban 日志。${NC}"; fi; return 0
 }
@@ -439,9 +444,9 @@ manage_fail2ban() {
     done
 }
 
-# --- 4. SSH 安全 ---
+# --- 5. SSH 安全 ---
 change_ssh_port() {
-    echo -e "\n${CYAN}--- 4.1 更改 SSH 端口 ---${NC}"; local new_port old_port; old_port=$CURRENT_SSH_PORT; echo "当前 SSH 端口是: $old_port"
+    echo -e "\n${CYAN}--- 5.1 更改 SSH 端口 ---${NC}"; local new_port old_port; old_port=$CURRENT_SSH_PORT; echo "当前 SSH 端口是: $old_port"
     while true; do read -p "请输入新的 SSH 端口号 (建议 10000-65535): " new_port; if [[ "$new_port" =~ ^[0-9]+$ && "$new_port" -gt 0 && "$new_port" -le 65535 ]]; then if [[ "$new_port" -eq "$old_port" ]]; then echo -e "${YELLOW}新端口与当前端口相同，无需更改。${NC}"; return; fi; break; else echo -e "${YELLOW}无效的端口号。请输入 1-65535 之间的数字。${NC}"; fi; done
     echo -e "${RED}[!] 警告：更改 SSH 端口需要确保新端口在防火墙中已开放！${NC}"; echo "脚本将尝试执行以下操作："; echo "  1. 在 UFW 中允许新端口 $new_port/tcp (如果 UFW 已启用)。"; echo "  2. 修改 SSH 配置文件 ($SSHD_CONFIG)。"; echo "  3. 重启 SSH 服务。"; echo "  4. 在 UFW 中删除旧端口 $old_port/tcp 的规则 (如果存在)。"; echo "  5. 重新配置 Fail2ban 以监控新端口 (如果 Fail2ban 已安装)。"; echo -e "${YELLOW}在重启 SSH 服务后，您需要使用新端口重新连接！例如: ssh user@host -p $new_port ${NC}"
     if ! confirm_action "确认要将 SSH 端口从 $old_port 更改为 $new_port 吗?"; then echo "操作已取消。"; return; fi
@@ -454,14 +459,14 @@ change_ssh_port() {
     echo -e "${GREEN}[✓] SSH 端口更改完成。请记住使用新端口 $new_port 登录。${NC}"; return 0
 }
 create_sudo_user() {
-    echo -e "\n${CYAN}--- 4.2 创建新的 Sudo 用户 ---${NC}"; local username
+    echo -e "\n${CYAN}--- 5.2 创建新的 Sudo 用户 ---${NC}"; local username
     while true; do read -p "请输入新用户名: " username; if [[ -z "$username" ]]; then echo -e "${YELLOW}用户名不能为空。${NC}"; elif id "$username" &>/dev/null; then echo -e "${YELLOW}用户 '$username' 已存在。${NC}"; elif [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then break; else echo -e "${YELLOW}无效的用户名格式 (建议使用小写字母、数字、下划线、连字符，并以字母或下划线开头)。${NC}"; fi; done
     echo -e "${BLUE}[*] 添加用户 '$username' 并设置密码...${NC}"; adduser "$username"; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 添加用户失败。${NC}"; return 1; fi
     echo -e "${BLUE}[*] 将用户 '$username' 添加到 sudo 组...${NC}"; usermod -aG sudo "$username"; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 添加到 sudo 组失败。${NC}"; return 1; fi
     echo -e "${GREEN}[✓] 用户 '$username' 创建成功并已添加到 sudo 组。${NC}"; echo -e "${YELLOW}请使用新用户登录并测试 sudo权限 (例如 'sudo whoami')。${NC}"; echo -e "${YELLOW}建议在新用户能够正常登录并使用 sudo 后，再考虑禁用 root 登录。${NC}"; return 0
 }
 disable_root_login() {
-    echo -e "\n${CYAN}--- 4.3 禁用 Root 用户 SSH 登录 ---${NC}"; echo -e "${RED}[!] 警告：禁用 Root 登录前，请确保您已创建具有 Sudo 权限的普通用户，并且该用户可以正常通过 SSH 登录！${NC}"
+    echo -e "\n${CYAN}--- 5.3 禁用 Root 用户 SSH 登录 ---${NC}"; echo -e "${RED}[!] 警告：禁用 Root 登录前，请确保您已创建具有 Sudo 权限的普通用户，并且该用户可以正常通过 SSH 登录！${NC}"
     if ! confirm_action "确认要禁止 Root 用户通过 SSH 登录吗?"; then echo "操作已取消。"; return; fi
     echo -e "${BLUE}[*] 修改 SSH 配置文件 ($SSHD_CONFIG) 以禁用 Root 登录...${NC}"; cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_root_$(date +%F_%T)"; if ! update_or_add_config "$SSHD_CONFIG" "" "PermitRootLogin" "no"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PermitRootLogin)。${NC}"; return 1; fi
     echo -e "${BLUE}[*] 重启 SSH 服务以应用更改...${NC}"; systemctl restart sshd; sleep 2; if systemctl is-active --quiet sshd; then echo -e "${GREEN}[✓] Root 用户 SSH 登录已禁用。${NC}"; else echo -e "${RED}[✗] SSH 服务重启失败！请检查配置。Root 登录可能仍被允许。${NC}"; echo -e "${RED}   旧配置已备份为 ${SSHD_CONFIG}.bak_root_* 。${NC}"; return 1; fi; return 0
@@ -480,19 +485,19 @@ add_public_key() {
     echo "$pub_key_cleaned" >> "$auth_keys_file"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] 公钥已成功添加到 ${auth_keys_file}。${NC}"; return 0; else echo -e "${RED}[✗] 将公钥写入文件失败。${NC}"; return 1; fi
 }
 configure_ssh_keys() {
-    echo -e "\n${CYAN}--- 4.4 配置 SSH 密钥登录 (禁用密码登录) ---${NC}"; local key_config_choice
+    echo -e "\n${CYAN}--- 5.4 配置 SSH 密钥登录 (禁用密码登录) ---${NC}"; local key_config_choice
     while true; do echo -e "请选择操作:"; echo -e "  ${YELLOW}1.${NC} 添加公钥 (粘贴公钥内容让脚本添加)"; echo -e "  ${YELLOW}2.${NC} 禁用 SSH 密码登录 ${RED}(高风险! 请确保密钥已添加并测试成功)${NC}"; echo -e "  ${YELLOW}0.${NC} 返回 SSH 安全菜单"; read -p "请输入选项 [0-2]: " key_config_choice
         case $key_config_choice in 1) local target_user; read -p "请输入要为其添加公钥的用户名: " target_user; if [[ -n "$target_user" ]]; then add_public_key "$target_user"; else echo -e "${YELLOW}用户名不能为空。${NC}"; fi; read -p "按 Enter键 继续..."; ;; 2) echo -e "${RED}[!] 警告：这是高风险操作！在禁用密码登录前，请务必完成以下步骤：${NC}"; echo -e "${YELLOW}  1. 在您的本地计算机上生成 SSH 密钥对 (例如使用 'ssh-keygen')。${NC}"; echo -e "${YELLOW}  2. 使用上面的【选项1】或其他方法，将您的【公钥】复制到服务器上目标用户的 ~/.ssh/authorized_keys 文件中。${NC}"; echo -e "${YELLOW}  3. 【重要】在禁用密码登录【之前】，打开一个新的终端窗口，尝试使用【密钥】登录服务器，确保可以成功登录！${NC}"; if ! confirm_action "您是否已经完成上述所有步骤，并确认可以通过密钥成功登录?"; then echo "操作已取消。请先确保密钥设置正确并可成功登录。"; continue; fi; echo -e "${BLUE}[*] 修改 SSH 配置文件 ($SSHD_CONFIG) 以启用密钥登录并禁用密码登录...${NC}"; cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_key_$(date +%F_%T)"; if ! update_or_add_config "$SSHD_CONFIG" "" "PubkeyAuthentication" "yes"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PubkeyAuthentication)。${NC}"; continue; fi; if ! update_or_add_config "$SSHD_CONFIG" "" "PasswordAuthentication" "no"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PasswordAuthentication)。${NC}"; continue; fi; if ! update_or_add_config "$SSHD_CONFIG" "" "ChallengeResponseAuthentication" "no"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (ChallengeResponseAuthentication)。${NC}"; continue; fi; echo -e "${YELLOW}[!] UsePAM 设置未修改，保持默认。${NC}"; echo -e "${BLUE}[*] 重启 SSH 服务以应用更改...${NC}"; systemctl restart sshd; sleep 2; if systemctl is-active --quiet sshd; then echo -e "${GREEN}[✓] SSH 已配置为仅允许密钥登录，密码登录已禁用。${NC}"; echo -e "${RED}请立即尝试使用密钥重新登录以确认！如果无法登录，您可能需要通过控制台或其他方式恢复备份配置 (${SSHD_CONFIG}.bak_key_*)。${NC}"; else echo -e "${RED}[✗] SSH 服务重启失败！请检查配置。密码登录可能仍然启用。${NC}"; echo -e "${RED}   旧配置已备份为 ${SSHD_CONFIG}.bak_key_* 。${NC}"; fi; read -p "按 Enter键 继续..."; ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
     done
 }
 manage_ssh_security() {
-     while true; do echo -e "\n${CYAN}--- SSH 安全管理 ---${NC}"; echo -e " 当前 SSH 端口: ${YELLOW}${CURRENT_SSH_PORT}${NC}"; echo -e " ${YELLOW}1.${NC} 更改 SSH 端口 (自动更新 UFW, Fail2ban)"; echo -e " ${YELLOW}2.${NC} 创建新的 Sudo 用户"; echo -e " ${YELLOW}3.${NC} 禁用 Root 用户 SSH 登录"; echo -e " ${YELLOW}4.${NC} 配置 SSH 密钥登录与密码禁用"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-4]: " ssh_choice
+     while true; do echo -e "\n${CYAN}--- 5. SSH 安全管理 ---${NC}"; echo -e " 当前 SSH 端口: ${YELLOW}${CURRENT_SSH_PORT}${NC}"; echo -e " ${YELLOW}1.${NC} 更改 SSH 端口 (自动更新 UFW, Fail2ban)"; echo -e " ${YELLOW}2.${NC} 创建新的 Sudo 用户"; echo -e " ${YELLOW}3.${NC} 禁用 Root 用户 SSH 登录"; echo -e " ${YELLOW}4.${NC} 配置 SSH 密钥登录与密码禁用"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-4]: " ssh_choice
         case $ssh_choice in 1) change_ssh_port ;; 2) create_sudo_user ;; 3) disable_root_login ;; 4) configure_ssh_keys ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $ssh_choice != 0 ]] && read -p "按 Enter键 继续..."; check_root
     done
 }
 
-# --- 5. Web 服务 (Let's Encrypt + Cloudflare + Nginx) ---
+# --- 9. Web 服务 (Let's Encrypt + Cloudflare + Nginx) ---
 
 # 处理 Certbot 安装/更新 (v5.1: 优化逻辑，优先 apt)
 install_or_update_certbot() {
@@ -774,7 +779,7 @@ delete_domain_config() {
 
 # 添加新 Web 服务域名的主流程 (v5.1)
 add_new_domain() {
-    echo -e "\n${CYAN}--- 5.1 添加新 Web 服务域名配置 ---${NC}"
+    echo -e "\n${CYAN}--- 9.1 添加新 Web 服务域名配置 ---${NC}"
     local overall_success=0 # 0 = success, 1 = failure
 
     # 0. 确保 Certbot 和 Nginx 已安装
@@ -833,19 +838,390 @@ add_new_domain() {
 
 # Web 服务管理主菜单
 manage_web_service() {
-     while true; do echo -e "\n${CYAN}--- Web 服务管理 (LE + CF + Nginx) ---${NC}"; echo -e " ${YELLOW}1.${NC} 添加新域名并配置 (证书/代理/Nginx/DDNS)"; echo -e " ${YELLOW}2.${NC} 查看已配置的域名列表"; echo -e " ${YELLOW}3.${NC} 删除已配置的域名及其本地设置"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-3]: " web_choice
+     while true; do echo -e "\n${CYAN}--- 9. Web 服务管理 (LE + CF + Nginx) ---${NC}"; echo -e " ${YELLOW}1.${NC} 添加新域名并配置 (证书/代理/Nginx/DDNS)"; echo -e " ${YELLOW}2.${NC} 查看已配置的域名列表"; echo -e " ${YELLOW}3.${NC} 删除已配置的域名及其本地设置"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-3]: " web_choice
         case $web_choice in 1) add_new_domain ;; 2) list_configured_domains ;; 3) delete_domain_config ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $web_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
 }
 
+# --- 6. DNS 配置管理 ---
+is_systemd_resolved_active() {
+    # 检查 resolv.conf 是否是软链接且指向 systemd-resolved 的文件
+    if [[ -L "$RESOLV_CONF" ]] && [[ "$(readlink "$RESOLV_CONF")" == "/run/systemd/resolve/resolv.conf" ]]; then
+        # 进一步检查 systemd-resolved 服务是否处于活动状态
+        if systemctl is-active --quiet systemd-resolved; then
+            return 0 # 返回 true
+        fi
+    fi
+    return 1 # 返回 false
+}
+
+wait_for_systemd_resolved() {
+    local max_retries=10
+    local retry_count=0
+    echo -e "${BLUE}[*] 正在等待 systemd-resolved 服务就绪...${NC}"
+    while [[ $retry_count -lt $max_retries ]]; do
+        if systemctl is-active --quiet systemd-resolved && resolvectl status >/dev/null 2>&1; then
+            echo -e "${GREEN}[✓] systemd-resolved 服务已就绪。${NC}"
+            return 0
+        fi
+        sleep 1
+        retry_count=$((retry_count + 1))
+    done
+    echo -e "${RED}[✗] 等待服务就绪超时。请检查 'systemctl status systemd-resolved'。${NC}"
+    return 1
+}
+
+view_dns_status() {
+    echo -e "\n${CYAN}--- DNS 状态 ---${NC}"
+    if command_exists resolvectl; then
+        if is_systemd_resolved_active; then
+            echo -e "${BLUE}[*] 使用 resolvectl 查看 DNS 状态...${NC}"
+            resolvectl status
+        else
+            echo -e "${YELLOW}[!] systemd-resolved 已安装，但服务未运行或未配置为系统默认。${NC}"
+            echo -e "${YELLOW}   请尝试 '升级到 systemd-resolved (推荐)' 选项。${NC}"
+            echo -e "${YELLOW}[*] 使用 cat 查看 /etc/resolv.conf...${NC}"
+            cat "$RESOLV_CONF"
+        fi
+    else
+        echo -e "${YELLOW}[!] 'resolvectl' 命令未找到，可能未安装 'systemd-resolved'。${NC}"
+        echo -e "${YELLOW}[*] 使用 cat 查看 /etc/resolv.conf...${NC}"
+        if [[ -f "$RESOLV_CONF" ]]; then
+            cat "$RESOLV_CONF"
+        else
+            echo -e "${RED}[✗] 找不到 /etc/resolv.conf 文件。${NC}"
+        fi
+    fi
+}
+
+upgrade_to_systemd_resolved() {
+    echo -e "\n${CYAN}--- 升级到 systemd-resolved ---${NC}"
+    if is_systemd_resolved_active; then
+        echo -e "${GREEN}[✓] systemd-resolved 似乎已安装并正在运行，无需升级。${NC}"
+        return 0
+    fi
+    
+    echo -e "${YELLOW}[!] 您的系统似乎没有使用 systemd-resolved。此操作将安装并启用它，以提供统一的 DNS 管理。${NC}"
+    if ! confirm_action "您确定要升级到 systemd-resolved 吗？"; then
+        echo -e "${YELLOW}操作已取消。${NC}"
+        return 0
+    fi
+    
+    if ! command_exists systemctl; then
+        echo -e "${RED}[✗] 找不到 'systemctl' 命令。您的系统可能未使用 systemd。无法进行升级。${NC}"
+        return 1
+    fi
+    
+    if ! install_package "systemd-resolved"; then
+        echo -e "${RED}[✗] 安装 systemd-resolved 失败。${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}[*] 正在启用并启动 systemd-resolved 服务...${NC}"
+    systemctl enable systemd-resolved
+    systemctl start systemd-resolved
+    
+    # 等待服务就绪
+    if ! wait_for_systemd_resolved; then
+        return 1
+    fi
+
+    # 创建 /etc/resolv.conf 的软链接
+    echo -e "${BLUE}[*] 正在创建 /etc/resolv.conf 的软链接...${NC}"
+    rm -f "$RESOLV_CONF"
+    ln -s /run/systemd/resolve/resolv.conf "$RESOLV_CONF"
+    
+    echo -e "${GREEN}[✓] 升级完成！您现在可以使用 '修改 DNS 服务器地址' 选项来配置 DNS。${NC}"
+    return 0
+}
+
+edit_dns_config() {
+    echo -e "\n${CYAN}--- 6.2 修改 DNS 配置 ---${NC}"
+    local new_dns_servers=""
+    while true; do
+        read -p "请输入新的 DNS 服务器地址 (用空格隔开，例如 '1.1.1.1 8.8.8.8'): " new_dns_servers
+        if [[ -n "$new_dns_servers" ]]; then
+            break
+        else
+            echo -e "${YELLOW}DNS 服务器地址不能为空。${NC}"
+        fi
+    done
+    
+    if is_systemd_resolved_active; then
+        echo -e "${BLUE}[*] 检测到 systemd-resolved 正在运行。将修改 ${SYSTEMD_RESOLVED_CONF}。${NC}"
+        local temp_file="$SYSTEMD_RESOLVED_CONF.tmp"
+        
+        # 备份文件
+        cp "$SYSTEMD_RESOLVED_CONF" "${SYSTEMD_RESOLVED_CONF}.bak"
+        
+        # 使用awk更新或添加DNS参数
+        awk -v new_dns="$new_dns_servers" '
+            /\[Resolve\]/ {
+                print;
+                print "DNS=" new_dns;
+                dns_set=1;
+                next;
+            }
+            /^DNS=|^FallbackDNS=/ {
+                next; # 跳过旧的DNS配置行
+            }
+            { print }
+            END {
+                if (!dns_set) {
+                    print "\n[Resolve]";
+                    print "DNS=" new_dns;
+                }
+            }
+        ' "$SYSTEMD_RESOLVED_CONF" > "$temp_file"
+        
+        mv "$temp_file" "$SYSTEMD_RESOLVED_CONF"
+        
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}[✓] DNS 配置已写入 ${SYSTEMD_RESOLVED_CONF}。${NC}"
+            echo -e "${BLUE}[*] 正在重启 systemd-resolved 服务以应用新配置...${NC}"
+            systemctl restart systemd-resolved
+            if wait_for_systemd_resolved; then
+                view_dns_status
+            fi
+        else
+            echo -e "${RED}[✗] 修改配置文件失败。${NC}"
+        fi
+    else
+        echo -e "${YELLOW}[!] 未检测到 systemd-resolved 服务。将直接修改 ${RESOLV_CONF}。${NC}"
+        echo -e "${RED}[!] 警告: 直接修改此文件可能会被其他网络服务覆盖！${NC}"
+        if confirm_action "是否继续修改 ${RESOLV_CONF}？"; then
+            # 备份文件
+            cp "$RESOLV_CONF" "${RESOLV_CONF}.bak"
+            
+            # 清空并写入新的DNS
+            echo "# This file was managed by server-manage.sh" > "$RESOLV_CONF"
+            echo "# Backup: ${RESOLV_CONF}.bak" >> "$RESOLV_CONF"
+            for server in $new_dns_servers; do
+                echo "nameserver $server" >> "$RESOLV_CONF"
+            done
+            
+            if [[ $? -eq 0 ]]; then
+                echo -e "${GREEN}[✓] DNS 配置已写入 ${RESOLV_CONF}。${NC}"
+                view_dns_status
+            else
+                echo -e "${RED}[✗] 修改配置文件失败。${NC}"
+            fi
+        else
+            echo -e "${YELLOW}操作已取消。${NC}"
+        fi
+    fi
+}
+
+manage_dns() {
+     while true; do
+        echo -e "\n${CYAN}--- 6. DNS 配置管理 ---${NC}"
+        echo -e " ${YELLOW}1.${NC} 查看当前 DNS 状态"
+        echo -e " ${YELLOW}2.${NC} 修改 DNS 服务器地址"
+        echo -e " ${YELLOW}3.${NC} 升级到 systemd-resolved (推荐)"
+        echo -e " ${YELLOW}0.${NC} 返回主菜单"
+        read -p "请输入选项 [0-3]: " dns_choice
+        case $dns_choice in
+            1) view_dns_status ;;
+            2) edit_dns_config ;;
+            3) upgrade_to_systemd_resolved ;;
+            0) break ;;
+            *) echo -e "${RED}无效选项。${NC}" ;;
+        esac
+        [[ $dns_choice != 0 ]] && read -p "按 Enter键 继续..."
+    done
+}
+
+# --- 7. 开启 BBR + FQ ---
+enable_bbr_fq() {
+    echo -e "\n${CYAN}--- 7. 开启 BBR + FQ 拥塞控制 ---${NC}"
+    # 检查内核版本是否支持BBR (4.9以上)
+    local kernel_version=$(uname -r)
+    if [[ $(echo "$kernel_version" | cut -d'.' -f1) -lt 4 ]] || ([[ $(echo "$kernel_version" | cut -d'.' -f1) -eq 4 ]] && [[ $(echo "$kernel_version" | cut -d'.' -f2) -lt 9 ]]); then
+        echo -e "${RED}[✗] 当前内核版本 (${kernel_version}) 可能不支持 BBR 拥塞控制。${NC}"
+        echo -e "${YELLOW}   建议将内核版本升级到 4.9 或更高版本。${NC}"
+        if ! confirm_action "是否仍要尝试开启 BBR？"; then
+            echo -e "${YELLOW}操作已取消。${NC}"
+            return 1
+        fi
+    fi
+
+    if confirm_action "您确定要开启 BBR + FQ 拥塞控制吗？此操作将修改系统网络参数。"; then
+        echo -e "${BLUE}[*] 正在修改 /etc/sysctl.conf ...${NC}"
+        
+        # 备份 sysctl.conf
+        cp /etc/sysctl.conf /etc/sysctl.conf.bak_bbr
+
+        # 移除旧的配置，然后添加新的
+        sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+        sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+
+        echo -e "${BLUE}[*] 正在应用新的 sysctl 配置...${NC}"
+        sysctl -p
+        
+        echo -e "${BLUE}[*] 正在验证 BBR 是否已启用...${NC}"
+        local bbr_status=$(sysctl net.ipv4.tcp_available_congestion_control)
+        local lsmod_bbr_status=$(lsmod | grep bbr)
+        
+        if [[ "$bbr_status" =~ "bbr" ]] && [[ -n "$lsmod_bbr_status" ]]; then
+            echo -e "${GREEN}[✓] BBR 和 FQ 已成功启用。${NC}"
+            echo -e "${CYAN}--- 验证结果 ---${NC}"
+            echo "当前可用的拥塞控制算法："
+            echo "$bbr_status"
+            echo "内核模块加载情况："
+            echo "$lsmod_bbr_status"
+            echo -e "${CYAN}----------------${NC}"
+        else
+            echo -e "${RED}[✗] 启用 BBR/FQ 失败。请检查系统内核版本是否支持。${NC}"
+        fi
+    else
+        echo -e "${YELLOW}操作已取消。${NC}"
+    fi
+}
+
+# --- 1. 系统信息查询 ---
+
+# 系统信息查询函数
+output_status() {
+    # 总接收和总发送流量（跨网卡）
+    local output=$(awk 'BEGIN { rx_total = 0; tx_total = 0 }
+        $1 ~ /^(eth|ens|enp|eno)[0-9]+/ {
+            rx_total += $2
+            tx_total += $10
+        }
+        END {
+            rx_units = "Bytes";
+            tx_units = "Bytes";
+            if (rx_total > 1024) { rx_total /= 1024; rx_units = "K"; }
+            if (rx_total > 1024) { rx_total /= 1024; rx_units = "M"; }
+            if (rx_total > 1024) { rx_total /= 1024; rx_units = "G"; }
+
+            if (tx_total > 1024) { tx_total /= 1024; tx_units = "K"; }
+            if (tx_total > 1024) { tx_total /= 1024; tx_units = "M"; }
+            if (tx_total > 1024) { tx_total /= 1024; tx_units = "G"; }
+
+            printf("%.2f%s %.2f%s\n", rx_total, rx_units, tx_total, tx_units);
+        }' /proc/net/dev)
+
+    local rx=$(echo "$output" | awk '{print $1}')
+    local tx=$(echo "$output" | awk '{print $2}')
+
+    local cpu_info=$(lscpu | awk -F': +' '/Model name:/ {print $2; exit}')
+    local cpu_usage_percent=$(awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){u1=u; t1=t;} else printf "%.0f", (($2+$4-u1) * 100 / (t-t1))}' <(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat))
+    local cpu_cores=$(nproc)
+    local cpu_freq=$(cat /proc/cpuinfo | grep "MHz" | head -n 1 | awk '{printf "%.1f GHz", $4/1000}')
+    local mem_info=$(free -b | awk 'NR==2{printf "%.2fG/%.2fG (%.2f%%)", $3/1024/1024/1024, $2/1024/1024/1024, $3*100/$2}')
+    local disk_info=$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')
+    local ipinfo=$(curl -s ipinfo.io)
+    local country=$(echo "$ipinfo" | grep 'country' | awk -F': ' '{print $2}' | tr -d '",')
+    local city=$(echo "$ipinfo" | grep 'city' | awk -F': ' '{print $2}' | tr -d '",')
+    local isp_info=$(echo "$ipinfo" | grep 'org' | awk -F': ' '{print $2}' | tr -d '",')
+    local load=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}')
+    local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
+    local cpu_arch=$(uname -m)
+    local hostname=$(uname -n)
+    local kernel_version=$(uname -r)
+    local congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control)
+    local queue_algorithm=$(sysctl -n net.core.default_qdisc)
+    local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
+    local current_time=$(date "+%Y-%m-%d %I:%M %p")
+    local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dM/%dM (%d%%)", used, total, percentage}')
+    local runtime=$(cat /proc/uptime | awk -F. '{run_days=int($1 / 86400);run_hours=int(($1 % 86400) / 3600);run_minutes=int(($1 % 3600) / 60); if (run_days > 0) printf("%d天 ", run_days); if (run_hours > 0) printf("%d时 ", run_hours); printf("%d分\n", run_minutes)}')
+    local timezone=$(timedatectl | grep "Time zone" | awk '{print $3}')
+
+    echo ""
+    echo -e "系统信息查询"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}主机名:       ${NC}$hostname"
+    echo -e "${CYAN}系统版本:     ${NC}$os_info"
+    echo -e "${CYAN}Linux版本:    ${NC}$kernel_version"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}CPU架构:      ${NC}$cpu_arch"
+    echo -e "${CYAN}CPU型号:      ${NC}$cpu_info"
+    echo -e "${CYAN}CPU核心数:    ${NC}$cpu_cores"
+    echo -e "${CYAN}CPU频率:      ${NC}$cpu_freq"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}CPU占用:      ${NC}$cpu_usage_percent%"
+    echo -e "${CYAN}系统负载:     ${NC}$load"
+    echo -e "${CYAN}物理内存:     ${NC}$mem_info"
+    echo -e "${CYAN}虚拟内存:     ${NC}$swap_info"
+    echo -e "${CYAN}硬盘占用:     ${NC}$disk_info"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}总接收:       ${NC}$rx"
+    echo -e "${CYAN}总发送:       ${NC}$tx"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}网络算法:     ${NC}$congestion_algorithm $queue_algorithm"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}运营商:       ${NC}$isp_info"
+    if [[ -n "$DETECTED_IPV4" ]]; then
+        echo -e "${CYAN}IPv4地址:     ${NC}$DETECTED_IPV4"
+    fi
+    if [[ -n "$DETECTED_IPV6" ]]; then
+        echo -e "${CYAN}IPv6地址:     ${NC}$DETECTED_IPV6"
+    fi
+    echo -e "${CYAN}DNS地址:      ${NC}$dns_addresses"
+    echo -e "${CYAN}地理位置:     ${NC}$country $city"
+    echo -e "${CYAN}系统时间:     ${NC}$timezone $current_time"
+    echo -e "${CYAN}-------------"
+    echo -e "${CYAN}运行时长:     ${NC}$runtime"
+    echo ""
+}
+
+# 时区调整函数
+set_timedate() {
+    local shiqu="$1"
+    if command_exists timedatectl; then
+        timedatectl set-timezone ${shiqu}
+        echo -e "${GREEN}[✓] 系统时区已修改为: ${shiqu}${NC}"
+    else
+        echo -e "${RED}[✗] timedatectl 命令未找到，无法设置时区。${NC}"
+        return 1
+    fi
+}
+
 # --- 主菜单 ---
 show_main_menu() {
     check_root; local certbot_vsn="未知"; if command_exists certbot; then certbot_vsn=$(certbot --version 2>&1 | awk '{print $2}'); fi
-    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v5.1)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 安装基础依赖工具 (curl, jq, unzip, snapd)"; echo -e "  ${YELLOW}2.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}3.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}4.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}5.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-5]: " main_choice
+    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v5.7)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 系统信息查询"; echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"; echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "  ${YELLOW}6.${NC} DNS 配置管理"; echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ (优化网络)"; echo -e "  ${YELLOW}8.${NC} 调整系统时区"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-9]: " main_choice
 }
 
 # --- 脚本入口 ---
 check_root
-while true; do show_main_menu; case $main_choice in 1) install_common_tools ;; 2) manage_ufw ;; 3) manage_fail2ban ;; 4) manage_ssh_security ;; 5) manage_web_service ;; 0) echo "退出脚本。" ; exit 0 ;; *) echo -e "${RED}无效选项，请输入 0 到 5 之间的数字。${NC}" ;; esac; if [[ "$main_choice" != "0" ]]; then read -p "按 Enter键 继续..."; fi; done
+while true; do show_main_menu; case $main_choice in 1) output_status ;; 2) install_common_tools ;; 3) manage_ufw ;; 4) manage_fail2ban ;; 5) manage_ssh_security ;; 6) manage_dns ;; 7) enable_bbr_fq ;; 8)
+                while true; do
+                    echo -e "\n${CYAN}--- 系统时区调整 ---${NC}"
+                    echo -e "当前系统时区: ${YELLOW}$(timedatectl | grep "Time zone" | awk '{print $3}')${NC}"
+                    echo -e "------------------------"
+                    echo "亚洲"
+                    echo "1.  中国上海时间             2.  中国香港时间"
+                    echo "3.  日本东京时间             4.  韩国首尔时间"
+                    echo "------------------------"
+                    echo "欧洲"
+                    echo "5.  英国伦敦时间             6.  德国柏林时间"
+                    echo "7.  俄罗斯莫斯科时间"
+                    echo "------------------------"
+                    echo "美洲"
+                    echo "8.  美国西部时间             9.  美国东部时间"
+                    echo "------------------------"
+                    echo "10. UTC全球标准时间"
+                    echo "0. 返回上一级菜单"
+                    read -p "请输入你的选择: " tz_choice
+                    case $tz_choice in
+                        1) set_timedate Asia/Shanghai ;;
+                        2) set_timedate Asia/Hong_Kong ;;
+                        3) set_timedate Asia/Tokyo ;;
+                        4) set_timedate Asia/Seoul ;;
+                        5) set_timedate Europe/London ;;
+                        6) set_timedate Europe/Berlin ;;
+                        7) set_timedate Europe/Moscow ;;
+                        8) set_timedate America/Los_Angeles ;;
+                        9) set_timedate America/New_York ;;
+                        10) set_timedate UTC ;;
+                        0) break ;;
+                        *) echo -e "${RED}无效选项。${NC}" ;;
+                    esac
+                done
+                ;; 9) manage_web_service ;; 0) echo "退出脚本。" ; exit 0 ;; *) echo -e "${RED}无效选项，请输入 0 到 9 之间的数字。${NC}" ;; esac; if [[ "$main_choice" != "0" ]]; then read -p "按 Enter键 继续..."; fi; done
 exit 0
