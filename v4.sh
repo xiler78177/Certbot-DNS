@@ -1,25 +1,19 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v5.7 - 修复DNS服务启动检查问题)
-# 功能:
-# 1.  **系统信息查询**: 快速获取服务器的详细运行状态。
-# 2.  **基础工具**: 安装常用软件包。
-# 3.  **防火墙 (UFW)**: 安装、启用、管理端口规则 (增/删/查) - 新增卸载选项。
-# 4.  **入侵防御 (Fail2ban)**: 安装并配置 SSH 防护、重新配置、查看状态 - 新增卸载选项。
-# 5.  **SSH 安全**: 更改端口、创建 sudo 用户、禁用 root 登录、配置密钥登录。
-# 6.  **DNS 配置管理**: 智能识别 systemd-resolved，安全修改 DNS 设置。
-# 7.  **网络优化 (BBR+FQ)**: 开启 BBR 拥塞控制和 FQ 队列调度。
-# 8.  **时区调整**: 快速设置系统时区。
-# 9.  **Web 服务 (LE + CF + Nginx)**:
-#     - 优化 Certbot 安装逻辑，优先使用 apt 以降低资源占用。
-#     - 自动申请 Let's Encrypt 证书 (使用 Cloudflare DNS 验证 - API Token)。
-#     - 证书申请成功后，可选自动开启 Cloudflare 代理（橙色云朵）。
-#     - 支持 IPv4 (A) / IPv6 (AAAA) 记录自动检测与添加/更新。
-#     - 支持 DDNS (动态域名解析)，自动更新 Cloudflare 记录 (保留代理状态)。
-#     - 自动配置 Nginx 反向代理 (支持自定义端口, HTTP/HTTPS 后端)。
-#     - 证书自动续期与部署 (通过 Cron)。
-#     - 集中查看/删除已配置域名信息。
+# 服务器初始化与管理脚本 (v6.1 - Gemini-Mod)
+# 修改日志:
+# v6.1:
+# 1.  **恢复证书复制**: 为了兼容 3x-ui 等面板，重新加入了将证书复制到 /root/cert/ 目录的功能。
+# 2.  **增强续期钩子**: 证书自动续期后，deploy-hook 脚本现在会同时复制新证书并重载 Nginx。
+# 3.  **增强域名信息展示**: "查看已配置域名" 功能现在会显示详细的反向代理目标和监听端口。
+# v6.0:
+# 1.  **Nginx 配置标准化**:
+#     - SSL/TLS 配置被提取到独立的 /etc/nginx/snippets/ssl-params.conf 文件中，实现模块化。
+#     - 站点配置文件结构更清晰，分为独立的 HTTP (重定向) 和 HTTPS (代理) server 块。
+#     - Nginx 直接使用 /etc/letsencrypt/live/ 目录下的证书。
+# 2.  **证书自动续期修复**:
+#     - 简化了 Certbot 的 --deploy-hook 脚本，只负责重载 Nginx 服务。
 # ==============================================================================
 
 # --- 全局变量 ---
@@ -563,7 +557,7 @@ get_user_input_initial() {
     echo -e "${BLUE}[*] 请输入首次设置所需信息:${NC}"; echo -e "${YELLOW}Let's Encrypt 注册邮箱已固定为: ${EMAIL}${NC}"
     while [[ -z "$DOMAIN" ]]; do read -p "请输入您要申请/管理的域名 (例如 my.example.com): " DOMAIN; done
     if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then echo -e "${RED}[✗] 域名格式似乎不正确。${NC}"; return 1; fi
-    if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then echo -e "${YELLOW}[!] 域名 ${DOMAIN} 的配置已存在。如果您想修改，请先删除旧配置 (选项 5-3)。${NC}"; return 1; fi
+    if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then echo -e "${YELLOW}[!] 域名 ${DOMAIN} 的配置已存在。如果您想修改，请先删除旧配置 (选项 9-3)。${NC}"; return 1; fi
     while [[ -z "$CF_API_TOKEN" ]]; do read -p "请输入您的 Cloudflare API Token (确保有 Zone:Read, DNS:Edit 权限): " CF_API_TOKEN; done
     while true; do read -p "请输入 DDNS 自动更新频率 (分钟, 输入 0 禁用 DDNS, 默认 5): " freq_input; if [[ -z "$freq_input" ]]; then DDNS_FREQUENCY=5; echo -e "DDNS 更新频率设置为: ${GREEN}5 分钟${NC}"; break; elif [[ "$freq_input" =~ ^[0-9]+$ ]]; then DDNS_FREQUENCY=$freq_input; if [[ "$DDNS_FREQUENCY" -eq 0 ]]; then echo -e "${YELLOW}DDNS 功能已禁用。${NC}"; else echo -e "DDNS 更新频率设置为: ${GREEN}${DDNS_FREQUENCY} 分钟${NC}"; fi; break; else echo -e "${YELLOW}请输入一个非负整数。${NC}"; fi; done
     update_paths_for_domain "$DOMAIN"; return 0
@@ -571,7 +565,12 @@ get_user_input_initial() {
 
 # 根据当前域名更新相关文件路径变量
 update_paths_for_domain() {
-    local current_domain="$1"; CERT_PATH="${CERT_PATH_PREFIX}/${current_domain}"; CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${current_domain}.ini"; DEPLOY_HOOK_SCRIPT="/root/cert-renew-hook-${current_domain}.sh"; DDNS_SCRIPT_PATH="/usr/local/bin/cf_ddns_update_${current_domain}.sh"; NGINX_CONF_PATH="/etc/nginx/sites-available/${current_domain}.conf"
+    local current_domain="$1"
+    CERT_PATH="${CERT_PATH_PREFIX}/${current_domain}"
+    CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${current_domain}.ini"
+    DEPLOY_HOOK_SCRIPT="/root/cert-renew-hook-${current_domain}.sh"
+    DDNS_SCRIPT_PATH="/usr/local/bin/cf_ddns_update_${current_domain}.sh"
+    NGINX_CONF_PATH="/etc/nginx/sites-available/${current_domain}.conf"
 }
 
 # 创建 Cloudflare API Token 凭证文件 (用于 Certbot)
@@ -635,24 +634,132 @@ request_certificate() {
     echo -e "${GREEN}[✓] SSL 证书申请成功！${NC}"; return 0
 }
 
-# 复制证书文件到指定目录
+# [v6.1] 复制证书文件到指定目录 (为 3x-ui 等面板兼容)
 copy_certificate() {
-    echo -e "${BLUE}[*] 复制证书文件到 $CERT_PATH ...${NC}"; mkdir -p "$CERT_PATH"
-    if cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$CERT_PATH/" && cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$CERT_PATH/" && cp -L "/etc/letsencrypt/live/${DOMAIN}/chain.pem" "$CERT_PATH/" && cp -L "/etc/letsencrypt/live/${DOMAIN}/cert.pem" "$CERT_PATH/"; then echo -e "${GREEN}[✓] 证书文件已复制到 $CERT_PATH ${NC}"; return 0; else echo -e "${RED}[✗] 复制证书文件失败。请检查源文件是否存在以及目标路径权限。${NC}"; return 1; fi
+    echo -e "${BLUE}[*] 复制证书文件到 $CERT_PATH (为 3x-ui 等面板兼容)...${NC}"; mkdir -p "$CERT_PATH"
+    if cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CERT_PATH}/fullchain.pem" && \
+       cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CERT_PATH}/privkey.pem"; then
+        echo -e "${GREEN}[✓] 证书文件已复制到 $CERT_PATH ${NC}";
+        return 0
+    else
+        echo -e "${RED}[✗] 复制证书文件失败。请检查源文件是否存在以及目标路径权限。${NC}"
+        return 1
+    fi
 }
 
-# 配置 Nginx 反向代理
+# [v6.0] 创建 Nginx SSL 参数配置文件 (如果不存在)
+create_nginx_ssl_snippet() {
+    local snippet_path="/etc/nginx/snippets/ssl-params.conf"
+    if [[ -f "$snippet_path" ]]; then
+        echo -e "${YELLOW}[!] Nginx SSL 参数文件 ${snippet_path} 已存在，跳过创建。${NC}"
+        return 0
+    fi
+    echo -e "${BLUE}[*] 创建 Nginx SSL 参数文件: ${snippet_path} ...${NC}"
+    mkdir -p "$(dirname "$snippet_path")"
+    cat > "$snippet_path" <<EOF
+# Generated by server-manage.sh (v6.1)
+# Modern SSL/TLS configuration
+# See: https://mozilla.github.io/server-side-tls/ssl-config-generator/
+ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+
+# Modern configuration
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+ssl_prefer_server_ciphers off;
+
+# HSTS (max-age = 6 months)
+add_header Strict-Transport-Security "max-age=15768000" always;
+
+# OCSP stapling
+ssl_stapling on;
+ssl_stapling_verify on;
+# Use Cloudflare/Google DNS for OCSP stapling
+resolver 1.1.1.1 8.8.8.8 valid=300s;
+resolver_timeout 5s;
+EOF
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}[✓] Nginx SSL 参数文件创建成功。${NC}"
+        return 0
+    else
+        echo -e "${RED}[✗] 创建 Nginx SSL 参数文件失败。${NC}"
+        return 1
+    fi
+}
+
+# [v6.0] 配置 Nginx 反向代理 (已重构)
 setup_nginx_proxy() {
     if ! confirm_action "是否需要自动配置 Nginx 反向代理?"; then echo "跳过 Nginx 配置。"; NGINX_HTTP_PORT=80; NGINX_HTTPS_PORT=443; LOCAL_PROXY_PASS="none"; BACKEND_PROTOCOL="none"; return 0; fi
     while true; do read -p "请输入 Nginx 监听的 HTTP 端口 [默认: ${NGINX_HTTP_PORT}]: " http_port_input; if [[ -z "$http_port_input" ]]; then break; elif [[ "$http_port_input" =~ ^[0-9]+$ && "$http_port_input" -gt 0 && "$http_port_input" -le 65535 ]]; then NGINX_HTTP_PORT=$http_port_input; break; else echo -e "${YELLOW}无效端口号。请输入 1-65535 之间的数字，或直接回车使用默认值。${NC}"; fi; done; echo -e "Nginx HTTP 端口设置为: ${GREEN}${NGINX_HTTP_PORT}${NC}"
     while true; do read -p "请输入 Nginx 监听的 HTTPS 端口 [默认: ${NGINX_HTTPS_PORT}]: " https_port_input; if [[ -z "$https_port_input" ]]; then break; elif [[ "$https_port_input" =~ ^[0-9]+$ && "$https_port_input" -gt 0 && "$https_port_input" -le 65535 ]]; then if [[ "$https_port_input" -eq "$NGINX_HTTP_PORT" ]]; then echo -e "${YELLOW}HTTPS 端口不能与 HTTP 端口 (${NGINX_HTTP_PORT}) 相同。${NC}"; else NGINX_HTTPS_PORT=$https_port_input; break; fi; else echo -e "${YELLOW}无效端口号。请输入 1-65535 之间的数字，或直接回车使用默认值。${NC}"; fi; done; echo -e "Nginx HTTPS 端口设置为: ${GREEN}${NGINX_HTTPS_PORT}${NC}"
     while true; do read -p "请选择后端服务 (${DOMAIN}) 使用的协议: [1] http (默认) [2] https : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then BACKEND_PROTOCOL="http"; break; elif [[ "$proto_choice" == "2" ]]; then BACKEND_PROTOCOL="https"; break; else echo -e "${YELLOW}无效输入，请输入 1 或 2。${NC}"; fi; done; echo -e "后端服务协议设置为: ${GREEN}${BACKEND_PROTOCOL}${NC}"
     local addr_input=""; while [[ -z "$LOCAL_PROXY_PASS" ]]; do read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080 或 [::1]:30000): " addr_input; if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"; echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"; else echo -e "${YELLOW}地址格式似乎不正确，请确保是 '地址:端口' 或 '[IPv6地址]:端口' 格式。${NC}"; LOCAL_PROXY_PASS=""; fi; done
+    
+    # 确保 SSL 参数文件存在
+    create_nginx_ssl_snippet || return 1
+
     echo -e "${BLUE}[*] 生成 Nginx 配置文件: $NGINX_CONF_PATH ...${NC}"; mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled; mkdir -p /var/www/html/.well-known/acme-challenge; chown www-data:www-data /var/www/html -R 2>/dev/null || echo -e "${YELLOW}[!] 无法设置 /var/www/html 权限 (可能 www-data 用户/组不存在)。${NC}"
+    
+    # 如果 HTTPS 端口不是标准的 443, 重定向时需要附带端口号
     local redirect_suffix_bash=""; if [[ "${NGINX_HTTPS_PORT}" -ne 443 ]]; then redirect_suffix_bash=":${NGINX_HTTPS_PORT}"; fi
+    
+    # 使用标准化模板生成 Nginx 配置
     cat > "$NGINX_CONF_PATH" <<EOF
-server { listen ${NGINX_HTTP_PORT}; listen [::]:${NGINX_HTTP_PORT}; server_name ${DOMAIN}; location ~ /.well-known/acme-challenge/ { allow all; root /var/www/html; } location / { return 301 https://\$host${redirect_suffix_bash}\$request_uri; } }
-server { listen ${NGINX_HTTPS_PORT} ssl http2; listen [::]:${NGINX_HTTPS_PORT} ssl http2; server_name ${DOMAIN}; ssl_certificate ${CERT_PATH}/fullchain.pem; ssl_certificate_key ${CERT_PATH}/privkey.pem; ssl_session_timeout 1d; ssl_session_cache shared:SSL:10m; ssl_session_tickets off; ssl_protocols TLSv1.2 TLSv1.3; ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384; ssl_prefer_server_ciphers off; add_header Strict-Transport-Security "max-age=15768000" always; ssl_stapling on; ssl_stapling_verify on; ssl_trusted_certificate ${CERT_PATH}/chain.pem; resolver 1.1.1.1 8.8.8.8 valid=300s; resolver_timeout 5s; location / { proxy_pass ${LOCAL_PROXY_PASS}; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; proxy_set_header X-Forwarded-Host \$host; proxy_set_header X-Forwarded-Port \$server_port; $( [[ "$BACKEND_PROTOCOL" == "https" ]] && echo '        proxy_ssl_server_name on;' ) } }
+# Generated by server-manage.sh (v6.1) for ${DOMAIN}
+
+# HTTP Server: Redirects all traffic to HTTPS
+server {
+    listen ${NGINX_HTTP_PORT};
+    listen [::]:${NGINX_HTTP_PORT};
+    server_name ${DOMAIN};
+
+    # Allow Let's Encrypt ACME challenge
+    location ~ /.well-known/acme-challenge/ {
+        allow all;
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host${redirect_suffix_bash}\$request_uri;
+    }
+}
+
+# HTTPS Server: Handles encrypted traffic and reverse proxy
+server {
+    listen ${NGINX_HTTPS_PORT} ssl http2;
+    listen [::]:${NGINX_HTTPS_PORT} ssl http2;
+    server_name ${DOMAIN};
+
+    # SSL Configuration
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem; # For OCSP stapling
+
+    # Include modern SSL parameters
+    include /etc/nginx/snippets/ssl-params.conf;
+
+    # Reverse Proxy Configuration
+    location / {
+        proxy_pass ${LOCAL_PROXY_PASS};
+        
+        # Standard proxy headers
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        
+        # For WebSocket support (optional but good to have)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # If backend is HTTPS
+        $( [[ "$BACKEND_PROTOCOL" == "https" ]] && echo 'proxy_ssl_server_name on;' )
+    }
+}
 EOF
     local enabled_link="/etc/nginx/sites-enabled/${DOMAIN}.conf"; if [[ -L "$enabled_link" ]]; then echo -e "${YELLOW}[!] Nginx 配置软链接已存在，将重新创建。${NC}"; rm -f "$enabled_link"; fi; ln -s "$NGINX_CONF_PATH" "$enabled_link"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] Nginx 配置已启用 (创建软链接)。${NC}"; else echo -e "${RED}[✗] 创建 Nginx 配置软链接失败。${NC}"; return 1; fi
     echo -e "${GREEN}[✓] Nginx 配置文件已生成并启用: ${NGINX_CONF_PATH}${NC}"; echo -e "${YELLOW}[!] Nginx 配置将在证书申请成功后进行测试和重载。${NC}"; return 0
@@ -719,18 +826,74 @@ EOF
     chmod +x "$DDNS_SCRIPT_PATH"; echo -e "${GREEN}[✓] DDNS 更新脚本 (v4.1) 创建成功: $DDNS_SCRIPT_PATH ${NC}"; return 0
 }
 
-# 设置 Cron 定时任务 (证书续期和 DDNS)
+# [v6.1] 设置 Cron 定时任务 (证书续期和 DDNS) - 续期钩子已更新
 setup_cron_jobs() {
     echo -e "${BLUE}[*] 设置 Cron 定时任务...${NC}"; echo -e "${BLUE}[*] 创建证书续期部署钩子脚本: $DEPLOY_HOOK_SCRIPT ...${NC}"; mkdir -p "$(dirname "$DEPLOY_HOOK_SCRIPT")"
+    
+    # [v6.1] 部署钩子脚本：复制证书并重载 Nginx
     cat > "$DEPLOY_HOOK_SCRIPT" <<EOF
 #!/bin/bash
-LOG_FILE="/var/log/cert_renew_${DOMAIN}.log"; CERT_PATH="${CERT_PATH}"; NGINX_CONF_PATH="${NGINX_CONF_PATH}"; LIVE_CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"; CONFIG_DIR="${CERT_PATH_PREFIX}/.managed_domains"; CONFIG_FILE="${CONFIG_DIR}/${DOMAIN}.conf"; LOCAL_PROXY_PASS="none"
-if [[ -f "\$CONFIG_FILE" ]]; then source "\$CONFIG_FILE"; fi
-log_hook() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }; mkdir -p \$(dirname "\$LOG_FILE"); log_hook "证书已为 ${DOMAIN} 续期。正在运行部署钩子..."
-if [[ ! -f "\${LIVE_CERT_DIR}/fullchain.pem" || ! -f "\${LIVE_CERT_DIR}/privkey.pem" ]]; then log_hook "错误：在 \${LIVE_CERT_DIR} 中找不到源证书文件。无法复制。"; exit 1; fi
-log_hook "正在从 \${LIVE_CERT_DIR} 复制新证书到 ${CERT_PATH}..."; if cp -L "\${LIVE_CERT_DIR}/fullchain.pem" "${CERT_PATH}/" && cp -L "\${LIVE_CERT_DIR}/privkey.pem" "${CERT_PATH}/" && cp -L "\${LIVE_CERT_DIR}/chain.pem" "${CERT_PATH}/" && cp -L "\${LIVE_CERT_DIR}/cert.pem" "${CERT_PATH}/"; then log_hook "成功：证书已复制到 ${CERT_PATH}。"; else log_hook "错误：复制证书文件失败。"; fi
-if [[ "${LOCAL_PROXY_PASS}" != "none" ]] && [[ -n "${NGINX_CONF_PATH}" ]] && [[ -f "${NGINX_CONF_PATH}" ]] && command -v nginx >/dev/null 2>&1; then log_hook "Nginx 配置文件 ${NGINX_CONF_PATH} 存在且已配置代理。正在重载 Nginx..."; if nginx -t -c /etc/nginx/nginx.conf; then if systemctl reload nginx; then log_hook "成功：Nginx 已成功重载。"; else log_hook "错误：重载 Nginx 失败。请检查 'systemctl status nginx' 和 'journalctl -u nginx'。"; fi; else log_hook "错误：Nginx 配置测试失败 (nginx -t)。跳过重载。请手动检查 Nginx 配置！"; fi; else if [[ "${LOCAL_PROXY_PASS}" == "none" ]]; then log_hook "此域名未配置 Nginx 代理。跳过 Nginx 重载。"; elif [[ ! -f "${NGINX_CONF_PATH}" ]]; then log_hook "找不到 Nginx 配置文件 ${NGINX_CONF_PATH}。跳过 Nginx 重载。"; else log_hook "找不到 nginx 命令或未配置 Nginx。跳过 Nginx 重载。"; fi; fi
-log_hook "为 ${DOMAIN} 执行的部署钩子已完成。"; exit 0
+# [v6.1] 证书续期部署钩子 for ${DOMAIN}
+# 此脚本由 Certbot 在成功续期后调用。
+# 任务1: 复制新证书到 ${CERT_PATH} (兼容 3x-ui)
+# 任务2: 重载 Nginx 以应用新证书
+
+LOG_FILE="/var/log/cert_renew_${DOMAIN}.log"
+CONFIG_DIR="${CERT_PATH_PREFIX}/.managed_domains"
+CONFIG_FILE="${CONFIG_DIR}/${DOMAIN}.conf"
+LIVE_CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+CERT_PATH="${CERT_PATH}"
+LOCAL_PROXY_PASS="none" # 默认值
+
+log_hook() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
+mkdir -p \$(dirname "\$LOG_FILE")
+log_hook "证书已为 ${DOMAIN} 续期。正在运行部署钩子..."
+
+# 任务1: 复制新证书
+if [[ ! -d "\$CERT_PATH" ]]; then
+    mkdir -p "\$CERT_PATH"
+fi
+log_hook "正在从 \${LIVE_CERT_DIR} 复制新证书到 ${CERT_PATH}..."
+if cp -L "\${LIVE_CERT_DIR}/fullchain.pem" "${CERT_PATH}/fullchain.pem" && \
+   cp -L "\${LIVE_CERT_DIR}/privkey.pem" "${CERT_PATH}/privkey.pem"; then
+    log_hook "成功: 证书已复制到 ${CERT_PATH}。"
+else
+    log_hook "错误: 复制证书文件失败。"
+fi
+
+# 从配置文件加载变量，以确定是否配置了 Nginx
+if [[ -f "\$CONFIG_FILE" ]]; then
+    source "\$CONFIG_FILE"
+else
+    log_hook "警告: 找不到配置文件 \$CONFIG_FILE。无法确定是否需要重载 Nginx。"
+    exit 0 # 即使配置不存在，也要继续执行，因为复制证书可能已成功
+fi
+
+# 任务2: 重载 Nginx
+if [[ "\${LOCAL_PROXY_PASS}" != "none" ]] && command -v nginx >/dev/null 2>&1; then
+    log_hook "检测到 Nginx 已配置，准备重载服务..."
+    
+    NGINX_CMD="/usr/sbin/nginx"
+    SYSTEMCTL_CMD="/bin/systemctl"
+
+    if [[ ! -x "\$NGINX_CMD" ]]; then NGINX_CMD=$(command -v nginx); fi
+    if [[ ! -x "\$SYSTEMCTL_CMD" ]]; then SYSTEMCTL_CMD=$(command -v systemctl); fi
+
+    if "\$NGINX_CMD" -t -c /etc/nginx/nginx.conf; then
+        if "\$SYSTEMCTL_CMD" reload nginx; then
+            log_hook "成功: Nginx 服务已成功重载。"
+        else
+            log_hook "错误: 重载 Nginx 失败。请检查 'systemctl status nginx'。"
+        fi
+    else
+        log_hook "错误: Nginx 配置测试失败 (nginx -t)。跳过重载。"
+    fi
+else
+    log_hook "此域名未配置 Nginx 代理或找不到 Nginx 命令。跳过 Nginx 重载。"
+fi
+
+log_hook "为 ${DOMAIN} 执行的部署钩子已完成。";
+exit 0
 EOF
     chmod +x "$DEPLOY_HOOK_SCRIPT"; echo -e "${GREEN}[✓] 证书续期部署钩子脚本创建成功: $DEPLOY_HOOK_SCRIPT ${NC}"
     CRON_TAG_RENEW="# CertRenew_${DOMAIN}"; CRON_TAG_DDNS="# DDNSUpdate_${DOMAIN}"; local CRON_CONTENT
@@ -752,12 +915,37 @@ EOF
     chmod 600 "$config_file"; echo -e "${GREEN}[✓] 配置已保存到: ${config_file}${NC}"
 }
 
-# 列出已配置的 Web 服务域名
+# [v6.1] 列出已配置的 Web 服务域名 (带详细信息)
 list_configured_domains() {
-    echo -e "${BLUE}[*] 当前已配置的 Web 服务域名列表:${NC}"; mkdir -p "$CONFIG_DIR"; local domains=(); local i=1
-    for config_file in "${CONFIG_DIR}"/*.conf; do if [[ -f "$config_file" && -r "$config_file" ]]; then local domain_name=$(basename "$config_file" .conf); echo -e "  ${CYAN}[$i]${NC} $domain_name"; domains+=("$domain_name"); ((i++)); fi; done
-    if [[ ${#domains[@]} -eq 0 ]]; then echo -e "${YELLOW}  未找到任何已配置的 Web 服务域名。${NC}"; return 1; fi; return 0
+    echo -e "\n${CYAN}--- 当前已配置的 Web 服务域名列表 ---${NC}"
+    mkdir -p "$CONFIG_DIR"
+    
+    if ! ls "${CONFIG_DIR}"/*.conf 1> /dev/null 2>&1; then
+        echo -e "${YELLOW}未找到任何已配置的 Web 服务域名。${NC}"
+        return 1
+    fi
+
+    local i=1
+    for config_file in "${CONFIG_DIR}"/*.conf; do
+        if [[ -f "$config_file" && -r "$config_file" ]]; then
+            # 加载配置文件中的变量
+            source "$config_file"
+            
+            echo -e " ${YELLOW}[$i]${NC} -------------------------------------"
+            echo -e "     ${CYAN}Domain:${NC}         ${GREEN}${DOMAIN}${NC}"
+            if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then
+                echo -e "     ${CYAN}Proxy Target:${NC}   ${GREEN}${LOCAL_PROXY_PASS}${NC}"
+                echo -e "     ${CYAN}Listening Port:${NC} ${GREEN}${NGINX_HTTPS_PORT} (HTTPS)${NC}"
+            else
+                echo -e "     ${CYAN}Proxy Target:${NC}   ${YELLOW}未配置 Nginx 代理${NC}"
+            fi
+            ((i++))
+        fi
+    done
+    echo -e "     -------------------------------------"
+    return 0
 }
+
 
 # 删除指定域名的配置和相关文件/任务
 delete_domain_config() {
@@ -777,7 +965,7 @@ delete_domain_config() {
     echo -e "${GREEN}[✓] 域名 ${DOMAIN_TO_DELETE} 的所有相关本地配置已成功删除！${NC}"; DOMAIN="" CF_API_TOKEN="" EMAIL="your@mail.com" CERT_PATH="" CLOUDFLARE_CREDENTIALS="" DEPLOY_HOOK_SCRIPT="" DDNS_SCRIPT_PATH="" DDNS_FREQUENCY=5 RECORD_TYPE="" ZONE_ID="" NGINX_CONF_PATH="" LOCAL_PROXY_PASS="" BACKEND_PROTOCOL="http" NGINX_HTTP_PORT=80 NGINX_HTTPS_PORT=443
 }
 
-# 添加新 Web 服务域名的主流程 (v5.1)
+# 添加新 Web 服务域名的主流程 (v6.1)
 add_new_domain() {
     echo -e "\n${CYAN}--- 9.1 添加新 Web 服务域名配置 ---${NC}"
     local overall_success=0 # 0 = success, 1 = failure
@@ -799,19 +987,21 @@ add_new_domain() {
     # --- 证书申请与后续步骤 ---
     if request_certificate; then
         # 证书申请成功
-        copy_certificate || overall_success=1
+        copy_certificate || overall_success=1 # [v6.1] 恢复证书复制
+        
         # 询问并开启 Cloudflare 代理
         if confirm_action "证书申请成功！是否要在 Cloudflare 上为此域名开启代理（橙色云朵）？"; then
             enable_cloudflare_proxy "$DOMAIN" || overall_success=1
         else echo -e "${YELLOW}用户选择不开启 Cloudflare 代理。${NC}"; fi
-        # 创建 DDNS 脚本 (使用修复后的模板)
+        
+        # 创建 DDNS 脚本
         create_ddns_script || overall_success=1
         setup_cron_jobs || overall_success=1
         save_domain_config || overall_success=1
 
         # 测试并重载 Nginx (如果配置了 Nginx)
         if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then
-            echo -e "\n${BLUE}[*] 检查 Nginx 配置并尝试重载 (证书已申请/复制)...${NC}"
+            echo -e "\n${BLUE}[*] 检查 Nginx 配置并尝试重载...${NC}"
             if ! command_exists nginx; then echo -e "${RED}[✗] Nginx 命令未找到。无法测试或重载配置。${NC}"; overall_success=1;
             else
                 nginx_test_output=$(nginx -t -c /etc/nginx/nginx.conf 2>&1); nginx_test_status=$?
@@ -1184,7 +1374,7 @@ set_timedate() {
 # --- 主菜单 ---
 show_main_menu() {
     check_root; local certbot_vsn="未知"; if command_exists certbot; then certbot_vsn=$(certbot --version 2>&1 | awk '{print $2}'); fi
-    echo -e "\n${CYAN}=======================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v5.7)     ${NC}"; echo -e "${CYAN}=======================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 系统信息查询"; echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"; echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "  ${YELLOW}6.${NC} DNS 配置管理"; echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ (优化网络)"; echo -e "  ${YELLOW}8.${NC} 调整系统时区"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}=======================================================${NC}"; read -p "请输入选项 [0-9]: " main_choice
+    echo -e "\n${CYAN}================================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v6.1 - Gemini-Mod)     ${NC}"; echo -e "${CYAN}================================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 系统信息查询"; echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"; echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "  ${YELLOW}6.${NC} DNS 配置管理"; echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ (优化网络)"; echo -e "  ${YELLOW}8.${NC} 调整系统时区"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}================================================================${NC}"; read -p "请输入选项 [0-9]: " main_choice
 }
 
 # --- 脚本入口 ---
