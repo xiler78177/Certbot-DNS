@@ -1,8 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v6.1 - Gemini-Mod)
+# 服务器初始化与管理脚本 (v6.3 - Gemini-Mod)
 # 修改日志:
+# v6.3:
+# 1.  **修复手动续期**: 修正了手动续期功能，确保 certbot 能正确调用部署钩子脚本。
+# v6.2:
+# 1.  **新增手动续期**: 在 Web 服务管理中增加了手动为指定域名续期证书的功能。
 # v6.1:
 # 1.  **恢复证书复制**: 为了兼容 3x-ui 等面板，重新加入了将证书复制到 /root/cert/ 目录的功能。
 # 2.  **增强续期钩子**: 证书自动续期后，deploy-hook 脚本现在会同时复制新证书并重载 Nginx。
@@ -870,8 +874,8 @@ else
 fi
 
 # 任务2: 重载 Nginx
-if [[ "\${LOCAL_PROXY_PASS}" != "none" ]] && command -v nginx >/dev/null 2>&1; then
-    log_hook "检测到 Nginx 已配置，准备重载服务..."
+if [[ "\${LOCAL_PROXY_PASS}" != "none" ]] && command -v nginx >/dev/null 2>&1 && [[ -f "\${NGINX_CONF_PATH}" ]]; then
+    log_hook "检测到 Nginx 已配置 (\${NGINX_CONF_PATH})，准备重载服务..."
     
     NGINX_CMD="/usr/sbin/nginx"
     SYSTEMCTL_CMD="/bin/systemctl"
@@ -889,7 +893,7 @@ if [[ "\${LOCAL_PROXY_PASS}" != "none" ]] && command -v nginx >/dev/null 2>&1; t
         log_hook "错误: Nginx 配置测试失败 (nginx -t)。跳过重载。"
     fi
 else
-    log_hook "此域名未配置 Nginx 代理或找不到 Nginx 命令。跳过 Nginx 重载。"
+    log_hook "找不到 Nginx 配置文件 \${NGINX_CONF_PATH}。跳过 Nginx 重载。"
 fi
 
 log_hook "为 ${DOMAIN} 执行的部署钩子已完成。";
@@ -965,6 +969,81 @@ delete_domain_config() {
     echo -e "${GREEN}[✓] 域名 ${DOMAIN_TO_DELETE} 的所有相关本地配置已成功删除！${NC}"; DOMAIN="" CF_API_TOKEN="" EMAIL="your@mail.com" CERT_PATH="" CLOUDFLARE_CREDENTIALS="" DEPLOY_HOOK_SCRIPT="" DDNS_SCRIPT_PATH="" DDNS_FREQUENCY=5 RECORD_TYPE="" ZONE_ID="" NGINX_CONF_PATH="" LOCAL_PROXY_PASS="" BACKEND_PROTOCOL="http" NGINX_HTTP_PORT=80 NGINX_HTTPS_PORT=443
 }
 
+# 手动续期指定域名的证书 (v6.3 修复)
+manual_renew_certificate() {
+    echo -e "\n${CYAN}--- 手动续期证书 ---${NC}"
+    echo -e "${YELLOW}[!] 此功能会强制为选定的域名尝试续期证书，无论其是否即将到期。${NC}"
+    list_configured_domains
+    if [[ $? -ne 0 ]]; then return; fi
+
+    local domains=()
+    for config_file in "${CONFIG_DIR}"/*.conf; do
+        if [[ -f "$config_file" && -r "$config_file" ]]; then
+            domains+=("$(basename "$config_file" .conf)")
+        fi
+    done
+
+    local choice
+    local DOMAIN_TO_RENEW
+    while true; do
+        read -p "请输入要续期的域名的序号 (输入 '0' 退出): " choice
+        if [[ "$choice" == "0" ]]; then
+            echo "取消续期操作。"
+            return
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#domains[@]} ]]; then
+            local index=$((choice - 1))
+            DOMAIN_TO_RENEW=${domains[$index]}
+            break
+        else
+            echo -e "${YELLOW}无效的序号，请重新输入。${NC}"
+        fi
+    done
+
+    echo -e "${BLUE}[*] 准备为域名 ${DOMAIN_TO_RENEW} 强制续期...${NC}"
+
+    if ! command_exists certbot; then
+        echo -e "${RED}[✗] certbot 命令未找到。无法执行续期。${NC}"
+        return 1
+    fi
+    
+    # [v6.3] 修复: 先加载配置，获取钩子脚本路径
+    local config_file_to_load="${CONFIG_DIR}/${DOMAIN_TO_RENEW}.conf"
+    if [[ ! -f "$config_file_to_load" ]]; then
+        echo -e "${RED}[✗] 找不到域名 ${DOMAIN_TO_RENEW} 的配置文件。${NC}"
+        return 1
+    fi
+    source "$config_file_to_load"
+
+    if [[ -z "$DEPLOY_HOOK_SCRIPT" || ! -f "$DEPLOY_HOOK_SCRIPT" ]]; then
+        echo -e "${RED}[✗] 未找到或未配置此域名的部署钩子脚本: ${DEPLOY_HOOK_SCRIPT}${NC}"
+        echo -e "${YELLOW}   无法执行安全的续期。请尝试使用 '删除' 功能后重新添加此域名的配置。${NC}"
+        return 1
+    fi
+
+    local certbot_cmd=$(command -v certbot)
+    # [v6.3] 修复: 在 certbot 命令中直接使用 --deploy-hook 参数
+    "$certbot_cmd" renew --cert-name "${DOMAIN_TO_RENEW}" --force-renewal --deploy-hook "$DEPLOY_HOOK_SCRIPT" --non-interactive --logs-dir /var/log/letsencrypt
+    local renew_status=$?
+
+    if [[ $renew_status -eq 0 ]]; then
+        echo -e "${GREEN}[✓] 证书续期和部署钩子已成功执行！${NC}"
+        echo -e "${BLUE}[*] 正在检查钩子脚本的日志输出...${NC}"
+        sleep 1 # 给日志文件一点写入时间
+        if [[ -f "/var/log/cert_renew_${DOMAIN_TO_RENEW}.log" ]]; then
+            echo -e "${CYAN}--- 部署日志 (最近10行) ---${NC}"
+            tail -n 10 "/var/log/cert_renew_${DOMAIN_TO_RENEW}.log"
+            echo -e "${CYAN}----------------------------${NC}"
+        else
+            echo -e "${YELLOW}[!] 未找到部署日志，但 Certbot 命令成功。请手动检查 Nginx 服务状态。${NC}"
+        fi
+    else
+        echo -e "${RED}[✗] 证书续期命令执行失败 (退出码: $renew_status)。${NC}"
+        echo -e "${RED}   请检查 certbot 日志 (/var/log/letsencrypt/letsencrypt.log) 获取详细信息。${NC}"
+    fi
+    return 0
+}
+
 # 添加新 Web 服务域名的主流程 (v6.1)
 add_new_domain() {
     echo -e "\n${CYAN}--- 9.1 添加新 Web 服务域名配置 ---${NC}"
@@ -1028,8 +1107,8 @@ add_new_domain() {
 
 # Web 服务管理主菜单
 manage_web_service() {
-     while true; do echo -e "\n${CYAN}--- 9. Web 服务管理 (LE + CF + Nginx) ---${NC}"; echo -e " ${YELLOW}1.${NC} 添加新域名并配置 (证书/代理/Nginx/DDNS)"; echo -e " ${YELLOW}2.${NC} 查看已配置的域名列表"; echo -e " ${YELLOW}3.${NC} 删除已配置的域名及其本地设置"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-3]: " web_choice
-        case $web_choice in 1) add_new_domain ;; 2) list_configured_domains ;; 3) delete_domain_config ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
+     while true; do echo -e "\n${CYAN}--- 9. Web 服务管理 (LE + CF + Nginx) ---${NC}"; echo -e " ${YELLOW}1.${NC} 添加新域名并配置 (证书/代理/Nginx/DDNS)"; echo -e " ${YELLOW}2.${NC} 查看已配置的域名列表"; echo -e " ${YELLOW}3.${NC} 删除已配置的域名及其本地设置"; echo -e " ${YELLOW}4.${NC} 手动续期指定域名的证书"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-4]: " web_choice
+        case $web_choice in 1) add_new_domain ;; 2) list_configured_domains ;; 3) delete_domain_config ;; 4) manual_renew_certificate ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $web_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
 }
@@ -1374,7 +1453,7 @@ set_timedate() {
 # --- 主菜单 ---
 show_main_menu() {
     check_root; local certbot_vsn="未知"; if command_exists certbot; then certbot_vsn=$(certbot --version 2>&1 | awk '{print $2}'); fi
-    echo -e "\n${CYAN}================================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v6.1 - Gemini-Mod)     ${NC}"; echo -e "${CYAN}================================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 系统信息查询"; echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"; echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "  ${YELLOW}6.${NC} DNS 配置管理"; echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ (优化网络)"; echo -e "  ${YELLOW}8.${NC} 调整系统时区"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}================================================================${NC}"; read -p "请输入选项 [0-9]: " main_choice
+    echo -e "\n${CYAN}================================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v6.3 - Gemini-Mod)     ${NC}"; echo -e "${CYAN}================================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 系统信息查询"; echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"; echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "  ${YELLOW}6.${NC} DNS 配置管理"; echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ (优化网络)"; echo -e "  ${YELLOW}8.${NC} 调整系统时区"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}================================================================${NC}"; read -p "请输入选项 [0-9]: " main_choice
 }
 
 # --- 脚本入口 ---
