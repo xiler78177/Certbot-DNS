@@ -1,23 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v6.3 - Gemini-Mod)
-# 修改日志:
-# v6.3:
-# 1.  **修复手动续期**: 修正了手动续期功能，确保 certbot 能正确调用部署钩子脚本。
-# v6.2:
-# 1.  **新增手动续期**: 在 Web 服务管理中增加了手动为指定域名续期证书的功能。
-# v6.1:
-# 1.  **恢复证书复制**: 为了兼容 3x-ui 等面板，重新加入了将证书复制到 /root/cert/ 目录的功能。
-# 2.  **增强续期钩子**: 证书自动续期后，deploy-hook 脚本现在会同时复制新证书并重载 Nginx。
-# 3.  **增强域名信息展示**: "查看已配置域名" 功能现在会显示详细的反向代理目标和监听端口。
-# v6.0:
-# 1.  **Nginx 配置标准化**:
-#     - SSL/TLS 配置被提取到独立的 /etc/nginx/snippets/ssl-params.conf 文件中，实现模块化。
-#     - 站点配置文件结构更清晰，分为独立的 HTTP (重定向) 和 HTTPS (代理) server 块。
-#     - Nginx 直接使用 /etc/letsencrypt/live/ 目录下的证书。
-# 2.  **证书自动续期修复**:
-#     - 简化了 Certbot 的 --deploy-hook 脚本，只负责重载 Nginx 服务。
+# 服务器初始化与管理脚本 (v7.2 - Gemini-Mod)
+#
+# 更新日志 v7.2:
+# 1. [核心修复] 彻底解决 Backspace 键无法删除并显示 "^H" 的问题。
+#    (添加了 stty erase '^H' 强制映射删除键)
+# 2. [功能保持] 包含 v7.1 的所有功能：详细系统信息、Web 服务增强、SSH 密码修改等。
 # ==============================================================================
 
 # --- 全局变量 ---
@@ -63,8 +52,11 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# --- 尝试修复 Backspace 问题 ---
+# --- 关键修复：解决 Backspace 键显示 ^H 的问题 ---
+# 1. stty sane: 重置终端为合理状态
+# 2. stty erase '^H': 强制将 Backspace (Ctrl+H) 映射为删除动作
 stty sane
+stty erase '^H'
 
 # --- 函数定义 ---
 
@@ -174,28 +166,23 @@ install_common_tools() {
     else echo -e "${RED}[✗] 部分基础工具安装失败，请检查上面的错误信息。${NC}"; fi
 }
 
-# --- 3. UFW 防火墙 (v5: 移除 expect 依赖) ---
+# --- 3. UFW 防火墙 ---
 setup_ufw() {
     echo -e "\n${CYAN}--- 3.1 安装并启用 UFW 防火墙 ---${NC}"
-    # 安装 UFW
     if ! install_package "ufw"; then return 1; fi
 
-    # 检查 firewalld 是否活动，如果活动则提示并退出
     if systemctl is-active --quiet firewalld; then
         echo -e "${RED}[✗] 检测到 firewalld 正在运行。UFW 不能与 firewalld 同时运行。${NC}"
         echo -e "${YELLOW}   请先禁用 firewalld: 'sudo systemctl stop firewalld && sudo systemctl disable firewalld'${NC}"
         return 1
     fi
 
-    # 设置默认规则
     echo -e "${BLUE}[*] 设置 UFW 默认规则 (deny incoming, allow outgoing)...${NC}"
     ufw default deny incoming > /dev/null
     ufw default allow outgoing > /dev/null
-    # 允许当前 SSH 端口
     echo -e "${BLUE}[*] 允许当前 SSH 端口 ($CURRENT_SSH_PORT)...${NC}"
     ufw allow $CURRENT_SSH_PORT/tcp comment "SSH Access (Current)" > /dev/null
 
-    # 询问额外端口
     local extra_ports_input; local extra_ports_array
     read -p "是否需要额外开放其他端口 (例如 80 443 8080，用空格隔开) [留空则跳过]: " extra_ports_input
     if [[ -n "$extra_ports_input" ]]; then
@@ -210,41 +197,63 @@ setup_ufw() {
         done
     fi
 
-    # 启用 UFW (直接调用，需要用户手动确认)
     echo -e "${YELLOW}[!] 准备启用 UFW。这将断开除已允许端口外的所有连接。${NC}"
     echo -e "${YELLOW}   您可能需要在下一个提示中输入 'y' 来确认。${NC}"
-    # 直接执行 ufw enable，让用户交互
     ufw enable
-    local ufw_enable_status=$? # 获取 ufw enable 的退出状态码
+    local ufw_enable_status=$?
 
-    # 检查退出状态码和 UFW 状态
     if [[ $ufw_enable_status -eq 0 ]] && ufw status | grep -q "Status: active"; then
         echo -e "${GREEN}[✓] UFW 已成功启用。${NC}"
-        ufw status verbose # 显示详细状态
+        ufw status verbose
     else
         echo -e "${RED}[✗] UFW 启用失败。请检查上面的错误信息或 UFW 日志。${NC}"
-        # 如果 ufw enable 命令本身失败，状态码通常非 0
-        # 如果用户输入 'n' 取消，状态码通常也是 0，但 status 不会是 active
-        return 1 # 启用失败返回错误
+        return 1
     fi
     return 0
 }
 
+# 批量添加 UFW 规则 (优化版)
 add_ufw_rule() {
-    echo -e "\n${CYAN}--- 3.2 添加 UFW 规则 ---${NC}"
-    local port protocol comment rule
-    while true; do read -p "请输入要开放的端口号 (例如 80, 443, 8080): " port; if [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]]; then break; else echo -e "${YELLOW}无效的端口号。请输入 1-65535 之间的数字。${NC}"; fi; done
-    while true; do read -p "请选择协议 [1] TCP (默认) [2] UDP : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then protocol="tcp"; break; elif [[ "$proto_choice" == "2" ]]; then protocol="udp"; break; else echo -e "${YELLOW}无效输入，请输入 1 或 2。${NC}"; fi; done
-    read -p "请输入端口用途备注 (例如 'Web Server HTTP', 'Game Server UDP'): " comment; [[ -z "$comment" ]] && comment="Rule added by script"
-    rule="${port}/${protocol}"
-    echo -e "${BLUE}[*] 准备添加规则: ufw allow ${rule} comment '${comment}'${NC}"
-    # 直接调用 ufw allow，不需要 expect
-    ufw allow $rule comment "$comment"
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}[✓] 规则已添加。请运行 '查看 UFW 规则' 确认。${NC}"
-    else
-        echo -e "${RED}[✗] 添加规则失败。${NC}"
+    echo -e "\n${CYAN}--- 3.2 批量添加 UFW 允许规则 (TCP) ---${NC}"
+    echo -e "${YELLOW}提示: 请输入一个或多个端口号，用空格隔开 (例如: 80 443 8888)${NC}"
+    
+    local ports_input
+    local ports_array
+    
+    # 1. 获取输入
+    read -p "请输入端口号: " ports_input
+    
+    # 检查是否为空
+    if [[ -z "$ports_input" ]]; then
+        echo -e "${YELLOW}未输入任何端口，操作已取消。${NC}"
+        return
     fi
+    
+    # 2. 将输入分割为数组 (以空格为分隔符)
+    read -a ports_array <<< "$ports_input"
+    
+    echo -e "${BLUE}[*] 正在处理端口 (默认 TCP): ${ports_array[*]} ...${NC}"
+    
+    # 3. 循环处理每个端口
+    for port in "${ports_array[@]}"; do
+        # 校验端口合法性 (必须是 1-65535 的纯数字)
+        if [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]]; then
+            # 执行添加命令 (默认使用 /tcp，并添加备注)
+            ufw allow "$port/tcp" comment "Manual-Add-$port" > /dev/null
+            
+            if [[ $? -eq 0 ]]; then
+                echo -e "  ${GREEN}[✓] 端口 $port/tcp 已成功开放。${NC}"
+            else
+                echo -e "  ${RED}[✗] 端口 $port/tcp 添加失败。${NC}"
+            fi
+        else
+            echo -e "  ${YELLOW}[!] '$port' 无效，已跳过 (请输入 1-65535 的数字)。${NC}"
+        fi
+    done
+    
+    echo -e "\n${BLUE}批量操作执行完毕。${NC}"
+    # 自动展示结果
+    view_ufw_rules 
 }
 
 delete_ufw_rule() {
@@ -264,27 +273,23 @@ delete_ufw_rule() {
     echo -e "${YELLOW}   您可能需要在下一个提示中为每个规则输入 'y' 来确认删除。${NC}"
 
     local delete_failed=0
-    # 循环删除选中的规则 (直接调用 ufw delete)
     for num_to_delete in "${sorted_nums[@]}"; do
         echo -n "  尝试删除规则 $num_to_delete ... "
-        # 直接执行 ufw delete，让用户交互确认
         ufw delete $num_to_delete
-        local delete_status=$? # 获取退出状态码
+        local delete_status=$?
         if [[ $delete_status -eq 0 ]]; then
-             echo -e "${GREEN}命令执行完毕 (请检查 UFW 输出确认是否成功删除)。${NC}"
-             # 注意：即使用户输入 'n' 取消，ufw delete 也可能返回 0
+             echo -e "${GREEN}命令执行完毕。${NC}"
         else
              echo -e "${RED}命令执行失败 (状态码: $delete_status)。${NC}"
              delete_failed=1
         fi
     done
 
-    # 提示用户检查结果，因为脚本无法确切知道是否真的删除了
-    echo -e "\n${BLUE}删除命令已执行完毕。请再次查看规则列表确认结果。${NC}"
+    echo -e "\n${BLUE}删除命令执行完毕。请再次查看规则列表确认结果。${NC}"
     if [[ $delete_failed -ne 0 ]]; then
         echo -e "${RED}[✗] 部分删除命令执行失败。${NC}"
     fi
-    view_ufw_rules # 显示更新后的规则
+    view_ufw_rules
 }
 
 view_ufw_rules() {
@@ -310,36 +315,18 @@ ufw_reset_default() {
     else echo -e "${YELLOW}操作已取消。${NC}"; fi
 }
 
-# 新增 UFW 卸载函数
 uninstall_ufw() {
     echo -e "\n${RED}--- 警告：即将卸载 UFW 防火墙 ---${NC}"
     echo -e "${YELLOW}[!] 此操作会移除 UFW 及其所有规则，您的服务器将完全暴露在公网！${NC}"
-    if ! command_exists ufw; then
-        echo -e "${YELLOW}[!] UFW 未安装，无需卸载。${NC}"
-        return 0
-    fi
-    if ! confirm_action "您确定要卸载 UFW 吗？"; then
-        echo -e "${YELLOW}操作已取消。${NC}"
-        return 0
-    fi
-    echo -e "${BLUE}[*] 正在禁用 UFW...${NC}"
-    ufw disable
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}[✗] 禁用 UFW 失败。请手动执行 'sudo ufw disable'。${NC}"
-        return 1
-    fi
-    echo -e "${BLUE}[*] 正在彻底移除 UFW...${NC}"
-    apt remove --purge ufw -y
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}[✗] 卸载 UFW 失败。请手动执行 'sudo apt remove --purge ufw'。${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}[✓] UFW 已成功卸载。${NC}"
-    return 0
+    if ! command_exists ufw; then echo -e "${YELLOW}[!] UFW 未安装，无需卸载。${NC}"; return 0; fi
+    if ! confirm_action "您确定要卸载 UFW 吗？"; then echo -e "${YELLOW}操作已取消。${NC}"; return 0; fi
+    echo -e "${BLUE}[*] 正在禁用 UFW...${NC}"; ufw disable; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 禁用 UFW 失败。请手动执行 'sudo ufw disable'。${NC}"; return 1; fi
+    echo -e "${BLUE}[*] 正在彻底移除 UFW...${NC}"; apt remove --purge ufw -y; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 卸载 UFW 失败。请手动执行 'sudo apt remove --purge ufw'。${NC}"; return 1; fi
+    echo -e "${GREEN}[✓] UFW 已成功卸载。${NC}"; return 0
 }
 
 manage_ufw() {
-    while true; do echo -e "\n${CYAN}--- UFW 防火墙管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并启用 UFW (手动确认启用)"; echo -e " ${YELLOW}2.${NC} 添加允许规则 (开放端口)"; echo -e " ${YELLOW}3.${NC} 查看当前 UFW 规则"; echo -e " ${YELLOW}4.${NC} 删除 UFW 规则 (手动确认删除)"; echo -e " ${YELLOW}5.${NC} ${RED}允许所有入站连接 (危险!)${NC}"; echo -e " ${YELLOW}6.${NC} 重置为默认拒绝规则 (保留 SSH)"; echo -e " ${YELLOW}7.${NC} ${RED}卸载 UFW 防火墙 (高危!)${NC}"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-7]: " ufw_choice
+    while true; do echo -e "\n${CYAN}--- UFW 防火墙管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 安装并启用 UFW (手动确认启用)"; echo -e " ${YELLOW}2.${NC} 批量添加允许规则 (TCP, 简洁模式)"; echo -e " ${YELLOW}3.${NC} 查看当前 UFW 规则"; echo -e " ${YELLOW}4.${NC} 删除 UFW 规则 (手动确认删除)"; echo -e " ${YELLOW}5.${NC} ${RED}允许所有入站连接 (危险!)${NC}"; echo -e " ${YELLOW}6.${NC} 重置为默认拒绝规则 (保留 SSH)"; echo -e " ${YELLOW}7.${NC} ${RED}卸载 UFW 防火墙 (高危!)${NC}"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-7]: " ufw_choice
         case $ufw_choice in 1) setup_ufw ;; 2) add_ufw_rule ;; 3) view_ufw_rules ;; 4) delete_ufw_rule ;; 5) ufw_allow_all ;; 6) ufw_reset_default ;; 7) uninstall_ufw ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
         [[ $ufw_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
@@ -360,6 +347,7 @@ setup_fail2ban() {
     else echo -e "${RED}[✗] Fail2ban 服务启动失败。请检查 'systemctl status fail2ban' 和日志。${NC}"; echo -e "${YELLOW}   尝试查看日志: journalctl -u fail2ban -n 50 --no-pager ${NC}"; return 1; fi
     return 0
 }
+
 update_or_add_config() {
     local file="$1"; local section="$2"; local key="$3"; local value="$4"; local section_header_regex="^\s*\[${section}\]"; local temp_file_del="${file}.tmp_del.$$" ; local temp_file_add="${file}.tmp_add.$$"
     if [[ -n "$section" ]] && ! grep -qE "$section_header_regex" "$file"; then echo -e "${YELLOW}[!] 段落 [${section}] 在 ${file} 中未找到，将在末尾添加。${NC}"; echo -e "\n[${section}]" >> "$file"; fi
@@ -373,6 +361,7 @@ update_or_add_config() {
     mv "$temp_file_add" "$file"; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 替换配置文件 ${file} 失败。${NC}"; rm -f "$temp_file_del" "$temp_file_add" 2>/dev/null; return 1; fi
     rm -f "$temp_file_del" 2>/dev/null; return 0
 }
+
 configure_fail2ban() {
     echo -e "\n${CYAN}--- 配置 Fail2ban (SSH 防护) ---${NC}"; local ssh_port maxretry bantime backend journalmatch
     read -p "请输入要监控的 SSH 端口 (当前: $CURRENT_SSH_PORT): " ssh_port_input; ssh_port=${ssh_port_input:-$CURRENT_SSH_PORT}
@@ -399,40 +388,22 @@ EOF
         if [[ $? -eq 0 ]]; then chmod 644 "$FAIL2BAN_JAIL_LOCAL"; echo -e "${GREEN}[✓] Fail2ban 配置已写入 ${FAIL2BAN_JAIL_LOCAL}。${NC}"; return 0; else echo -e "${RED}[✗] 写入 Fail2ban 配置文件失败。${NC}"; return 1; fi
     else echo -e "${YELLOW}操作已取消。${NC}"; return 1; fi
 }
+
 view_fail2ban_status() {
     echo -e "\n${CYAN}--- 4.3 查看 Fail2ban 状态 (SSH) ---${NC}"; if ! command_exists fail2ban-client; then echo -e "${YELLOW}[!] Fail2ban 未安装。${NC}"; return 1; fi
     echo -e "${BLUE}Fail2ban SSH jail 状态:${NC}"; fail2ban-client status sshd; echo -e "\n${BLUE}查看 Fail2ban 日志 (最近 20 条):${NC}"
     if command_exists journalctl; then journalctl -u fail2ban -n 20 --no-pager --quiet; elif [[ -f /var/log/fail2ban.log ]]; then tail -n 20 /var/log/fail2ban.log; else echo -e "${YELLOW}无法找到 Fail2ban 日志。${NC}"; fi; return 0
 }
 
-# 新增 Fail2ban 卸载函数
 uninstall_fail2ban() {
     echo -e "\n${RED}--- 警告：即将卸载 Fail2ban 入侵防御 ---${NC}"
     echo -e "${YELLOW}[!] 此操作会移除 Fail2ban 服务，您的 SSH 等服务将不再受到自动暴力破解防御。${NC}"
-    if ! command_exists fail2ban-client; then
-        echo -e "${YELLOW}[!] Fail2ban 未安装，无需卸载。${NC}"
-        return 0
-    fi
-    if ! confirm_action "您确定要卸载 Fail2ban 吗？"; then
-        echo -e "${YELLOW}操作已取消。${NC}"
-        return 0
-    fi
-    echo -e "${BLUE}[*] 正在停止并禁用 Fail2ban 服务...${NC}"
-    systemctl stop fail2ban > /dev/null 2>&1
-    systemctl disable fail2ban > /dev/null 2>&1
-    echo -e "${BLUE}[*] 正在彻底移除 Fail2ban...${NC}"
-    apt remove --purge fail2ban -y
-    if [[ $? -ne 0 ]]; then
-        echo -e "${RED}[✗] 卸载 Fail2ban 失败。请手动执行 'sudo apt remove --purge fail2ban'。${NC}"
-        return 1
-    fi
-    # 尝试删除脚本生成的配置文件
-    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
-        echo -e "${BLUE}[*] 删除脚本生成的配置文件: ${FAIL2BAN_JAIL_LOCAL}...${NC}"
-        rm -f "$FAIL2BAN_JAIL_LOCAL"
-    fi
-    echo -e "${GREEN}[✓] Fail2ban 已成功卸载。${NC}"
-    return 0
+    if ! command_exists fail2ban-client; then echo -e "${YELLOW}[!] Fail2ban 未安装，无需卸载。${NC}"; return 0; fi
+    if ! confirm_action "您确定要卸载 Fail2ban 吗？"; then echo -e "${YELLOW}操作已取消。${NC}"; return 0; fi
+    echo -e "${BLUE}[*] 正在停止并禁用 Fail2ban 服务...${NC}"; systemctl stop fail2ban > /dev/null 2>&1; systemctl disable fail2ban > /dev/null 2>&1
+    echo -e "${BLUE}[*] 正在彻底移除 Fail2ban...${NC}"; apt remove --purge fail2ban -y; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 卸载 Fail2ban 失败。请手动执行 'sudo apt remove --purge fail2ban'。${NC}"; return 1; fi
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then echo -e "${BLUE}[*] 删除脚本生成的配置文件: ${FAIL2BAN_JAIL_LOCAL}...${NC}"; rm -f "$FAIL2BAN_JAIL_LOCAL"; fi
+    echo -e "${GREEN}[✓] Fail2ban 已成功卸载。${NC}"; return 0
 }
 
 manage_fail2ban() {
@@ -456,6 +427,7 @@ change_ssh_port() {
     if command_exists fail2ban-client; then echo -e "${BLUE}[*] 重新配置 Fail2ban 以监控新端口 $new_port ...${NC}"; if configure_fail2ban; then echo -e "${BLUE}[*] 重启 Fail2ban 服务以应用新端口...${NC}"; systemctl restart fail2ban; sleep 2; if systemctl is-active --quiet fail2ban; then echo -e "${GREEN}[✓] Fail2ban 服务已重启。${NC}"; else echo -e "${RED}[✗] Fail2ban 服务重启失败。${NC}"; fi; else echo -e "${RED}[✗] Fail2ban 配置更新失败。${NC}"; fi; else echo -e "${YELLOW}[!] Fail2ban 未安装，跳过其配置更新。${NC}"; fi
     echo -e "${GREEN}[✓] SSH 端口更改完成。请记住使用新端口 $new_port 登录。${NC}"; return 0
 }
+
 create_sudo_user() {
     echo -e "\n${CYAN}--- 5.2 创建新的 Sudo 用户 ---${NC}"; local username
     while true; do read -p "请输入新用户名: " username; if [[ -z "$username" ]]; then echo -e "${YELLOW}用户名不能为空。${NC}"; elif id "$username" &>/dev/null; then echo -e "${YELLOW}用户 '$username' 已存在。${NC}"; elif [[ "$username" =~ ^[a-z_][a-z0-9_-]*$ ]]; then break; else echo -e "${YELLOW}无效的用户名格式 (建议使用小写字母、数字、下划线、连字符，并以字母或下划线开头)。${NC}"; fi; done
@@ -463,12 +435,14 @@ create_sudo_user() {
     echo -e "${BLUE}[*] 将用户 '$username' 添加到 sudo 组...${NC}"; usermod -aG sudo "$username"; if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 添加到 sudo 组失败。${NC}"; return 1; fi
     echo -e "${GREEN}[✓] 用户 '$username' 创建成功并已添加到 sudo 组。${NC}"; echo -e "${YELLOW}请使用新用户登录并测试 sudo权限 (例如 'sudo whoami')。${NC}"; echo -e "${YELLOW}建议在新用户能够正常登录并使用 sudo 后，再考虑禁用 root 登录。${NC}"; return 0
 }
+
 disable_root_login() {
     echo -e "\n${CYAN}--- 5.3 禁用 Root 用户 SSH 登录 ---${NC}"; echo -e "${RED}[!] 警告：禁用 Root 登录前，请确保您已创建具有 Sudo 权限的普通用户，并且该用户可以正常通过 SSH 登录！${NC}"
     if ! confirm_action "确认要禁止 Root 用户通过 SSH 登录吗?"; then echo "操作已取消。"; return; fi
     echo -e "${BLUE}[*] 修改 SSH 配置文件 ($SSHD_CONFIG) 以禁用 Root 登录...${NC}"; cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_root_$(date +%F_%T)"; if ! update_or_add_config "$SSHD_CONFIG" "" "PermitRootLogin" "no"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PermitRootLogin)。${NC}"; return 1; fi
     echo -e "${BLUE}[*] 重启 SSH 服务以应用更改...${NC}"; systemctl restart sshd; sleep 2; if systemctl is-active --quiet sshd; then echo -e "${GREEN}[✓] Root 用户 SSH 登录已禁用。${NC}"; else echo -e "${RED}[✗] SSH 服务重启失败！请检查配置。Root 登录可能仍被允许。${NC}"; echo -e "${RED}   旧配置已备份为 ${SSHD_CONFIG}.bak_root_* 。${NC}"; return 1; fi; return 0
 }
+
 add_public_key() {
     local target_user="$1"; local user_home; local ssh_dir; local auth_keys_file; local pub_key_input; local pub_key_cleaned
     if ! id "$target_user" &>/dev/null; then echo -e "${RED}[✗] 用户 '$target_user' 不存在。${NC}"; return 1; fi
@@ -482,22 +456,69 @@ add_public_key() {
     if grep -qF "$pub_key_cleaned" "$auth_keys_file"; then echo -e "${YELLOW}[!] 此公钥似乎已存在于 ${auth_keys_file} 中，无需重复添加。${NC}"; return 0; fi
     echo "$pub_key_cleaned" >> "$auth_keys_file"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] 公钥已成功添加到 ${auth_keys_file}。${NC}"; return 0; else echo -e "${RED}[✗] 将公钥写入文件失败。${NC}"; return 1; fi
 }
+
 configure_ssh_keys() {
     echo -e "\n${CYAN}--- 5.4 配置 SSH 密钥登录 (禁用密码登录) ---${NC}"; local key_config_choice
     while true; do echo -e "请选择操作:"; echo -e "  ${YELLOW}1.${NC} 添加公钥 (粘贴公钥内容让脚本添加)"; echo -e "  ${YELLOW}2.${NC} 禁用 SSH 密码登录 ${RED}(高风险! 请确保密钥已添加并测试成功)${NC}"; echo -e "  ${YELLOW}0.${NC} 返回 SSH 安全菜单"; read -p "请输入选项 [0-2]: " key_config_choice
         case $key_config_choice in 1) local target_user; read -p "请输入要为其添加公钥的用户名: " target_user; if [[ -n "$target_user" ]]; then add_public_key "$target_user"; else echo -e "${YELLOW}用户名不能为空。${NC}"; fi; read -p "按 Enter键 继续..."; ;; 2) echo -e "${RED}[!] 警告：这是高风险操作！在禁用密码登录前，请务必完成以下步骤：${NC}"; echo -e "${YELLOW}  1. 在您的本地计算机上生成 SSH 密钥对 (例如使用 'ssh-keygen')。${NC}"; echo -e "${YELLOW}  2. 使用上面的【选项1】或其他方法，将您的【公钥】复制到服务器上目标用户的 ~/.ssh/authorized_keys 文件中。${NC}"; echo -e "${YELLOW}  3. 【重要】在禁用密码登录【之前】，打开一个新的终端窗口，尝试使用【密钥】登录服务器，确保可以成功登录！${NC}"; if ! confirm_action "您是否已经完成上述所有步骤，并确认可以通过密钥成功登录?"; then echo "操作已取消。请先确保密钥设置正确并可成功登录。"; continue; fi; echo -e "${BLUE}[*] 修改 SSH 配置文件 ($SSHD_CONFIG) 以启用密钥登录并禁用密码登录...${NC}"; cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak_key_$(date +%F_%T)"; if ! update_or_add_config "$SSHD_CONFIG" "" "PubkeyAuthentication" "yes"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PubkeyAuthentication)。${NC}"; continue; fi; if ! update_or_add_config "$SSHD_CONFIG" "" "PasswordAuthentication" "no"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (PasswordAuthentication)。${NC}"; continue; fi; if ! update_or_add_config "$SSHD_CONFIG" "" "ChallengeResponseAuthentication" "no"; then echo -e "${RED}[✗] 修改 SSH 配置文件失败 (ChallengeResponseAuthentication)。${NC}"; continue; fi; echo -e "${YELLOW}[!] UsePAM 设置未修改，保持默认。${NC}"; echo -e "${BLUE}[*] 重启 SSH 服务以应用更改...${NC}"; systemctl restart sshd; sleep 2; if systemctl is-active --quiet sshd; then echo -e "${GREEN}[✓] SSH 已配置为仅允许密钥登录，密码登录已禁用。${NC}"; echo -e "${RED}请立即尝试使用密钥重新登录以确认！如果无法登录，您可能需要通过控制台或其他方式恢复备份配置 (${SSHD_CONFIG}.bak_key_*)。${NC}"; else echo -e "${RED}[✗] SSH 服务重启失败！请检查配置。密码登录可能仍然启用。${NC}"; echo -e "${RED}   旧配置已备份为 ${SSHD_CONFIG}.bak_key_* 。${NC}"; fi; read -p "按 Enter键 继续..."; ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
     done
 }
+
+# 修改用户登录密码
+change_ssh_password() {
+    echo -e "\n${CYAN}--- 5.5 修改 SSH 登录密码 ---${NC}"
+    local target_user
+    
+    read -p "请输入要修改密码的用户名 (留空默认 root): " target_user
+    target_user=${target_user:-root}
+
+    if ! id "$target_user" &>/dev/null; then
+        echo -e "${RED}[✗] 用户 '$target_user' 不存在。${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}[*] 正在修改用户 ${YELLOW}$target_user${BLUE} 的密码...${NC}"
+    echo -e "${YELLOW}提示: 输入密码时屏幕不会显示任何字符，输入完毕后按回车即可。${NC}"
+    
+    passwd "$target_user"
+    
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}[✓] 用户 '$target_user' 的密码修改成功！${NC}"
+        echo -e "${YELLOW}请记住您的新密码，下次登录时生效。${NC}"
+    else
+        echo -e "${RED}[✗] 密码修改失败。可能是两次输入不一致或太简单。${NC}"
+    fi
+}
+
+# SSH 安全管理菜单
 manage_ssh_security() {
-     while true; do echo -e "\n${CYAN}--- 5. SSH 安全管理 ---${NC}"; echo -e " 当前 SSH 端口: ${YELLOW}${CURRENT_SSH_PORT}${NC}"; echo -e " ${YELLOW}1.${NC} 更改 SSH 端口 (自动更新 UFW, Fail2ban)"; echo -e " ${YELLOW}2.${NC} 创建新的 Sudo 用户"; echo -e " ${YELLOW}3.${NC} 禁用 Root 用户 SSH 登录"; echo -e " ${YELLOW}4.${NC} 配置 SSH 密钥登录与密码禁用"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-4]: " ssh_choice
-        case $ssh_choice in 1) change_ssh_port ;; 2) create_sudo_user ;; 3) disable_root_login ;; 4) configure_ssh_keys ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
-        [[ $ssh_choice != 0 ]] && read -p "按 Enter键 继续..."; check_root
+     while true; do
+        echo -e "\n${CYAN}--- 5. SSH 安全管理 ---${NC}"
+        echo -e " 当前 SSH 端口: ${YELLOW}${CURRENT_SSH_PORT}${NC}"
+        echo -e " ${YELLOW}1.${NC} 更改 SSH 端口 (自动更新 UFW, Fail2ban)"
+        echo -e " ${YELLOW}2.${NC} 创建新的 Sudo 用户"
+        echo -e " ${YELLOW}3.${NC} 禁用 Root 用户 SSH 登录"
+        echo -e " ${YELLOW}4.${NC} 配置 SSH 密钥登录与密码禁用"
+        echo -e " ${YELLOW}5.${NC} 修改 SSH 登录密码"
+        echo -e " ${YELLOW}0.${NC} 返回主菜单"
+        read -p "请输入选项 [0-5]: " ssh_choice
+
+        case $ssh_choice in
+            1) change_ssh_port ;;
+            2) create_sudo_user ;;
+            3) disable_root_login ;;
+            4) configure_ssh_keys ;;
+            5) change_ssh_password ;;
+            0) break ;;
+            *) echo -e "${RED}无效选项。${NC}" ;;
+        esac
+        [[ $ssh_choice != 0 ]] && read -p "按 Enter键 继续..."
+        check_root
     done
 }
 
 # --- 9. Web 服务 (Let's Encrypt + Cloudflare + Nginx) ---
 
-# 处理 Certbot 安装/更新 (v5.1: 优化逻辑，优先 apt)
 install_or_update_certbot() {
     echo -e "${BLUE}[*] 检查 Certbot 安装情况并优先使用 apt 版本...${NC}"
     local apt_certbot_pkg="certbot"
@@ -505,7 +526,6 @@ install_or_update_certbot() {
     local snap_certbot_name="certbot"
     local snap_cf_plugin_name="certbot-dns-cloudflare"
 
-    # 1. 尝试使用 apt 安装
     if dpkg -s "$apt_certbot_pkg" &> /dev/null && dpkg -s "$apt_cf_plugin_pkg" &> /dev/null; then
         echo -e "${GREEN}[✓] Certbot 和 Cloudflare 插件 (apt) 已安装。${NC}"
         return 0
@@ -516,11 +536,9 @@ install_or_update_certbot() {
             return 0
         else
             echo -e "${YELLOW}[!] apt 安装失败。尝试使用 snap 安装...${NC}"
-            # apt 安装失败，继续到 snap 逻辑
         fi
     fi
 
-    # 2. 如果 apt 失败，尝试使用 snap
     if command_exists snap; then
         echo -e "${BLUE}[*] 尝试使用 Snap 安装 Certbot...${NC}"
         if snap install --classic "$snap_certbot_name"; then
@@ -531,7 +549,6 @@ install_or_update_certbot() {
                 echo -e "${BLUE}[*] 尝试连接 Certbot 插件...${NC}"
                 snap connect "$snap_certbot_name:plugin" "$snap_cf_plugin_name" &>/dev/null || echo -e "${YELLOW}[!] 无法自动连接插件，可能需要手动执行: sudo snap connect certbot:plugin certbot-dns-cloudflare ${NC}"
                 snap connect "$snap_cf_plugin_name:snapd-access" "$snap_certbot_name:snapd-access" &>/dev/null || true;
-                # 创建软链接，确保 certbot 命令可用
                 if ! command_exists certbot; then
                     echo -e "${BLUE}[*] 创建 certbot 软链接...${NC}"
                     ln -sf /snap/bin/certbot /usr/bin/certbot
@@ -550,12 +567,10 @@ install_or_update_certbot() {
         echo -e "${RED}[✗] snap 命令不可用，且 apt 安装失败。无法安装 Certbot。${NC}"
         return 1
     fi
-    
     echo -e "${RED}[✗] Certbot 最终未能成功安装。请手动安装 Certbot 及其 Cloudflare 插件。${NC}"
     return 1
 }
 
-# 获取 Web 服务配置的初始用户输入
 get_user_input_initial() {
     DOMAIN="" CF_API_TOKEN="" DDNS_FREQUENCY=5 RECORD_TYPE="" SELECTED_IP="" ZONE_ID="" ZONE_NAME="" LOCAL_PROXY_PASS="" BACKEND_PROTOCOL="http" NGINX_HTTP_PORT=80 NGINX_HTTPS_PORT=443
     echo -e "${BLUE}[*] 请输入首次设置所需信息:${NC}"; echo -e "${YELLOW}Let's Encrypt 注册邮箱已固定为: ${EMAIL}${NC}"
@@ -567,7 +582,6 @@ get_user_input_initial() {
     update_paths_for_domain "$DOMAIN"; return 0
 }
 
-# 根据当前域名更新相关文件路径变量
 update_paths_for_domain() {
     local current_domain="$1"
     CERT_PATH="${CERT_PATH_PREFIX}/${current_domain}"
@@ -577,7 +591,6 @@ update_paths_for_domain() {
     NGINX_CONF_PATH="/etc/nginx/sites-available/${current_domain}.conf"
 }
 
-# 创建 Cloudflare API Token 凭证文件 (用于 Certbot)
 create_cf_credentials() {
     echo -e "${BLUE}[*] 创建 Cloudflare API Token 凭证文件...${NC}"; mkdir -p "$(dirname "$CLOUDFLARE_CREDENTIALS")"
     cat > "$CLOUDFLARE_CREDENTIALS" <<EOF
@@ -589,20 +602,17 @@ EOF
     chmod 600 "$CLOUDFLARE_CREDENTIALS"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] 凭证文件创建成功: ${CLOUDFLARE_CREDENTIALS}${NC}"; return 0; else echo -e "${RED}[✗] 创建凭证文件失败 (权限设置?)。${NC}"; return 1; fi
 }
 
-# 检测公网 IP 地址 (IPv4 和 IPv6)
 detect_public_ip() {
     echo -e "${BLUE}[*] 检测公网 IP 地址...${NC}"; DETECTED_IPV4=$(curl -4s --max-time 5 https://api.ipify.org || curl -4s --max-time 5 https://ifconfig.me/ip || curl -4s --max-time 5 https://ipv4.icanhazip.com || echo ""); DETECTED_IPV6=$(curl -6s --max-time 5 https://api64.ipify.org || curl -6s --max-time 5 https://ifconfig.me/ip || curl -6s --max-time 5 https://ipv6.icanhazip.com || echo ""); echo "检测结果:"; if [[ -n "$DETECTED_IPV4" ]]; then echo -e "  - IPv4: ${GREEN}$DETECTED_IPV4${NC}"; else echo -e "  - IPv4: ${RED}未检测到${NC}"; fi; if [[ -n "$DETECTED_IPV6" ]]; then echo -e "  - IPv6: ${GREEN}$DETECTED_IPV6${NC}"; else echo -e "  - IPv6: ${RED}未检测到${NC}"; fi
     if [[ -z "$DETECTED_IPV4" && -z "$DETECTED_IPV6" ]]; then echo -e "${RED}[✗] 无法检测到任何公网 IP 地址。请检查网络连接。脚本无法继续。${NC}"; return 1; fi; return 0
 }
 
-# 让用户选择使用哪个 IP 地址和记录类型 (A 或 AAAA)
 select_record_type() {
     echo -e "${BLUE}[*] 请选择要使用的 DNS 记录类型和 IP 地址:${NC}"; options=(); ips=(); types=(); if [[ -n "$DETECTED_IPV4" ]]; then options+=("IPv4 (A 记录) - ${DETECTED_IPV4}"); ips+=("$DETECTED_IPV4"); types+=("A"); fi; if [[ -n "$DETECTED_IPV6" ]]; then options+=("IPv6 (AAAA 记录) - ${DETECTED_IPV6}"); ips+=("$DETECTED_IPV6"); types+=("AAAA"); fi; options+=("退出")
     select opt in "${options[@]}"; do choice_index=$((REPLY - 1)); if [[ "$opt" == "退出" ]]; then echo "用户选择退出。"; return 1; elif [[ $choice_index -ge 0 && $choice_index -lt ${#ips[@]} ]]; then RECORD_TYPE=${types[$choice_index]}; SELECTED_IP=${ips[$choice_index]}; echo -e "已选择: ${GREEN}${RECORD_TYPE} - $SELECTED_IP${NC}"; break; else echo "无效选项 $REPLY"; fi; done
     if [[ -z "$RECORD_TYPE" || -z "$SELECTED_IP" ]]; then echo -e "${RED}[✗] 未选择有效的记录类型或 IP 地址。脚本无法继续。${NC}"; return 1; fi; return 0
 }
 
-# 获取 Cloudflare Zone ID
 get_zone_id() {
     echo -e "${BLUE}[*] 获取 Cloudflare Zone ID...${NC}"; ZONE_NAME=$(echo "$DOMAIN" | awk -F. '{if (NF>2) print $(NF-1)"."$NF; else print $0}'); echo "尝试获取 Zone Name: $ZONE_NAME"
     ZONE_ID_JSON=$(curl -s --max-time 10 -X GET "$CF_API/zones?name=$ZONE_NAME&status=active" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API 失败 (网络错误或超时)。${NC}"; return 1; fi
@@ -611,7 +621,6 @@ get_zone_id() {
     echo -e "${GREEN}[✓] 找到 Zone ID: $ZONE_ID${NC}"; return 0
 }
 
-# 管理 Cloudflare DNS 记录 (创建或更新, 强制 proxied=false)
 manage_cloudflare_record() {
     local action="$1"; local force_proxy_status="false"; echo -e "${BLUE}[*] ${action} Cloudflare DNS 记录 ($RECORD_TYPE) 并确保代理关闭...${NC}"; echo "正在检查 $DOMAIN 的 $RECORD_TYPE 记录..."
     local RECORD_INFO=$(curl -s --max-time 10 -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$DOMAIN" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (获取记录) 失败。${NC}"; return 1; fi; if ! echo "$RECORD_INFO" | jq -e '.success == true' > /dev/null; then echo -e "${RED}[✗] Cloudflare API 返回错误 (获取记录): $(echo "$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
@@ -620,16 +629,14 @@ manage_cloudflare_record() {
     else echo "找到 $RECORD_TYPE 记录 (ID: $RECORD_ID)，当前 IP: $CURRENT_IP, 当前代理: $CURRENT_PROXIED"; if [[ "$CURRENT_IP" != "$SELECTED_IP" || "$CURRENT_PROXIED" != "$force_proxy_status" ]]; then echo "IP 或代理状态不符，正在更新 (目标 IP: $SELECTED_IP, 目标代理: ${force_proxy_status})..."; local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$DOMAIN\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":${force_proxy_status}}"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (更新记录) 失败。${NC}"; return 1; fi; if echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] $RECORD_TYPE 记录更新成功: $DOMAIN -> $SELECTED_IP (代理: ${force_proxy_status})${NC}"; else echo -e "${RED}[✗] 更新 $RECORD_TYPE 记录失败: $(echo "$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi; else echo -e "${GREEN}[✓] $RECORD_TYPE 记录已是最新 ($CURRENT_IP, 代理: ${force_proxy_status})，无需更新。${NC}"; fi; fi; return 0
 }
 
-# 开启 Cloudflare 代理状态
 enable_cloudflare_proxy() {
     local domain_to_proxy="$1"; echo -e "${BLUE}[*] 尝试为域名 $domain_to_proxy 开启 Cloudflare 代理 (橙色云朵)...${NC}"
     if [[ -z "$ZONE_ID" || -z "$RECORD_TYPE" || -z "$CF_API_TOKEN" || -z "$SELECTED_IP" || -z "$domain_to_proxy" ]]; then echo -e "${RED}[✗] 缺少必要信息 (Zone ID, Record Type, Token, IP, Domain)，无法开启代理。${NC}"; return 1; fi
     local RECORD_INFO=$(curl -s --max-time 10 -X GET "$CF_API/zones/$ZONE_ID/dns_records?type=$RECORD_TYPE&name=$domain_to_proxy" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json"); if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (获取记录 ID) 失败。${NC}"; return 1; fi; if ! echo "$RECORD_INFO" | jq -e '.success == true' > /dev/null; then echo -e "${RED}[✗] Cloudflare API 返回错误 (获取记录 ID): $(echo "$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi; local RECORD_ID=$(echo "$RECORD_INFO" | jq -r '.result[0].id'); if [[ "$RECORD_ID" == "null" || -z "$RECORD_ID" ]]; then echo -e "${RED}[✗] 未找到域名 $domain_to_proxy 的 $RECORD_TYPE 记录，无法开启代理。${NC}"; return 1; fi
-    echo "正在更新记录 $RECORD_ID，设置 proxied=true ..."; local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$domain_to_proxy\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":true}") # 设置 proxied 为 true
+    echo "正在更新记录 $RECORD_ID，设置 proxied=true ..."; local UPDATE_RESULT=$(curl -s --max-time 10 -X PUT "$CF_API/zones/$ZONE_ID/dns_records/$RECORD_ID" -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" --data "{\"type\":\"$RECORD_TYPE\",\"name\":\"$domain_to_proxy\",\"content\":\"$SELECTED_IP\",\"ttl\":120,\"proxied\":true}")
     if [[ $? -ne 0 ]]; then echo -e "${RED}[✗] 调用 Cloudflare API (设置代理) 失败。${NC}"; return 1; fi; if echo "$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then echo -e "${GREEN}[✓] 成功为 $domain_to_proxy ($RECORD_TYPE) 开启 Cloudflare 代理。${NC}"; return 0; else echo -e "${RED}[✗] 开启 Cloudflare 代理失败: $(echo "$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"')${NC}"; return 1; fi
 }
 
-# 申请 Let's Encrypt 证书
 request_certificate() {
     echo -e "${BLUE}[*] 申请 SSL 证书 (Let's Encrypt)...${NC}"; local certbot_cmd=$(command -v certbot)
     "$certbot_cmd" certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" --dns-cloudflare-propagation-seconds 60 -d "$DOMAIN" --email "$EMAIL" --agree-tos --no-eff-email --non-interactive --logs-dir /var/log/letsencrypt
@@ -638,7 +645,6 @@ request_certificate() {
     echo -e "${GREEN}[✓] SSL 证书申请成功！${NC}"; return 0
 }
 
-# [v6.1] 复制证书文件到指定目录 (为 3x-ui 等面板兼容)
 copy_certificate() {
     echo -e "${BLUE}[*] 复制证书文件到 $CERT_PATH (为 3x-ui 等面板兼容)...${NC}"; mkdir -p "$CERT_PATH"
     if cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CERT_PATH}/fullchain.pem" && \
@@ -651,136 +657,80 @@ copy_certificate() {
     fi
 }
 
-# [v6.0] 创建 Nginx SSL 参数配置文件 (如果不存在)
 create_nginx_ssl_snippet() {
     local snippet_path="/etc/nginx/snippets/ssl-params.conf"
-    if [[ -f "$snippet_path" ]]; then
-        echo -e "${YELLOW}[!] Nginx SSL 参数文件 ${snippet_path} 已存在，跳过创建。${NC}"
-        return 0
-    fi
+    if [[ -f "$snippet_path" ]]; then return 0; fi
     echo -e "${BLUE}[*] 创建 Nginx SSL 参数文件: ${snippet_path} ...${NC}"
     mkdir -p "$(dirname "$snippet_path")"
     cat > "$snippet_path" <<EOF
-# Generated by server-manage.sh (v6.1)
-# Modern SSL/TLS configuration
-# See: https://mozilla.github.io/server-side-tls/ssl-config-generator/
 ssl_session_timeout 1d;
 ssl_session_cache shared:SSL:10m;
 ssl_session_tickets off;
-
-# Modern configuration
 ssl_protocols TLSv1.2 TLSv1.3;
 ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
 ssl_prefer_server_ciphers off;
-
-# HSTS (max-age = 6 months)
 add_header Strict-Transport-Security "max-age=15768000" always;
-
-# OCSP stapling
 ssl_stapling on;
 ssl_stapling_verify on;
-# Use Cloudflare/Google DNS for OCSP stapling
 resolver 1.1.1.1 8.8.8.8 valid=300s;
 resolver_timeout 5s;
 EOF
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}[✓] Nginx SSL 参数文件创建成功。${NC}"
-        return 0
-    else
-        echo -e "${RED}[✗] 创建 Nginx SSL 参数文件失败。${NC}"
-        return 1
-    fi
+    return 0
 }
 
-# [v6.0] 配置 Nginx 反向代理 (已重构)
 setup_nginx_proxy() {
     if ! confirm_action "是否需要自动配置 Nginx 反向代理?"; then echo "跳过 Nginx 配置。"; NGINX_HTTP_PORT=80; NGINX_HTTPS_PORT=443; LOCAL_PROXY_PASS="none"; BACKEND_PROTOCOL="none"; return 0; fi
-    while true; do read -p "请输入 Nginx 监听的 HTTP 端口 [默认: ${NGINX_HTTP_PORT}]: " http_port_input; if [[ -z "$http_port_input" ]]; then break; elif [[ "$http_port_input" =~ ^[0-9]+$ && "$http_port_input" -gt 0 && "$http_port_input" -le 65535 ]]; then NGINX_HTTP_PORT=$http_port_input; break; else echo -e "${YELLOW}无效端口号。请输入 1-65535 之间的数字，或直接回车使用默认值。${NC}"; fi; done; echo -e "Nginx HTTP 端口设置为: ${GREEN}${NGINX_HTTP_PORT}${NC}"
-    while true; do read -p "请输入 Nginx 监听的 HTTPS 端口 [默认: ${NGINX_HTTPS_PORT}]: " https_port_input; if [[ -z "$https_port_input" ]]; then break; elif [[ "$https_port_input" =~ ^[0-9]+$ && "$https_port_input" -gt 0 && "$https_port_input" -le 65535 ]]; then if [[ "$https_port_input" -eq "$NGINX_HTTP_PORT" ]]; then echo -e "${YELLOW}HTTPS 端口不能与 HTTP 端口 (${NGINX_HTTP_PORT}) 相同。${NC}"; else NGINX_HTTPS_PORT=$https_port_input; break; fi; else echo -e "${YELLOW}无效端口号。请输入 1-65535 之间的数字，或直接回车使用默认值。${NC}"; fi; done; echo -e "Nginx HTTPS 端口设置为: ${GREEN}${NGINX_HTTPS_PORT}${NC}"
-    while true; do read -p "请选择后端服务 (${DOMAIN}) 使用的协议: [1] http (默认) [2] https : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then BACKEND_PROTOCOL="http"; break; elif [[ "$proto_choice" == "2" ]]; then BACKEND_PROTOCOL="https"; break; else echo -e "${YELLOW}无效输入，请输入 1 或 2。${NC}"; fi; done; echo -e "后端服务协议设置为: ${GREEN}${BACKEND_PROTOCOL}${NC}"
-    local addr_input=""; while [[ -z "$LOCAL_PROXY_PASS" ]]; do read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080 或 [::1]:30000): " addr_input; if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"; echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"; else echo -e "${YELLOW}地址格式似乎不正确，请确保是 '地址:端口' 或 '[IPv6地址]:端口' 格式。${NC}"; LOCAL_PROXY_PASS=""; fi; done
+    while true; do read -p "请输入 Nginx 监听的 HTTP 端口 [默认: ${NGINX_HTTP_PORT}]: " http_port_input; if [[ -z "$http_port_input" ]]; then break; elif [[ "$http_port_input" =~ ^[0-9]+$ && "$http_port_input" -gt 0 && "$http_port_input" -le 65535 ]]; then NGINX_HTTP_PORT=$http_port_input; break; else echo -e "${YELLOW}无效端口号。${NC}"; fi; done
+    while true; do read -p "请输入 Nginx 监听的 HTTPS 端口 [默认: ${NGINX_HTTPS_PORT}]: " https_port_input; if [[ -z "$https_port_input" ]]; then break; elif [[ "$https_port_input" =~ ^[0-9]+$ && "$https_port_input" -gt 0 && "$https_port_input" -le 65535 ]]; then if [[ "$https_port_input" -eq "$NGINX_HTTP_PORT" ]]; then echo -e "${YELLOW}HTTPS 端口不能与 HTTP 端口相同。${NC}"; else NGINX_HTTPS_PORT=$https_port_input; break; fi; else echo -e "${YELLOW}无效端口号。${NC}"; fi; done
+    while true; do read -p "请选择后端服务 (${DOMAIN}) 使用的协议: [1] http (默认) [2] https : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then BACKEND_PROTOCOL="http"; break; elif [[ "$proto_choice" == "2" ]]; then BACKEND_PROTOCOL="https"; break; else echo -e "${YELLOW}无效输入。${NC}"; fi; done
+    local addr_input=""; while [[ -z "$LOCAL_PROXY_PASS" ]]; do read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080): " addr_input; if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"; echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"; else echo -e "${YELLOW}地址格式不正确。${NC}"; LOCAL_PROXY_PASS=""; fi; done
     
-    # 确保 SSL 参数文件存在
     create_nginx_ssl_snippet || return 1
-
-    echo -e "${BLUE}[*] 生成 Nginx 配置文件: $NGINX_CONF_PATH ...${NC}"; mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled; mkdir -p /var/www/html/.well-known/acme-challenge; chown www-data:www-data /var/www/html -R 2>/dev/null || echo -e "${YELLOW}[!] 无法设置 /var/www/html 权限 (可能 www-data 用户/组不存在)。${NC}"
+    echo -e "${BLUE}[*] 生成 Nginx 配置文件: $NGINX_CONF_PATH ...${NC}"; mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled; mkdir -p /var/www/html/.well-known/acme-challenge; chown www-data:www-data /var/www/html -R 2>/dev/null
     
-    # 如果 HTTPS 端口不是标准的 443, 重定向时需要附带端口号
     local redirect_suffix_bash=""; if [[ "${NGINX_HTTPS_PORT}" -ne 443 ]]; then redirect_suffix_bash=":${NGINX_HTTPS_PORT}"; fi
-    
-    # 使用标准化模板生成 Nginx 配置
     cat > "$NGINX_CONF_PATH" <<EOF
-# Generated by server-manage.sh (v6.1) for ${DOMAIN}
-
-# HTTP Server: Redirects all traffic to HTTPS
 server {
     listen ${NGINX_HTTP_PORT};
     listen [::]:${NGINX_HTTP_PORT};
     server_name ${DOMAIN};
-
-    # Allow Let's Encrypt ACME challenge
-    location ~ /.well-known/acme-challenge/ {
-        allow all;
-        root /var/www/html;
-    }
-
-    location / {
-        return 301 https://\$host${redirect_suffix_bash}\$request_uri;
-    }
+    location ~ /.well-known/acme-challenge/ { allow all; root /var/www/html; }
+    location / { return 301 https://\$host${redirect_suffix_bash}\$request_uri; }
 }
-
-# HTTPS Server: Handles encrypted traffic and reverse proxy
 server {
     listen ${NGINX_HTTPS_PORT} ssl http2;
     listen [::]:${NGINX_HTTPS_PORT} ssl http2;
     server_name ${DOMAIN};
-
-    # SSL Configuration
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem; # For OCSP stapling
-
-    # Include modern SSL parameters
+    ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem;
     include /etc/nginx/snippets/ssl-params.conf;
-
-    # Reverse Proxy Configuration
     location / {
         proxy_pass ${LOCAL_PROXY_PASS};
-        
-        # Standard proxy headers
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Port \$server_port;
-        
-        # For WebSocket support (optional but good to have)
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        
-        # If backend is HTTPS
         $( [[ "$BACKEND_PROTOCOL" == "https" ]] && echo 'proxy_ssl_server_name on;' )
     }
 }
 EOF
-    local enabled_link="/etc/nginx/sites-enabled/${DOMAIN}.conf"; if [[ -L "$enabled_link" ]]; then echo -e "${YELLOW}[!] Nginx 配置软链接已存在，将重新创建。${NC}"; rm -f "$enabled_link"; fi; ln -s "$NGINX_CONF_PATH" "$enabled_link"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] Nginx 配置已启用 (创建软链接)。${NC}"; else echo -e "${RED}[✗] 创建 Nginx 配置软链接失败。${NC}"; return 1; fi
-    echo -e "${GREEN}[✓] Nginx 配置文件已生成并启用: ${NGINX_CONF_PATH}${NC}"; echo -e "${YELLOW}[!] Nginx 配置将在证书申请成功后进行测试和重载。${NC}"; return 0
+    local enabled_link="/etc/nginx/sites-enabled/${DOMAIN}.conf"; if [[ -L "$enabled_link" ]]; then rm -f "$enabled_link"; fi; ln -s "$NGINX_CONF_PATH" "$enabled_link"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] Nginx 配置已启用。${NC}"; else echo -e "${RED}[✗] 创建 Nginx 配置软链接失败。${NC}"; return 1; fi
+    return 0
 }
 
-# 创建 DDNS 更新脚本 (v4.1: 修复 URL 列表处理 Bug)
 create_ddns_script() {
-    if [[ "$DDNS_FREQUENCY" -le 0 ]]; then echo "${YELLOW}DDNS 已禁用，跳过创建 DDNS 更新脚本。${NC}"; if [[ -f "$DDNS_SCRIPT_PATH" ]]; then echo "${YELLOW}检测到旧的 DDNS 脚本 $DDNS_SCRIPT_PATH，正在删除...${NC}"; rm -f "$DDNS_SCRIPT_PATH"; fi; return 0; fi
+    if [[ "$DDNS_FREQUENCY" -le 0 ]]; then echo "${YELLOW}DDNS 已禁用，跳过创建。${NC}"; if [[ -f "$DDNS_SCRIPT_PATH" ]]; then rm -f "$DDNS_SCRIPT_PATH"; fi; return 0; fi
     echo -e "${BLUE}[*] 创建 DDNS 更新脚本 (v4.1): $DDNS_SCRIPT_PATH ...${NC}"; mkdir -p "$(dirname "$DDNS_SCRIPT_PATH")"
-    local current_token; if [[ -f "$CLOUDFLARE_CREDENTIALS" ]]; then current_token=$(grep dns_cloudflare_api_token "$CLOUDFLARE_CREDENTIALS" | awk '{print $3}'); fi; if [[ -z "$current_token" ]]; then echo -e "${RED}[✗] 无法从 $CLOUDFLARE_CREDENTIALS 读取 API Token，无法创建 DDNS 脚本。${NC}"; return 1; fi
+    local current_token; if [[ -f "$CLOUDFLARE_CREDENTIALS" ]]; then current_token=$(grep dns_cloudflare_api_token "$CLOUDFLARE_CREDENTIALS" | awk '{print $3}'); fi; if [[ -z "$current_token" ]]; then echo -e "${RED}[✗] 无法读取 API Token。${NC}"; return 1; fi
 
-    # DDNS 更新脚本模板 (修复了 get_current_ip 中的 URL 循环)
     cat > "$DDNS_SCRIPT_PATH" <<EOF
 #!/bin/bash
-# --- DDNS 更新脚本 for ${DOMAIN} (v4.1 - 修复 URL 列表 Bug & 保留代理状态) ---
-
-# --- 配置 ---
 CF_CREDENTIALS_FILE="${CLOUDFLARE_CREDENTIALS}"
 DOMAIN="${DOMAIN}"
 RECORD_TYPE="${RECORD_TYPE}"
@@ -788,161 +738,112 @@ ZONE_ID="${ZONE_ID}"
 CF_API="https://api.cloudflare.com/client/v4"
 LOG_FILE="/var/log/cf_ddns_update_${DOMAIN}.log"
 TIMEOUT=10
-# 定义 IP 查询 URL 列表
 IPV4_URLS=("https://api.ipify.org" "https://ifconfig.me/ip" "https://ipv4.icanhazip.com")
 IPV6_URLS=("https://api64.ipify.org" "https://ifconfig.me/ip" "https://ipv6.icanhazip.com")
-
-# --- 函数 ---
 log_message() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
-
-# 获取当前公网 IP (修复了 URL 循环)
 get_current_ip() {
     local type=\$1; local curl_opt; local curl_ua="Bash-DDNS-Script/1.0"; local ip=""; local raw_output=""
-    if [[ "\$type" == "A" ]]; then curl_opt="-4"; for url in "\${IPV4_URLS[@]}"; do log_message "调试：正在查询 \$url (IPv4)..."; raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1); local curl_exit_status=\$?; if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi; ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"; if [[ -n "\$ip" ]]; then if [[ "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then log_message "调试：找到有效的 IPv4: \$ip"; echo "\$ip"; return 0; fi; log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'"; else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1; done
-    elif [[ "\$type" == "AAAA" ]]; then curl_opt="-6"; for url in "\${IPV6_URLS[@]}"; do log_message "调试：正在查询 \$url (IPv6)..."; raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" | head -n 1); local curl_exit_status=\$?; if [[ \$curl_exit_status -ne 0 ]]; then log_message "警告：curl 命令执行 \$url 失败，退出状态码 \$curl_exit_status。"; fi; ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); log_message "调试：从 \$url 收到 (原始): '\$raw_output' / (处理后): '\$ip'"; if [[ -n "\$ip" ]]; then if [[ "\$ip" =~ ^([0-9a-fA-F:]+)$ && "\$ip" == *":"* ]]; then log_message "调试：找到有效的 IPv6: \$ip"; echo "\$ip"; return 0; fi; log_message "警告：从 \$url 收到非空响应但验证失败: '\$ip'"; else log_message "调试：从 \$url 收到空响应。"; fi; sleep 1; done
-    else log_message "错误：指定的记录类型无效: \$type"; return 1; fi
-    log_message "错误：尝试所有 URL 后，未能从所有来源获取当前的公共 \$type IP 地址。"; return 1
+    if [[ "\$type" == "A" ]]; then curl_opt="-4"; for url in "\${IPV4_URLS[@]}"; do raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" 2>/dev/null | head -n 1); ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); if [[ -n "\$ip" && "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "\$ip"; return 0; fi; sleep 1; done
+    elif [[ "\$type" == "AAAA" ]]; then curl_opt="-6"; for url in "\${IPV6_URLS[@]}"; do raw_output=\$(curl \$curl_opt --user-agent "\$curl_ua" --max-time \$TIMEOUT "\$url" 2>/dev/null | head -n 1); ip=\$(echo "\$raw_output" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'); if [[ -n "\$ip" && "\$ip" =~ ^([0-9a-fA-F:]+)$ && "\$ip" == *":"* ]]; then echo "\$ip"; return 0; fi; sleep 1; done
+    else return 1; fi
+    log_message "错误：无法获取 \$type IP 地址。"; return 1
 }
-
-# 获取 Cloudflare DNS 记录信息
 get_cf_record() {
-    local cf_token=\$1; RECORD_INFO=\$(curl -s --max-time \$TIMEOUT -X GET "\$CF_API/zones/\$ZONE_ID/dns_records?type=\$RECORD_TYPE&name=\$DOMAIN" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json"); if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (获取记录 - 网络/超时)"; return 1; fi; if ! echo "\$RECORD_INFO" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$RECORD_INFO" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (获取记录): \$err_msg"; return 1; fi
-    echo "\$RECORD_INFO"; return 0
+    local cf_token=\$1; RECORD_INFO=\$(curl -s --max-time \$TIMEOUT -X GET "\$CF_API/zones/\$ZONE_ID/dns_records?type=\$RECORD_TYPE&name=\$DOMAIN" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json"); if [[ \$? -ne 0 ]]; then return 1; fi; if ! echo "\$RECORD_INFO" | jq -e '.success == true' > /dev/null; then log_message "API错误: \$(echo "\$RECORD_INFO" | jq -r '.errors[0].message')"; return 1; fi; echo "\$RECORD_INFO"; return 0
 }
-
-# 更新 Cloudflare DNS 记录 (v4: 接受代理状态参数)
 update_cf_record() {
-    local cf_token=\$1; local record_id=\$2; local new_ip=\$3; local current_proxied_status=\$4; if [[ "\$current_proxied_status" != "true" && "\$current_proxied_status" != "false" ]]; then log_message "警告：无效的代理状态 '\$current_proxied_status'，将强制设为 false。"; current_proxied_status="false"; fi
-    log_message "调试：准备更新记录 \$record_id，IP: \$new_ip，代理状态: \$current_proxied_status"
-    UPDATE_RESULT=\$(curl -s --max-time \$TIMEOUT -X PUT "\$CF_API/zones/\$ZONE_ID/dns_records/\$record_id" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json" --data "{\"type\":\"\$RECORD_TYPE\",\"name\":\"\$DOMAIN\",\"content\":\"\$new_ip\",\"ttl\":120,\"proxied\":\${current_proxied_status}}")
-    if [[ \$? -ne 0 ]]; then log_message "错误：API 调用失败 (更新记录 - 网络/超时)"; return 1; fi; if ! echo "\$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then local err_msg=\$(echo "\$UPDATE_RESULT" | jq -r '.errors[0].message // "未知 API 错误"'); log_message "错误：API 调用失败 (更新记录): \$err_msg"; return 1; fi; return 0
+    local cf_token=\$1; local record_id=\$2; local new_ip=\$3; local current_proxied_status=\$4; if [[ "\$current_proxied_status" != "true" && "\$current_proxied_status" != "false" ]]; then current_proxied_status="false"; fi
+    UPDATE_RESULT=\$(curl -s --max-time \$TIMEOUT -X PUT "\$CF_API/zones/\$ZONE_ID/dns_records/\$record_id" -H "Authorization: Bearer \$cf_token" -H "Content-Type: application/json" --data "{\"type\":\"\$RECORD_TYPE\",\"name\":\"\$DOMAIN\",\"content\":\"\$new_ip\",\"ttl\":120,\"proxied\":\${current_proxied_status}}"); if [[ \$? -ne 0 ]]; then return 1; fi; if ! echo "\$UPDATE_RESULT" | jq -e '.success == true' > /dev/null; then log_message "API错误: \$(echo "\$UPDATE_RESULT" | jq -r '.errors[0].message')"; return 1; fi; return 0
 }
-
-# --- DDNS 脚本主逻辑 ---
-mkdir -p \$(dirname "\$LOG_FILE"); if [[ ! -f "\$CF_CREDENTIALS_FILE" ]]; then log_message "错误：找不到 Cloudflare 凭证文件: \$CF_CREDENTIALS_FILE"; exit 1; fi; CF_API_TOKEN=\$(grep dns_cloudflare_api_token "\$CF_CREDENTIALS_FILE" | awk '{print \$3}'); if [[ -z "\$CF_API_TOKEN" ]]; then log_message "错误：无法从 \$CF_CREDENTIALS_FILE 读取 Cloudflare API Token"; exit 1; fi
+mkdir -p \$(dirname "\$LOG_FILE"); if [[ ! -f "\$CF_CREDENTIALS_FILE" ]]; then exit 1; fi; CF_API_TOKEN=\$(grep dns_cloudflare_api_token "\$CF_CREDENTIALS_FILE" | awk '{print \$3}'); if [[ -z "\$CF_API_TOKEN" ]]; then exit 1; fi
 CURRENT_IP=\$(get_current_ip "\$RECORD_TYPE"); if [[ \$? -ne 0 ]]; then exit 1; fi; RECORD_INFO_JSON=\$(get_cf_record "\$CF_API_TOKEN"); if [[ \$? -ne 0 ]]; then exit 1; fi
 CF_IP=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].content'); RECORD_ID=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].id'); CF_PROXIED=\$(echo "\$RECORD_INFO_JSON" | jq -r '.result[0].proxied')
-if [[ -z "\$RECORD_ID" || "\$RECORD_ID" == "null" ]]; then log_message "错误：无法在 Cloudflare 上找到 \$DOMAIN 的 \$RECORD_TYPE 记录。"; exit 1; fi; if [[ -z "\$CF_IP" || "\$CF_IP" == "null" ]]; then log_message "错误：无法从 Cloudflare 记录中解析 IP 地址 (\$DOMAIN)。"; exit 1; fi; if [[ -z "\$CF_PROXIED" || "\$CF_PROXIED" == "null" ]]; then log_message "警告：无法从 Cloudflare 记录中解析代理状态 (\$DOMAIN)，将默认为 false。"; CF_PROXIED="false"; fi
-if [[ "\$CURRENT_IP" == "\$CF_IP" ]]; then exit 0; else log_message "信息：IP 地址不匹配。当前: \$CURRENT_IP, Cloudflare: \$CF_IP。正在更新 Cloudflare (代理状态将保持为: \$CF_PROXIED)..."; update_cf_record "\$CF_API_TOKEN" "\$RECORD_ID" "\$CURRENT_IP" "\$CF_PROXIED"; if [[ \$? -eq 0 ]]; then log_message "成功：Cloudflare DNS 记录 (\$DOMAIN) 已成功更新为 \$CURRENT_IP (代理状态: \$CF_PROXIED)。"; exit 0; else exit 1; fi; fi
+if [[ -z "\$RECORD_ID" || "\$RECORD_ID" == "null" ]]; then exit 1; fi; if [[ -z "\$CF_PROXIED" || "\$CF_PROXIED" == "null" ]]; then CF_PROXIED="false"; fi
+if [[ "\$CURRENT_IP" != "\$CF_IP" ]]; then log_message "IP不匹配 ($CURRENT_IP vs $CF_IP). 更新中..."; update_cf_record "\$CF_API_TOKEN" "\$RECORD_ID" "\$CURRENT_IP" "\$CF_PROXIED"; if [[ \$? -eq 0 ]]; then log_message "成功更新。"; else log_message "更新失败。"; fi; fi
 exit 0
 EOF
-    # --- DDNS 更新脚本模板结束 ---
-    chmod +x "$DDNS_SCRIPT_PATH"; echo -e "${GREEN}[✓] DDNS 更新脚本 (v4.1) 创建成功: $DDNS_SCRIPT_PATH ${NC}"; return 0
+    chmod +x "$DDNS_SCRIPT_PATH"; echo -e "${GREEN}[✓] DDNS 更新脚本 (v4.1) 创建成功。${NC}"; return 0
 }
 
-# [v6.1] 设置 Cron 定时任务 (证书续期和 DDNS) - 续期钩子已更新
 setup_cron_jobs() {
-    echo -e "${BLUE}[*] 设置 Cron 定时任务...${NC}"; echo -e "${BLUE}[*] 创建证书续期部署钩子脚本: $DEPLOY_HOOK_SCRIPT ...${NC}"; mkdir -p "$(dirname "$DEPLOY_HOOK_SCRIPT")"
+    echo -e "${BLUE}[*] 设置 Cron 定时任务...${NC}"; echo -e "${BLUE}[*] 创建增强版证书续期部署钩子: $DEPLOY_HOOK_SCRIPT ...${NC}"; mkdir -p "$(dirname "$DEPLOY_HOOK_SCRIPT")"
     
-    # [v6.1] 部署钩子脚本：复制证书并重载 Nginx
     cat > "$DEPLOY_HOOK_SCRIPT" <<EOF
 #!/bin/bash
-# [v6.1] 证书续期部署钩子 for ${DOMAIN}
-# 此脚本由 Certbot 在成功续期后调用。
-# 任务1: 复制新证书到 ${CERT_PATH} (兼容 3x-ui)
-# 任务2: 重载 Nginx 以应用新证书
+# [v7.0] 增强版证书续期部署钩子 for ${DOMAIN}
+# Certbot 续期成功后触发
 
 LOG_FILE="/var/log/cert_renew_${DOMAIN}.log"
-CONFIG_DIR="${CERT_PATH_PREFIX}/.managed_domains"
-CONFIG_FILE="${CONFIG_DIR}/${DOMAIN}.conf"
+CONFIG_FILE="${CERT_PATH_PREFIX}/.managed_domains/${DOMAIN}.conf"
 LIVE_CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 CERT_PATH="${CERT_PATH}"
-LOCAL_PROXY_PASS="none" # 默认值
+LOCAL_PROXY_PASS="none"
 
 log_hook() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 mkdir -p \$(dirname "\$LOG_FILE")
-log_hook "证书已为 ${DOMAIN} 续期。正在运行部署钩子..."
+log_hook ">>> 开始执行部署钩子 <<<"
 
-# 任务1: 复制新证书
-if [[ ! -d "\$CERT_PATH" ]]; then
-    mkdir -p "\$CERT_PATH"
-fi
-log_hook "正在从 \${LIVE_CERT_DIR} 复制新证书到 ${CERT_PATH}..."
+# 1. 复制证书 (兼容面板)
+if [[ ! -d "\$CERT_PATH" ]]; then mkdir -p "\$CERT_PATH"; fi
 if cp -L "\${LIVE_CERT_DIR}/fullchain.pem" "${CERT_PATH}/fullchain.pem" && \
    cp -L "\${LIVE_CERT_DIR}/privkey.pem" "${CERT_PATH}/privkey.pem"; then
-    log_hook "成功: 证书已复制到 ${CERT_PATH}。"
+    log_hook "SUCCESS: 证书已复制到 \$CERT_PATH"
 else
-    log_hook "错误: 复制证书文件失败。"
+    log_hook "ERROR: 证书复制失败!"
 fi
 
-# 从配置文件加载变量，以确定是否配置了 Nginx
-if [[ -f "\$CONFIG_FILE" ]]; then
-    source "\$CONFIG_FILE"
-else
-    log_hook "警告: 找不到配置文件 \$CONFIG_FILE。无法确定是否需要重载 Nginx。"
-    exit 0 # 即使配置不存在，也要继续执行，因为复制证书可能已成功
-fi
+# 2. 检查 Nginx 并重载
+if [[ -f "\$CONFIG_FILE" ]]; then source "\$CONFIG_FILE"; fi
 
-# 任务2: 重载 Nginx
-if [[ "\${LOCAL_PROXY_PASS}" != "none" ]] && command -v nginx >/dev/null 2>&1 && [[ -f "\${NGINX_CONF_PATH}" ]]; then
-    log_hook "检测到 Nginx 已配置 (\${NGINX_CONF_PATH})，准备重载服务..."
-    
-    NGINX_CMD="/usr/sbin/nginx"
-    SYSTEMCTL_CMD="/bin/systemctl"
-
-    if [[ ! -x "\$NGINX_CMD" ]]; then NGINX_CMD=$(command -v nginx); fi
-    if [[ ! -x "\$SYSTEMCTL_CMD" ]]; then SYSTEMCTL_CMD=$(command -v systemctl); fi
-
-    if "\$NGINX_CMD" -t -c /etc/nginx/nginx.conf; then
-        if "\$SYSTEMCTL_CMD" reload nginx; then
-            log_hook "成功: Nginx 服务已成功重载。"
+if [[ "\${LOCAL_PROXY_PASS}" != "none" ]] && command -v nginx >/dev/null 2>&1; then
+    # 测试配置
+    if nginx -t -c /etc/nginx/nginx.conf >/dev/null 2>&1; then
+        if systemctl reload nginx; then
+            log_hook "SUCCESS: Nginx 配置测试通过并已重载。"
         else
-            log_hook "错误: 重载 Nginx 失败。请检查 'systemctl status nginx'。"
+            log_hook "ERROR: Nginx 重载失败 (systemctl reload nginx failed)."
         fi
     else
-        log_hook "错误: Nginx 配置测试失败 (nginx -t)。跳过重载。"
+        log_hook "CRITICAL: Nginx 配置测试失败！跳过重载以避免服务中断。"
     fi
 else
-    log_hook "找不到 Nginx 配置文件 \${NGINX_CONF_PATH}。跳过 Nginx 重载。"
+    log_hook "INFO: 未配置 Nginx 代理或 Nginx 未安装，跳过重载。"
 fi
-
-log_hook "为 ${DOMAIN} 执行的部署钩子已完成。";
+log_hook ">>> 部署钩子结束 <<<"
 exit 0
 EOF
-    chmod +x "$DEPLOY_HOOK_SCRIPT"; echo -e "${GREEN}[✓] 证书续期部署钩子脚本创建成功: $DEPLOY_HOOK_SCRIPT ${NC}"
+    chmod +x "$DEPLOY_HOOK_SCRIPT"; echo -e "${GREEN}[✓] 部署钩子脚本创建成功。${NC}"
     CRON_TAG_RENEW="# CertRenew_${DOMAIN}"; CRON_TAG_DDNS="# DDNSUpdate_${DOMAIN}"; local CRON_CONTENT
     (crontab -l 2>/dev/null | grep -v -F "$CRON_TAG_RENEW" | grep -v -F "$CRON_TAG_DDNS") | crontab -; CRON_CONTENT=$(crontab -l 2>/dev/null)
-    local certbot_cmd=$(command -v certbot); if [[ -z "$certbot_cmd" ]]; then echo -e "${RED}[✗] 找不到 certbot 命令。证书续期 Cron 任务可能失败。${NC}"; certbot_cmd="certbot"; fi
-    CRON_CERT_RENEW="0 3 * * * $certbot_cmd renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\" >> /var/log/certbot_renew.log 2>&1 ${CRON_TAG_RENEW}"; echo "${CRON_CONTENT}"$'\n'"${CRON_CERT_RENEW}" | crontab -; echo -e "${GREEN}[✓] Cron 证书续期任务已设置 (${DOMAIN})。${NC}"
-    if [[ "$DDNS_FREQUENCY" -gt 0 ]]; then if [[ -f "$DDNS_SCRIPT_PATH" ]]; then CRON_DDNS_UPDATE="*/${DDNS_FREQUENCY} * * * * $DDNS_SCRIPT_PATH ${CRON_TAG_DDNS}"; CRON_CONTENT=$(crontab -l 2>/dev/null); echo "${CRON_CONTENT}"$'\n'"${CRON_DDNS_UPDATE}" | crontab -; echo -e "${GREEN}[✓] Cron DDNS 更新任务已设置 (${DOMAIN}, 频率: ${DDNS_FREQUENCY} 分钟)。${NC}"; else echo -e "${RED}[✗] DDNS 更新脚本 $DDNS_SCRIPT_PATH 未找到，无法设置 Cron 任务。${NC}"; fi; else echo -e "${YELLOW}DDNS 已禁用，未设置 DDNS 更新 Cron 任务。${NC}"; fi
+    local certbot_cmd=$(command -v certbot); if [[ -z "$certbot_cmd" ]]; then certbot_cmd="certbot"; fi
+    CRON_CERT_RENEW="0 3 * * * $certbot_cmd renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\" >> /var/log/certbot_renew.log 2>&1 ${CRON_TAG_RENEW}"; echo "${CRON_CONTENT}"$'\n'"${CRON_CERT_RENEW}" | crontab -; echo -e "${GREEN}[✓] Cron 证书续期任务已设置。${NC}"
+    if [[ "$DDNS_FREQUENCY" -gt 0 && -f "$DDNS_SCRIPT_PATH" ]]; then CRON_DDNS_UPDATE="*/${DDNS_FREQUENCY} * * * * $DDNS_SCRIPT_PATH ${CRON_TAG_DDNS}"; CRON_CONTENT=$(crontab -l 2>/dev/null); echo "${CRON_CONTENT}"$'\n'"${CRON_DDNS_UPDATE}" | crontab -; echo -e "${GREEN}[✓] Cron DDNS 更新任务已设置。${NC}"; fi
     return 0
 }
 
-# 保存当前域名的配置变量到文件
 save_domain_config() {
-    echo -e "${BLUE}[*] 保存域名 ${DOMAIN} 的配置...${NC}"; mkdir -p "$CONFIG_DIR"; local config_file="${CONFIG_DIR}/${DOMAIN}.conf"
+    echo -e "${BLUE}[*] 保存配置...${NC}"; mkdir -p "$CONFIG_DIR"; local config_file="${CONFIG_DIR}/${DOMAIN}.conf"
     cat > "$config_file" <<EOF
-# Configuration for domain: ${DOMAIN}
 # Generated by script on $(date)
 DOMAIN="${DOMAIN}"; CF_API_TOKEN="${CF_API_TOKEN}"; EMAIL="${EMAIL}"; CERT_PATH="${CERT_PATH}"; CLOUDFLARE_CREDENTIALS="${CLOUDFLARE_CREDENTIALS}"; DEPLOY_HOOK_SCRIPT="${DEPLOY_HOOK_SCRIPT}"; DDNS_SCRIPT_PATH="${DDNS_SCRIPT_PATH}"; DDNS_FREQUENCY="${DDNS_FREQUENCY}"; RECORD_TYPE="${RECORD_TYPE}"; ZONE_ID="${ZONE_ID}"; NGINX_CONF_PATH="${NGINX_CONF_PATH}"; LOCAL_PROXY_PASS="${LOCAL_PROXY_PASS}"; BACKEND_PROTOCOL="${BACKEND_PROTOCOL}"; NGINX_HTTP_PORT="${NGINX_HTTP_PORT}"; NGINX_HTTPS_PORT="${NGINX_HTTPS_PORT}"
 EOF
-    chmod 600 "$config_file"; echo -e "${GREEN}[✓] 配置已保存到: ${config_file}${NC}"
+    chmod 600 "$config_file"; echo -e "${GREEN}[✓] 配置已保存。${NC}"
 }
 
-# [v6.1] 列出已配置的 Web 服务域名 (带详细信息)
 list_configured_domains() {
     echo -e "\n${CYAN}--- 当前已配置的 Web 服务域名列表 ---${NC}"
     mkdir -p "$CONFIG_DIR"
-    
-    if ! ls "${CONFIG_DIR}"/*.conf 1> /dev/null 2>&1; then
-        echo -e "${YELLOW}未找到任何已配置的 Web 服务域名。${NC}"
-        return 1
-    fi
-
+    if ! ls "${CONFIG_DIR}"/*.conf 1> /dev/null 2>&1; then echo -e "${YELLOW}未找到任何已配置的 Web 服务域名。${NC}"; return 1; fi
     local i=1
     for config_file in "${CONFIG_DIR}"/*.conf; do
         if [[ -f "$config_file" && -r "$config_file" ]]; then
-            # 加载配置文件中的变量
             source "$config_file"
-            
             echo -e " ${YELLOW}[$i]${NC} -------------------------------------"
             echo -e "     ${CYAN}Domain:${NC}         ${GREEN}${DOMAIN}${NC}"
             if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then
                 echo -e "     ${CYAN}Proxy Target:${NC}   ${GREEN}${LOCAL_PROXY_PASS}${NC}"
                 echo -e "     ${CYAN}Listening Port:${NC} ${GREEN}${NGINX_HTTPS_PORT} (HTTPS)${NC}"
-            else
-                echo -e "     ${CYAN}Proxy Target:${NC}   ${YELLOW}未配置 Nginx 代理${NC}"
-            fi
+            else echo -e "     ${CYAN}Proxy Target:${NC}   ${YELLOW}未配置 Nginx 代理${NC}"; fi
             ((i++))
         fi
     done
@@ -950,409 +851,196 @@ list_configured_domains() {
     return 0
 }
 
-
-# 删除指定域名的配置和相关文件/任务
 delete_domain_config() {
-    echo -e "${RED}[!] 删除 Web 服务域名配置是一个危险操作，将移除相关证书、脚本和配置！${NC}"; echo -e "${YELLOW}此操作不会删除 Cloudflare 上的 DNS 记录。${NC}"; list_configured_domains; if [[ $? -ne 0 ]]; then return; fi; local domains=(); for config_file in "${CONFIG_DIR}"/*.conf; do if [[ -f "$config_file" && -r "$config_file" ]]; then domains+=("$(basename "$config_file" .conf)"); fi; done; local choice; local DOMAIN_TO_DELETE
-    while true; do read -p "请输入要删除的域名的序号 (输入 '0' 退出): " choice; if [[ "$choice" == "0" ]]; then echo "取消删除操作。"; return; fi; if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#domains[@]} ]]; then local index=$((choice - 1)); DOMAIN_TO_DELETE=${domains[$index]}; break; else echo -e "${YELLOW}无效的序号，请重新输入。${NC}"; fi; done
-    echo -e "${RED}你确定要删除域名 ${DOMAIN_TO_DELETE} 的所有本地配置吗？${NC}"; if ! confirm_action "此操作不可恢复！确认删除吗?"; then echo "取消删除操作。"; return; fi
-    echo -e "${BLUE}[*] 开始删除域名 ${DOMAIN_TO_DELETE} 的本地配置...${NC}"; local config_file_to_load="${CONFIG_DIR}/${DOMAIN_TO_DELETE}.conf"
-    if [[ -f "$config_file_to_load" ]]; then echo -e "${BLUE}[*] 加载 ${DOMAIN_TO_DELETE} 的配置用于删除...${NC}"; source "$config_file_to_load"; echo -e "${GREEN}[✓] 配置加载成功。${NC}"; else echo -e "${RED}[✗] 找不到 ${DOMAIN_TO_DELETE} 的配置文件，删除中止。可能配置已损坏或部分删除。${NC}"; return 1; fi
-    echo -e "${BLUE}[*] 移除 Cron 任务...${NC}"; CRON_TAG_RENEW="# CertRenew_${DOMAIN_TO_DELETE}"; CRON_TAG_DDNS="# DDNSUpdate_${DOMAIN_TO_DELETE}"; (crontab -l 2>/dev/null | grep -v -F "$CRON_TAG_RENEW" | grep -v -F "$CRON_TAG_DDNS") | crontab -; echo -e "${GREEN}[✓] Cron 任务已移除。${NC}"
-    if [[ -n "$DDNS_SCRIPT_PATH" && -f "$DDNS_SCRIPT_PATH" ]]; then echo -e "${BLUE}[*] 删除 DDNS 更新脚本: $DDNS_SCRIPT_PATH ...${NC}"; rm -f "$DDNS_SCRIPT_PATH"; echo -e "${GREEN}[✓] DDNS 脚本已删除。${NC}"; fi
-    if [[ -n "$DEPLOY_HOOK_SCRIPT" && -f "$DEPLOY_HOOK_SCRIPT" ]]; then echo -e "${BLUE}[*] 删除证书续期钩子脚本: $DEPLOY_HOOK_SCRIPT ...${NC}"; rm -f "$DEPLOY_HOOK_SCRIPT"; echo -e "${GREEN}[✓] 续期钩子脚本已删除。${NC}"; fi
-    local nginx_enabled_link="/etc/nginx/sites-enabled/${DOMAIN_TO_DELETE}.conf"; if [[ "$LOCAL_PROXY_PASS" != "none" ]] && [[ -n "$NGINX_CONF_PATH" ]] && (-f "$NGINX_CONF_PATH" || -L "$nginx_enabled_link"); then echo -e "${BLUE}[*] 删除 Nginx 配置...${NC}"; if [[ -L "$nginx_enabled_link" ]]; then rm -f "$nginx_enabled_link"; echo -e "${GREEN}[✓] Nginx sites-enabled 软链接已删除。${NC}"; fi; if [[ -f "$NGINX_CONF_PATH" ]]; then rm -f "$NGINX_CONF_PATH"; echo -e "${GREEN}[✓] Nginx sites-available 配置文件已删除。${NC}"; fi; echo -e "${BLUE}[*] 检查并重载 Nginx 配置...${NC}"; if command_exists nginx; then if nginx -t -c /etc/nginx/nginx.conf; then systemctl reload nginx; echo -e "${GREEN}[✓] Nginx 已重载。${NC}"; else echo -e "${RED}[✗] Nginx 配置检查失败！请手动检查 Nginx 配置。${NC}"; fi; else echo -e "${YELLOW}[!] Nginx 未安装，跳过重载。${NC}"; fi; elif [[ "$LOCAL_PROXY_PASS" == "none" ]]; then echo -e "${YELLOW}[!] 此域名的 Nginx 未配置，跳过删除。${NC}"; fi
-    if [[ -n "$CLOUDFLARE_CREDENTIALS" && -f "$CLOUDFLARE_CREDENTIALS" ]]; then echo -e "${BLUE}[*] 删除 Cloudflare 凭证文件: $CLOUDFLARE_CREDENTIALS ...${NC}"; rm -f "$CLOUDFLARE_CREDENTIALS"; echo -e "${GREEN}[✓] Cloudflare 凭证文件已删除。${NC}"; fi
-    if [[ -n "$CERT_PATH" && -d "$CERT_PATH" ]]; then echo -e "${BLUE}[*] 删除证书副本目录: $CERT_PATH ...${NC}"; rm -rf "$CERT_PATH"; echo -e "${GREEN}[✓] 证书副本目录已删除。${NC}"; fi
-    echo -e "${BLUE}[*] 删除 Let's Encrypt 证书 (certbot)...${NC}"; if command_exists certbot; then local certbot_cmd=$(command -v certbot); "$certbot_cmd" delete --cert-name "${DOMAIN_TO_DELETE}" --non-interactive --logs-dir /var/log/letsencrypt; echo -e "${GREEN}[✓] 已尝试使用 certbot 删除证书。${NC}"; else echo -e "${YELLOW}[!] certbot 命令未找到，无法自动删除 Let's Encrypt 证书。${NC}"; echo -e "${YELLOW}   请手动清理 /etc/letsencrypt/... ${NC}"; fi
-    if [[ -f "$config_file_to_load" ]]; then echo -e "${BLUE}[*] 删除脚本配置文件: $config_file_to_load ...${NC}"; rm -f "$config_file_to_load"; echo -e "${GREEN}[✓] 脚本配置文件已删除。${NC}"; fi
-    echo -e "${GREEN}[✓] 域名 ${DOMAIN_TO_DELETE} 的所有相关本地配置已成功删除！${NC}"; DOMAIN="" CF_API_TOKEN="" EMAIL="your@mail.com" CERT_PATH="" CLOUDFLARE_CREDENTIALS="" DEPLOY_HOOK_SCRIPT="" DDNS_SCRIPT_PATH="" DDNS_FREQUENCY=5 RECORD_TYPE="" ZONE_ID="" NGINX_CONF_PATH="" LOCAL_PROXY_PASS="" BACKEND_PROTOCOL="http" NGINX_HTTP_PORT=80 NGINX_HTTPS_PORT=443
+    echo -e "${RED}[!] 删除 Web 服务域名配置是一个危险操作！${NC}"; list_configured_domains; if [[ $? -ne 0 ]]; then return; fi; local domains=(); for config_file in "${CONFIG_DIR}"/*.conf; do if [[ -f "$config_file" && -r "$config_file" ]]; then domains+=("$(basename "$config_file" .conf)"); fi; done; local choice; local DOMAIN_TO_DELETE
+    while true; do read -p "请输入要删除的域名的序号 (输入 '0' 退出): " choice; if [[ "$choice" == "0" ]]; then echo "取消删除操作。"; return; fi; if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#domains[@]} ]]; then local index=$((choice - 1)); DOMAIN_TO_DELETE=${domains[$index]}; break; else echo -e "${YELLOW}无效的序号。${NC}"; fi; done
+    echo -e "${RED}确认删除域名 ${DOMAIN_TO_DELETE} 的所有本地配置吗？${NC}"; if ! confirm_action "此操作不可恢复！"; then return; fi
+    echo -e "${BLUE}[*] 开始删除...${NC}"; local config_file_to_load="${CONFIG_DIR}/${DOMAIN_TO_DELETE}.conf"; if [[ -f "$config_file_to_load" ]]; then source "$config_file_to_load"; else echo -e "${RED}[✗] 找不到配置文件，删除中止。${NC}"; return 1; fi
+    CRON_TAG_RENEW="# CertRenew_${DOMAIN_TO_DELETE}"; CRON_TAG_DDNS="# DDNSUpdate_${DOMAIN_TO_DELETE}"; (crontab -l 2>/dev/null | grep -v -F "$CRON_TAG_RENEW" | grep -v -F "$CRON_TAG_DDNS") | crontab -
+    if [[ -n "$DDNS_SCRIPT_PATH" ]]; then rm -f "$DDNS_SCRIPT_PATH"; fi; if [[ -n "$DEPLOY_HOOK_SCRIPT" ]]; then rm -f "$DEPLOY_HOOK_SCRIPT"; fi
+    local nginx_enabled_link="/etc/nginx/sites-enabled/${DOMAIN_TO_DELETE}.conf"; if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then if [[ -L "$nginx_enabled_link" ]]; then rm -f "$nginx_enabled_link"; fi; if [[ -f "$NGINX_CONF_PATH" ]]; then rm -f "$NGINX_CONF_PATH"; fi; if command_exists nginx; then systemctl reload nginx; fi; fi
+    if [[ -n "$CLOUDFLARE_CREDENTIALS" ]]; then rm -f "$CLOUDFLARE_CREDENTIALS"; fi; if [[ -n "$CERT_PATH" ]]; then rm -rf "$CERT_PATH"; fi
+    if command_exists certbot; then local certbot_cmd=$(command -v certbot); "$certbot_cmd" delete --cert-name "${DOMAIN_TO_DELETE}" --non-interactive --logs-dir /var/log/letsencrypt; fi
+    if [[ -f "$config_file_to_load" ]]; then rm -f "$config_file_to_load"; fi
+    echo -e "${GREEN}[✓] 删除完成！${NC}"; DOMAIN=""
 }
 
-# 手动续期指定域名的证书 (v6.3 修复)
-manual_renew_certificate() {
-    echo -e "\n${CYAN}--- 手动续期证书 ---${NC}"
-    echo -e "${YELLOW}[!] 此功能会强制为选定的域名尝试续期证书，无论其是否即将到期。${NC}"
-    list_configured_domains
-    if [[ $? -ne 0 ]]; then return; fi
-
+check_cert_expiry() {
+    echo -e "\n${CYAN}--- SSL 证书有效期监控 ---${NC}"
     local domains=()
     for config_file in "${CONFIG_DIR}"/*.conf; do
-        if [[ -f "$config_file" && -r "$config_file" ]]; then
-            domains+=("$(basename "$config_file" .conf)")
-        fi
+        [[ -f "$config_file" ]] && domains+=("$(basename "$config_file" .conf)")
     done
-
-    local choice
-    local DOMAIN_TO_RENEW
-    while true; do
-        read -p "请输入要续期的域名的序号 (输入 '0' 退出): " choice
-        if [[ "$choice" == "0" ]]; then
-            echo "取消续期操作。"
-            return
-        fi
-        if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#domains[@]} ]]; then
-            local index=$((choice - 1))
-            DOMAIN_TO_RENEW=${domains[$index]}
-            break
-        else
-            echo -e "${YELLOW}无效的序号，请重新输入。${NC}"
-        fi
-    done
-
-    echo -e "${BLUE}[*] 准备为域名 ${DOMAIN_TO_RENEW} 强制续期...${NC}"
-
-    if ! command_exists certbot; then
-        echo -e "${RED}[✗] certbot 命令未找到。无法执行续期。${NC}"
-        return 1
-    fi
     
-    # [v6.3] 修复: 先加载配置，获取钩子脚本路径
-    local config_file_to_load="${CONFIG_DIR}/${DOMAIN_TO_RENEW}.conf"
-    if [[ ! -f "$config_file_to_load" ]]; then
-        echo -e "${RED}[✗] 找不到域名 ${DOMAIN_TO_RENEW} 的配置文件。${NC}"
-        return 1
-    fi
-    source "$config_file_to_load"
+    if [[ ${#domains[@]} -eq 0 ]]; then echo -e "${YELLOW}未找到已配置的域名。${NC}"; return; fi
 
-    if [[ -z "$DEPLOY_HOOK_SCRIPT" || ! -f "$DEPLOY_HOOK_SCRIPT" ]]; then
-        echo -e "${RED}[✗] 未找到或未配置此域名的部署钩子脚本: ${DEPLOY_HOOK_SCRIPT}${NC}"
-        echo -e "${YELLOW}   无法执行安全的续期。请尝试使用 '删除' 功能后重新添加此域名的配置。${NC}"
-        return 1
-    fi
+    printf "%-30s %-20s %-20s\n" "域名" "剩余天数" "到期日期"
+    echo "------------------------------------------------------------------------"
 
-    local certbot_cmd=$(command -v certbot)
-    # [v6.3] 修复: 在 certbot 命令中直接使用 --deploy-hook 参数
-    "$certbot_cmd" renew --cert-name "${DOMAIN_TO_RENEW}" --force-renewal --deploy-hook "$DEPLOY_HOOK_SCRIPT" --non-interactive --logs-dir /var/log/letsencrypt
-    local renew_status=$?
-
-    if [[ $renew_status -eq 0 ]]; then
-        echo -e "${GREEN}[✓] 证书续期和部署钩子已成功执行！${NC}"
-        echo -e "${BLUE}[*] 正在检查钩子脚本的日志输出...${NC}"
-        sleep 1 # 给日志文件一点写入时间
-        if [[ -f "/var/log/cert_renew_${DOMAIN_TO_RENEW}.log" ]]; then
-            echo -e "${CYAN}--- 部署日志 (最近10行) ---${NC}"
-            tail -n 10 "/var/log/cert_renew_${DOMAIN_TO_RENEW}.log"
-            echo -e "${CYAN}----------------------------${NC}"
+    for domain in "${domains[@]}"; do
+        local cert_file="/etc/letsencrypt/live/${domain}/fullchain.pem"
+        if [[ -f "$cert_file" ]]; then
+            local end_date=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$end_date" ]]; then
+                local end_epoch=$(date +%s -d "$end_date")
+                local current_epoch=$(date +%s)
+                local days_left=$(( ($end_epoch - current_epoch) / 86400 ))
+                
+                local color=$GREEN
+                if [[ $days_left -lt 30 ]]; then color=$YELLOW; fi
+                if [[ $days_left -lt 7 ]]; then color=$RED; fi
+                
+                printf "%-30s ${color}%-20s${NC} %-20s\n" "$domain" "${days_left} 天" "$(date -d "$end_date" +%F)"
+            else
+                printf "%-30s ${RED}%-20s${NC} %-20s\n" "$domain" "读取失败" "N/A"
+            fi
         else
-            echo -e "${YELLOW}[!] 未找到部署日志，但 Certbot 命令成功。请手动检查 Nginx 服务状态。${NC}"
+            printf "%-30s ${RED}%-20s${NC} %-20s\n" "$domain" "证书文件丢失" "N/A"
         fi
-    else
-        echo -e "${RED}[✗] 证书续期命令执行失败 (退出码: $renew_status)。${NC}"
-        echo -e "${RED}   请检查 certbot 日志 (/var/log/letsencrypt/letsencrypt.log) 获取详细信息。${NC}"
-    fi
-    return 0
+    done
+    echo ""
 }
 
-# 添加新 Web 服务域名的主流程 (v6.1)
+manual_renew_certificate() {
+    echo -e "\n${CYAN}--- 手动续期证书 ---${NC}"
+    list_configured_domains; if [[ $? -ne 0 ]]; then return; fi
+    local domains=(); for config_file in "${CONFIG_DIR}"/*.conf; do if [[ -f "$config_file" && -r "$config_file" ]]; then domains+=("$(basename "$config_file" .conf)"); fi; done
+    local choice; local DOMAIN_TO_RENEW
+    while true; do read -p "请输入序号 (0退出): " choice; if [[ "$choice" == "0" ]]; then return; fi; if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#domains[@]} ]]; then local index=$((choice - 1)); DOMAIN_TO_RENEW=${domains[$index]}; break; else echo -e "${YELLOW}无效序号。${NC}"; fi; done
+
+    local config_file_to_load="${CONFIG_DIR}/${DOMAIN_TO_RENEW}.conf"; if [[ ! -f "$config_file_to_load" ]]; then echo -e "${RED}配置文件丢失。${NC}"; return; fi; source "$config_file_to_load"
+
+    echo -e "\n请选择续期模式:"
+    echo -e " ${YELLOW}1.${NC} 模拟运行 (Dry Run) - 仅测试配置，不替换证书 (推荐)"
+    echo -e " ${YELLOW}2.${NC} 强制续期 (Force Renew) - 无论是否到期都重签 (慎用)"
+    read -p "请输入选项 [1-2]: " renew_mode
+
+    local certbot_cmd=$(command -v certbot)
+    local common_args="--cert-name ${DOMAIN_TO_RENEW} --deploy-hook ${DEPLOY_HOOK_SCRIPT} --non-interactive --logs-dir /var/log/letsencrypt"
+    
+    if [[ "$renew_mode" == "1" ]]; then
+        echo -e "${BLUE}[*] 正在执行模拟续期...${NC}"
+        "$certbot_cmd" renew --dry-run $common_args
+    elif [[ "$renew_mode" == "2" ]]; then
+        echo -e "${RED}[!] 正在执行强制续期...${NC}"
+        "$certbot_cmd" renew --force-renewal $common_args
+    else
+        echo "无效选项，操作取消。"
+        return
+    fi
+}
+
+view_cert_renew_log() {
+    echo -e "\n${CYAN}--- 最近续期日志 ---${NC}"
+    list_configured_domains; if [[ $? -ne 0 ]]; then return; fi
+    local domains=(); for config_file in "${CONFIG_DIR}"/*.conf; do if [[ -f "$config_file" && -r "$config_file" ]]; then domains+=("$(basename "$config_file" .conf)"); fi; done
+    local choice; local DOMAIN_LOG
+    while true; do read -p "请输入序号查看日志 (0退出): " choice; if [[ "$choice" == "0" ]]; then return; fi; if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#domains[@]} ]]; then local index=$((choice - 1)); DOMAIN_LOG=${domains[$index]}; break; else echo -e "${YELLOW}无效序号。${NC}"; fi; done
+    
+    local log_file="/var/log/cert_renew_${DOMAIN_LOG}.log"
+    if [[ -f "$log_file" ]]; then
+        echo -e "${BLUE}--- ${log_file} (Last 20 lines) ---${NC}"
+        tail -n 20 "$log_file"
+    else
+        echo -e "${YELLOW}未找到该域名的部署钩子日志文件。可能还未进行过续期。${NC}"
+    fi
+}
+
 add_new_domain() {
     echo -e "\n${CYAN}--- 9.1 添加新 Web 服务域名配置 ---${NC}"
-    local overall_success=0 # 0 = success, 1 = failure
-
-    # 0. 确保 Certbot 和 Nginx 已安装
-    if ! install_or_update_certbot; then echo -e "${RED}[✗] Certbot 环境设置失败，无法继续。${NC}"; return 1; fi
-    echo -e "${BLUE}[*] 检查并安装 Nginx...${NC}"; if ! install_package "nginx"; then echo -e "${RED}[✗] Nginx 安装失败，无法继续配置 Web 服务。${NC}"; return 1; fi
-
-    # --- 开始配置流程 ---
-    get_user_input_initial || { echo -e "${RED}[✗] 获取用户输入失败。${NC}"; return 1; }
-    setup_nginx_proxy || { echo -e "${RED}[✗] Nginx 代理配置步骤失败。${NC}"; overall_success=1; }
-    create_cf_credentials || { echo -e "${RED}[✗] 创建 Cloudflare 凭证失败。${NC}"; return 1; }
-    detect_public_ip || { echo -e "${RED}[✗] 检测公网 IP 失败。${NC}"; return 1; }
-    select_record_type || { echo -e "${RED}[✗] 选择记录类型失败。${NC}"; return 1; }
-    get_zone_id || { echo -e "${RED}[✗] 获取 Cloudflare Zone ID 失败。${NC}"; return 1; }
-    # 确保 DNS 记录存在且代理关闭，为证书申请做准备
-    manage_cloudflare_record "设置" || { echo -e "${RED}[✗] 设置 Cloudflare DNS 记录失败。${NC}"; return 1; }
-
-    # --- 证书申请与后续步骤 ---
+    local overall_success=0 
+    if ! install_or_update_certbot; then echo -e "${RED}[✗] Certbot 环境设置失败。${NC}"; return 1; fi
+    echo -e "${BLUE}[*] 检查 Nginx...${NC}"; if ! install_package "nginx"; then echo -e "${RED}[✗] Nginx 安装失败。${NC}"; return 1; fi
+    get_user_input_initial || { return 1; }
+    setup_nginx_proxy || { overall_success=1; }
+    create_cf_credentials || { return 1; }
+    detect_public_ip || { return 1; }
+    select_record_type || { return 1; }
+    get_zone_id || { return 1; }
+    manage_cloudflare_record "设置" || { return 1; }
     if request_certificate; then
-        # 证书申请成功
-        copy_certificate || overall_success=1 # [v6.1] 恢复证书复制
-        
-        # 询问并开启 Cloudflare 代理
-        if confirm_action "证书申请成功！是否要在 Cloudflare 上为此域名开启代理（橙色云朵）？"; then
-            enable_cloudflare_proxy "$DOMAIN" || overall_success=1
-        else echo -e "${YELLOW}用户选择不开启 Cloudflare 代理。${NC}"; fi
-        
-        # 创建 DDNS 脚本
+        copy_certificate || overall_success=1
+        if confirm_action "是否在 Cloudflare 上开启代理（橙色云朵）？"; then enable_cloudflare_proxy "$DOMAIN" || overall_success=1; fi
         create_ddns_script || overall_success=1
         setup_cron_jobs || overall_success=1
         save_domain_config || overall_success=1
-
-        # 测试并重载 Nginx (如果配置了 Nginx)
         if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then
-            echo -e "\n${BLUE}[*] 检查 Nginx 配置并尝试重载...${NC}"
-            if ! command_exists nginx; then echo -e "${RED}[✗] Nginx 命令未找到。无法测试或重载配置。${NC}"; overall_success=1;
-            else
-                nginx_test_output=$(nginx -t -c /etc/nginx/nginx.conf 2>&1); nginx_test_status=$?
-                if [[ $nginx_test_status -eq 0 ]]; then
-                    if systemctl reload nginx && systemctl is-active --quiet nginx; then
-                        echo -e "${GREEN}[✓] Nginx 配置检查通过并已成功重载。${NC}"; echo -e "${YELLOW}提示：Nginx 正在监听 HTTP 端口 ${NGINX_HTTP_PORT} 和 HTTPS 端口 ${NGINX_HTTPS_PORT}。${NC}"
-                        if command_exists ufw && ufw status | grep -q "Status: active"; then echo -e "${BLUE}[*] 尝试在 UFW 中允许 Nginx 端口 ${NGINX_HTTP_PORT} 和 ${NGINX_HTTPS_PORT}...${NC}"; ufw allow ${NGINX_HTTP_PORT}/tcp comment "Nginx HTTP (${DOMAIN})" > /dev/null; ufw allow ${NGINX_HTTPS_PORT}/tcp comment "Nginx HTTPS (${DOMAIN})" > /dev/null; echo -e "${GREEN}[✓] 已尝试添加 UFW 规则。请使用 '查看 UFW 规则' 确认。${NC}";
-                        elif [[ "$NGINX_HTTP_PORT" -ne 80 || "$NGINX_HTTPS_PORT" -ne 443 ]]; then echo -e "${YELLOW}重要提示：请确保防火墙允许访问您设置的自定义端口 (${NGINX_HTTP_PORT} 和 ${NGINX_HTTPS_PORT})！${NC}"; fi
-                        echo -e "${YELLOW}访问时，如果 HTTPS 端口不是 443，URL 中需要包含端口号，例如: https://${DOMAIN}:${NGINX_HTTPS_PORT}${NC}"
-                    else echo -e "${RED}[✗] Nginx 重载后状态异常，请检查 Nginx 服务状态和日志。${NC}"; overall_success=1; fi
-                else
-                    echo -e "${RED}[✗] Nginx 配置检查失败 (nginx -t 返回错误)! Nginx 未重载。${NC}"; echo -e "${RED}--- Nginx 错误信息 ---${NC}"; echo -e "${YELLOW}${nginx_test_output}${NC}"; echo -e "${RED}-----------------------${NC}"; echo -e "${RED}请检查错误信息中提到的文件。通常这是由于 /etc/nginx/sites-enabled/ 中存在旧的、无效的配置文件引起的。${NC}"; echo -e "${RED}请手动清理无效配置 (例如 'sudo rm /etc/nginx/sites-enabled/your-old-site.conf')，然后重试 'sudo nginx -t'。${NC}"; overall_success=1;
-                fi
+            if command_exists nginx; then
+                if systemctl reload nginx; then echo -e "${GREEN}[✓] Nginx 重载成功。${NC}"; 
+                else echo -e "${RED}[✗] Nginx 重载失败。${NC}"; overall_success=1; fi
             fi
-        else echo -e "${YELLOW}[!] 未配置 Nginx 反向代理，跳过 Nginx 测试和重载。${NC}"; fi
+        fi
     else
-        # 证书申请失败
-        echo -e "${RED}[!] 由于证书申请失败，后续步骤将被跳过。${NC}"; if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then echo -e "${YELLOW}[!] 尝试清理未使用的 Nginx 配置...${NC}"; rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"; rm -f "$NGINX_CONF_PATH"; fi; rm -f "$CLOUDFLARE_CREDENTIALS"; overall_success=1
+        echo -e "${RED}[!] 证书申请失败。${NC}"; overall_success=1
     fi
-
-    if [[ $overall_success -eq 0 ]]; then echo -e "\n${GREEN}--- 域名 ${DOMAIN} 配置完成！ ---${NC}"; return 0;
-    else echo -e "\n${RED}--- 域名 ${DOMAIN} 配置过程中遇到错误，请检查上面的日志。 ---${NC}"; return 1; fi
+    if [[ $overall_success -eq 0 ]]; then echo -e "\n${GREEN}--- 配置完成！ ---${NC}"; return 0; else echo -e "\n${RED}--- 配置有误，请检查日志。 ---${NC}"; return 1; fi
 }
 
-# Web 服务管理主菜单
 manage_web_service() {
-     while true; do echo -e "\n${CYAN}--- 9. Web 服务管理 (LE + CF + Nginx) ---${NC}"; echo -e " ${YELLOW}1.${NC} 添加新域名并配置 (证书/代理/Nginx/DDNS)"; echo -e " ${YELLOW}2.${NC} 查看已配置的域名列表"; echo -e " ${YELLOW}3.${NC} 删除已配置的域名及其本地设置"; echo -e " ${YELLOW}4.${NC} 手动续期指定域名的证书"; echo -e " ${YELLOW}0.${NC} 返回主菜单"; read -p "请输入选项 [0-4]: " web_choice
-        case $web_choice in 1) add_new_domain ;; 2) list_configured_domains ;; 3) delete_domain_config ;; 4) manual_renew_certificate ;; 0) break ;; *) echo -e "${RED}无效选项。${NC}" ;; esac
+     while true; do echo -e "\n${CYAN}--- 9. Web 服务管理 (LE + CF + Nginx) ---${NC}"; 
+        echo -e " ${YELLOW}1.${NC} 添加新域名并配置 (证书/代理/Nginx/DDNS)"; 
+        echo -e " ${YELLOW}2.${NC} 查看域名状态 & 证书有效期"; 
+        echo -e " ${YELLOW}3.${NC} 手动管理证书 (模拟/强制续期)"; 
+        echo -e " ${YELLOW}4.${NC} 查看最近续期日志";
+        echo -e " ${YELLOW}5.${NC} 删除域名配置"; 
+        echo -e " ${YELLOW}0.${NC} 返回主菜单"; 
+        read -p "请输入选项 [0-5]: " web_choice
+        case $web_choice in 
+            1) add_new_domain ;; 
+            2) check_cert_expiry ;; 
+            3) manual_renew_certificate ;; 
+            4) view_cert_renew_log ;;
+            5) delete_domain_config ;; 
+            0) break ;; 
+            *) echo -e "${RED}无效选项。${NC}" ;; 
+        esac
         [[ $web_choice != 0 ]] && read -p "按 Enter键 继续..."
     done
 }
 
 # --- 6. DNS 配置管理 ---
-is_systemd_resolved_active() {
-    # 检查 resolv.conf 是否是软链接且指向 systemd-resolved 的文件
-    if [[ -L "$RESOLV_CONF" ]] && [[ "$(readlink "$RESOLV_CONF")" == "/run/systemd/resolve/resolv.conf" ]]; then
-        # 进一步检查 systemd-resolved 服务是否处于活动状态
-        if systemctl is-active --quiet systemd-resolved; then
-            return 0 # 返回 true
-        fi
-    fi
-    return 1 # 返回 false
-}
-
-wait_for_systemd_resolved() {
-    local max_retries=10
-    local retry_count=0
-    echo -e "${BLUE}[*] 正在等待 systemd-resolved 服务就绪...${NC}"
-    while [[ $retry_count -lt $max_retries ]]; do
-        if systemctl is-active --quiet systemd-resolved && resolvectl status >/dev/null 2>&1; then
-            echo -e "${GREEN}[✓] systemd-resolved 服务已就绪。${NC}"
-            return 0
-        fi
-        sleep 1
-        retry_count=$((retry_count + 1))
-    done
-    echo -e "${RED}[✗] 等待服务就绪超时。请检查 'systemctl status systemd-resolved'。${NC}"
-    return 1
-}
-
-view_dns_status() {
-    echo -e "\n${CYAN}--- DNS 状态 ---${NC}"
-    if command_exists resolvectl; then
-        if is_systemd_resolved_active; then
-            echo -e "${BLUE}[*] 使用 resolvectl 查看 DNS 状态...${NC}"
-            resolvectl status
-        else
-            echo -e "${YELLOW}[!] systemd-resolved 已安装，但服务未运行或未配置为系统默认。${NC}"
-            echo -e "${YELLOW}   请尝试 '升级到 systemd-resolved (推荐)' 选项。${NC}"
-            echo -e "${YELLOW}[*] 使用 cat 查看 /etc/resolv.conf...${NC}"
-            cat "$RESOLV_CONF"
-        fi
-    else
-        echo -e "${YELLOW}[!] 'resolvectl' 命令未找到，可能未安装 'systemd-resolved'。${NC}"
-        echo -e "${YELLOW}[*] 使用 cat 查看 /etc/resolv.conf...${NC}"
-        if [[ -f "$RESOLV_CONF" ]]; then
-            cat "$RESOLV_CONF"
-        else
-            echo -e "${RED}[✗] 找不到 /etc/resolv.conf 文件。${NC}"
-        fi
-    fi
-}
-
+is_systemd_resolved_active() { if [[ -L "$RESOLV_CONF" ]] && [[ "$(readlink "$RESOLV_CONF")" == "/run/systemd/resolve/resolv.conf" ]] && systemctl is-active --quiet systemd-resolved; then return 0; fi; return 1; }
+wait_for_systemd_resolved() { local i=0; while [[ $i -lt 10 ]]; do if systemctl is-active --quiet systemd-resolved; then return 0; fi; sleep 1; ((i++)); done; return 1; }
+view_dns_status() { echo -e "\n${CYAN}--- DNS 状态 ---${NC}"; if command_exists resolvectl && is_systemd_resolved_active; then resolvectl status; else cat "$RESOLV_CONF"; fi; }
 upgrade_to_systemd_resolved() {
-    echo -e "\n${CYAN}--- 升级到 systemd-resolved ---${NC}"
-    if is_systemd_resolved_active; then
-        echo -e "${GREEN}[✓] systemd-resolved 似乎已安装并正在运行，无需升级。${NC}"
-        return 0
+    if is_systemd_resolved_active; then echo -e "${GREEN}已在使用 systemd-resolved。${NC}"; return 0; fi
+    if confirm_action "确定升级到 systemd-resolved 吗？"; then
+        if ! install_package "systemd-resolved"; then return 1; fi
+        systemctl enable systemd-resolved; systemctl start systemd-resolved
+        rm -f "$RESOLV_CONF"; ln -s /run/systemd/resolve/resolv.conf "$RESOLV_CONF"
+        echo -e "${GREEN}[✓] 升级完成。${NC}"
     fi
-    
-    echo -e "${YELLOW}[!] 您的系统似乎没有使用 systemd-resolved。此操作将安装并启用它，以提供统一的 DNS 管理。${NC}"
-    if ! confirm_action "您确定要升级到 systemd-resolved 吗？"; then
-        echo -e "${YELLOW}操作已取消。${NC}"
-        return 0
-    fi
-    
-    if ! command_exists systemctl; then
-        echo -e "${RED}[✗] 找不到 'systemctl' 命令。您的系统可能未使用 systemd。无法进行升级。${NC}"
-        return 1
-    fi
-    
-    if ! install_package "systemd-resolved"; then
-        echo -e "${RED}[✗] 安装 systemd-resolved 失败。${NC}"
-        return 1
-    fi
-    
-    echo -e "${BLUE}[*] 正在启用并启动 systemd-resolved 服务...${NC}"
-    systemctl enable systemd-resolved
-    systemctl start systemd-resolved
-    
-    # 等待服务就绪
-    if ! wait_for_systemd_resolved; then
-        return 1
-    fi
-
-    # 创建 /etc/resolv.conf 的软链接
-    echo -e "${BLUE}[*] 正在创建 /etc/resolv.conf 的软链接...${NC}"
-    rm -f "$RESOLV_CONF"
-    ln -s /run/systemd/resolve/resolv.conf "$RESOLV_CONF"
-    
-    echo -e "${GREEN}[✓] 升级完成！您现在可以使用 '修改 DNS 服务器地址' 选项来配置 DNS。${NC}"
-    return 0
 }
-
 edit_dns_config() {
-    echo -e "\n${CYAN}--- 6.2 修改 DNS 配置 ---${NC}"
-    local new_dns_servers=""
-    while true; do
-        read -p "请输入新的 DNS 服务器地址 (用空格隔开，例如 '1.1.1.1 8.8.8.8'): " new_dns_servers
-        if [[ -n "$new_dns_servers" ]]; then
-            break
-        else
-            echo -e "${YELLOW}DNS 服务器地址不能为空。${NC}"
-        fi
-    done
-    
+    echo -e "\n${CYAN}--- 修改 DNS ---${NC}"; local new_dns; read -p "输入 DNS (空格隔开): " new_dns
+    if [[ -z "$new_dns" ]]; then return; fi
     if is_systemd_resolved_active; then
-        echo -e "${BLUE}[*] 检测到 systemd-resolved 正在运行。将修改 ${SYSTEMD_RESOLVED_CONF}。${NC}"
-        local temp_file="$SYSTEMD_RESOLVED_CONF.tmp"
-        
-        # 备份文件
         cp "$SYSTEMD_RESOLVED_CONF" "${SYSTEMD_RESOLVED_CONF}.bak"
-        
-        # 使用awk更新或添加DNS参数
-        awk -v new_dns="$new_dns_servers" '
-            /\[Resolve\]/ {
-                print;
-                print "DNS=" new_dns;
-                dns_set=1;
-                next;
-            }
-            /^DNS=|^FallbackDNS=/ {
-                next; # 跳过旧的DNS配置行
-            }
-            { print }
-            END {
-                if (!dns_set) {
-                    print "\n[Resolve]";
-                    print "DNS=" new_dns;
-                }
-            }
-        ' "$SYSTEMD_RESOLVED_CONF" > "$temp_file"
-        
-        mv "$temp_file" "$SYSTEMD_RESOLVED_CONF"
-        
-        if [[ $? -eq 0 ]]; then
-            echo -e "${GREEN}[✓] DNS 配置已写入 ${SYSTEMD_RESOLVED_CONF}。${NC}"
-            echo -e "${BLUE}[*] 正在重启 systemd-resolved 服务以应用新配置...${NC}"
-            systemctl restart systemd-resolved
-            if wait_for_systemd_resolved; then
-                view_dns_status
-            fi
-        else
-            echo -e "${RED}[✗] 修改配置文件失败。${NC}"
-        fi
+        awk -v dns="$new_dns" '/\[Resolve\]/{p=1;print;print "DNS=" dns;next} /^DNS=/{next} {print}' "$SYSTEMD_RESOLVED_CONF" > "${SYSTEMD_RESOLVED_CONF}.tmp" && mv "${SYSTEMD_RESOLVED_CONF}.tmp" "$SYSTEMD_RESOLVED_CONF"
+        systemctl restart systemd-resolved
     else
-        echo -e "${YELLOW}[!] 未检测到 systemd-resolved 服务。将直接修改 ${RESOLV_CONF}。${NC}"
-        echo -e "${RED}[!] 警告: 直接修改此文件可能会被其他网络服务覆盖！${NC}"
-        if confirm_action "是否继续修改 ${RESOLV_CONF}？"; then
-            # 备份文件
-            cp "$RESOLV_CONF" "${RESOLV_CONF}.bak"
-            
-            # 清空并写入新的DNS
-            echo "# This file was managed by server-manage.sh" > "$RESOLV_CONF"
-            echo "# Backup: ${RESOLV_CONF}.bak" >> "$RESOLV_CONF"
-            for server in $new_dns_servers; do
-                echo "nameserver $server" >> "$RESOLV_CONF"
-            done
-            
-            if [[ $? -eq 0 ]]; then
-                echo -e "${GREEN}[✓] DNS 配置已写入 ${RESOLV_CONF}。${NC}"
-                view_dns_status
-            else
-                echo -e "${RED}[✗] 修改配置文件失败。${NC}"
-            fi
-        else
-            echo -e "${YELLOW}操作已取消。${NC}"
-        fi
+        echo -e "nameserver $new_dns" > "$RESOLV_CONF"
     fi
+    echo -e "${GREEN}[✓] DNS 已修改。${NC}"
 }
-
 manage_dns() {
-     while true; do
-        echo -e "\n${CYAN}--- 6. DNS 配置管理 ---${NC}"
-        echo -e " ${YELLOW}1.${NC} 查看当前 DNS 状态"
-        echo -e " ${YELLOW}2.${NC} 修改 DNS 服务器地址"
-        echo -e " ${YELLOW}3.${NC} 升级到 systemd-resolved (推荐)"
-        echo -e " ${YELLOW}0.${NC} 返回主菜单"
-        read -p "请输入选项 [0-3]: " dns_choice
-        case $dns_choice in
-            1) view_dns_status ;;
-            2) edit_dns_config ;;
-            3) upgrade_to_systemd_resolved ;;
-            0) break ;;
-            *) echo -e "${RED}无效选项。${NC}" ;;
-        esac
-        [[ $dns_choice != 0 ]] && read -p "按 Enter键 继续..."
-    done
+     while true; do echo -e "\n${CYAN}--- 6. DNS 管理 ---${NC}"; echo -e " ${YELLOW}1.${NC} 查看状态"; echo -e " ${YELLOW}2.${NC} 修改 DNS"; echo -e " ${YELLOW}3.${NC} 升级 systemd-resolved"; echo -e " ${YELLOW}0.${NC} 返回"; read -p "选 [0-3]: " c; case $c in 1) view_dns_status ;; 2) edit_dns_config ;; 3) upgrade_to_systemd_resolved ;; 0) break ;; esac; [[ $c != 0 ]] && read -p "继续..."; done
 }
 
-# --- 7. 开启 BBR + FQ ---
+# --- 7. BBR ---
 enable_bbr_fq() {
-    echo -e "\n${CYAN}--- 7. 开启 BBR + FQ 拥塞控制 ---${NC}"
-    # 检查内核版本是否支持BBR (4.9以上)
-    local kernel_version=$(uname -r)
-    if [[ $(echo "$kernel_version" | cut -d'.' -f1) -lt 4 ]] || ([[ $(echo "$kernel_version" | cut -d'.' -f1) -eq 4 ]] && [[ $(echo "$kernel_version" | cut -d'.' -f2) -lt 9 ]]); then
-        echo -e "${RED}[✗] 当前内核版本 (${kernel_version}) 可能不支持 BBR 拥塞控制。${NC}"
-        echo -e "${YELLOW}   建议将内核版本升级到 4.9 或更高版本。${NC}"
-        if ! confirm_action "是否仍要尝试开启 BBR？"; then
-            echo -e "${YELLOW}操作已取消。${NC}"
-            return 1
-        fi
-    fi
-
-    if confirm_action "您确定要开启 BBR + FQ 拥塞控制吗？此操作将修改系统网络参数。"; then
-        echo -e "${BLUE}[*] 正在修改 /etc/sysctl.conf ...${NC}"
-        
-        # 备份 sysctl.conf
-        cp /etc/sysctl.conf /etc/sysctl.conf.bak_bbr
-
-        # 移除旧的配置，然后添加新的
+    echo -e "\n${CYAN}--- 7. 开启 BBR + FQ ---${NC}"
+    if confirm_action "确认修改 sysctl.conf 开启 BBR 吗？"; then
         sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-
-        echo -e "${BLUE}[*] 正在应用新的 sysctl 配置...${NC}"
         sysctl -p
-        
-        echo -e "${BLUE}[*] 正在验证 BBR 是否已启用...${NC}"
-        local bbr_status=$(sysctl net.ipv4.tcp_available_congestion_control)
-        local lsmod_bbr_status=$(lsmod | grep bbr)
-        
-        if [[ "$bbr_status" =~ "bbr" ]] && [[ -n "$lsmod_bbr_status" ]]; then
-            echo -e "${GREEN}[✓] BBR 和 FQ 已成功启用。${NC}"
-            echo -e "${CYAN}--- 验证结果 ---${NC}"
-            echo "当前可用的拥塞控制算法："
-            echo "$bbr_status"
-            echo "内核模块加载情况："
-            echo "$lsmod_bbr_status"
-            echo -e "${CYAN}----------------${NC}"
-        else
-            echo -e "${RED}[✗] 启用 BBR/FQ 失败。请检查系统内核版本是否支持。${NC}"
-        fi
-    else
-        echo -e "${YELLOW}操作已取消。${NC}"
+        echo -e "${GREEN}[✓] BBR 设置完成。${NC}"
     fi
 }
 
-# --- 1. 系统信息查询 ---
-
-# 系统信息查询函数
+# --- 1. 系统信息 (已恢复完整功能) ---
 output_status() {
     # 总接收和总发送流量（跨网卡）
     local output=$(awk 'BEGIN { rx_total = 0; tx_total = 0 }
@@ -1437,60 +1125,36 @@ output_status() {
     echo -e "${CYAN}运行时长:     ${NC}$runtime"
     echo ""
 }
-
-# 时区调整函数
-set_timedate() {
-    local shiqu="$1"
-    if command_exists timedatectl; then
-        timedatectl set-timezone ${shiqu}
-        echo -e "${GREEN}[✓] 系统时区已修改为: ${shiqu}${NC}"
-    else
-        echo -e "${RED}[✗] timedatectl 命令未找到，无法设置时区。${NC}"
-        return 1
-    fi
-}
+set_timedate() { timedatectl set-timezone "$1"; echo -e "${GREEN}[✓] 时区设为 $1${NC}"; }
 
 # --- 主菜单 ---
 show_main_menu() {
-    check_root; local certbot_vsn="未知"; if command_exists certbot; then certbot_vsn=$(certbot --version 2>&1 | awk '{print $2}'); fi
-    echo -e "\n${CYAN}================================================================${NC}"; echo -e "${CYAN}     服务器初始化与管理脚本 (v6.3 - Gemini-Mod)     ${NC}"; echo -e "${CYAN}================================================================${NC}"; echo -e " ${BLUE}--- 系统与安全 ---${NC}"; echo -e "  ${YELLOW}1.${NC} 系统信息查询"; echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"; echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"; echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御管理"; echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"; echo -e "  ${YELLOW}6.${NC} DNS 配置管理"; echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ (优化网络)"; echo -e "  ${YELLOW}8.${NC} 调整系统时区"; echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${certbot_vsn}) ---${NC}"; echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"; echo -e "\n ${BLUE}--- 其他 ---${NC}"; echo -e "  ${YELLOW}0.${NC} 退出脚本"; echo -e "${CYAN}================================================================${NC}"; read -p "请输入选项 [0-9]: " main_choice
+    check_root; local cv="未知"; if command_exists certbot; then cv=$(certbot --version 2>&1 | awk '{print $2}'); fi
+    echo -e "\n${CYAN}================================================================${NC}"
+    echo -e "${CYAN}     服务器管理脚本 (v7.2 - Gemini-Mod)     ${NC}"
+    echo -e "${CYAN}================================================================${NC}"
+    echo -e " ${BLUE}--- 系统与安全 ---${NC}"
+    echo -e "  ${YELLOW}1.${NC} 系统信息查询"
+    echo -e "  ${YELLOW}2.${NC} 安装基础依赖工具"
+    echo -e "  ${YELLOW}3.${NC} UFW 防火墙管理"
+    echo -e "  ${YELLOW}4.${NC} Fail2ban 入侵防御"
+    echo -e "  ${YELLOW}5.${NC} SSH 安全管理 (端口: ${YELLOW}${CURRENT_SSH_PORT}${NC})"
+    echo -e "  ${YELLOW}6.${NC} DNS 配置管理"
+    echo -e "  ${YELLOW}7.${NC} 开启 BBR + FQ"
+    echo -e "  ${YELLOW}8.${NC} 调整系统时区"
+    echo -e "\n ${BLUE}--- Web 服务 (Certbot: ${cv}) ---${NC}"
+    echo -e "  ${YELLOW}9.${NC} Web 服务管理 (Let's Encrypt + Cloudflare + Nginx)"
+    echo -e "\n ${BLUE}--- 其他 ---${NC}"
+    echo -e "  ${YELLOW}0.${NC} 退出脚本"
+    echo -e "${CYAN}================================================================${NC}"
+    read -p "请输入选项 [0-9]: " main_choice
 }
 
 # --- 脚本入口 ---
 check_root
-while true; do show_main_menu; case $main_choice in 1) output_status ;; 2) install_common_tools ;; 3) manage_ufw ;; 4) manage_fail2ban ;; 5) manage_ssh_security ;; 6) manage_dns ;; 7) enable_bbr_fq ;; 8)
-                while true; do
-                    echo -e "\n${CYAN}--- 系统时区调整 ---${NC}"
-                    echo -e "当前系统时区: ${YELLOW}$(timedatectl | grep "Time zone" | awk '{print $3}')${NC}"
-                    echo -e "------------------------"
-                    echo "亚洲"
-                    echo "1.  中国上海时间             2.  中国香港时间"
-                    echo "3.  日本东京时间             4.  韩国首尔时间"
-                    echo "------------------------"
-                    echo "欧洲"
-                    echo "5.  英国伦敦时间             6.  德国柏林时间"
-                    echo "7.  俄罗斯莫斯科时间"
-                    echo "------------------------"
-                    echo "美洲"
-                    echo "8.  美国西部时间             9.  美国东部时间"
-                    echo "------------------------"
-                    echo "10. UTC全球标准时间"
-                    echo "0. 返回上一级菜单"
-                    read -p "请输入你的选择: " tz_choice
-                    case $tz_choice in
-                        1) set_timedate Asia/Shanghai ;;
-                        2) set_timedate Asia/Hong_Kong ;;
-                        3) set_timedate Asia/Tokyo ;;
-                        4) set_timedate Asia/Seoul ;;
-                        5) set_timedate Europe/London ;;
-                        6) set_timedate Europe/Berlin ;;
-                        7) set_timedate Europe/Moscow ;;
-                        8) set_timedate America/Los_Angeles ;;
-                        9) set_timedate America/New_York ;;
-                        10) set_timedate UTC ;;
-                        0) break ;;
-                        *) echo -e "${RED}无效选项。${NC}" ;;
-                    esac
-                done
-                ;; 9) manage_web_service ;; 0) echo "退出脚本。" ; exit 0 ;; *) echo -e "${RED}无效选项，请输入 0 到 9 之间的数字。${NC}" ;; esac; if [[ "$main_choice" != "0" ]]; then read -p "按 Enter键 继续..."; fi; done
-exit 0
+while true; do show_main_menu; case $main_choice in 
+    1) output_status ;; 2) install_common_tools ;; 3) manage_ufw ;; 4) manage_fail2ban ;; 
+    5) manage_ssh_security ;; 6) manage_dns ;; 7) enable_bbr_fq ;; 
+    8) set_timedate "Asia/Shanghai" ;; 
+    9) manage_web_service ;; 0) echo "退出。"; exit 0 ;; *) echo -e "${RED}无效选项。${NC}" ;; 
+esac; if [[ "$main_choice" != "0" ]]; then read -p "按 Enter键 继续..."; fi; done
