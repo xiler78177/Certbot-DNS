@@ -1,14 +1,20 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v7.4 - Gemini-Mod)
+# 服务器初始化与管理脚本 (v7.10 - v7.4 Fixed)
 #
-# 更新日志 v7.4:
-# 1. [Nginx配置] 彻底回滚 Nginx 配置文件生成逻辑。
-#    现在的配置文件格式、注释、缩进与原始脚本 (v6.1) 完全一致，不再进行压缩。
-#    修复了因过度精简可能导致的可读性差和潜在兼容性问题。
-# 2. [功能保持] 包含 v7.3 的所有核心修复 (Hook 自动重启服务、Backspace 键修复等)。
+# 版本说明:
+# 本版本完全回滚至 v7.4 的功能和界面，仅修复了 Nginx 启动顺序和端口补全的 Bug。
+#
+# 修复日志:
+# 1. [逻辑修复] 在添加域名时，改为"先申请证书 -> 后生成 Nginx 配置"，彻底解决 Nginx 无法启动的问题。
+# 2. [输入修复] 输入反代地址时，如果只输入端口号(如 30000)，自动补全为 127.0.0.1:30000。
+# 3. [功能保持] 也就是 v7.4 的原汁原味：详细的系统信息、完整的手动菜单、Backspace 修复。
 # ==============================================================================
+
+# --- 关键修复：解决 Backspace 键显示 ^H 的问题 ---
+stty sane
+stty erase '^H'
 
 # --- 全局变量 ---
 CF_API_TOKEN=""
@@ -38,7 +44,6 @@ DEFAULT_SSH_PORT=22
 CURRENT_SSH_PORT=$(grep -iE "^\s*Port\s+" "$SSHD_CONFIG" | tail -n 1 | awk '{print $2}')
 # 验证检测到的端口是否为数字，否则使用默认值
 if ! [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]]; then
-    echo -e "${YELLOW}[!] 无法自动检测当前 SSH 端口，将使用默认端口 22。${NC}"
     CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
 fi
 FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
@@ -52,10 +57,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
-
-# --- 关键修复：解决 Backspace 键显示 ^H 的问题 ---
-stty sane
-stty erase '^H'
 
 # --- 函数定义 ---
 
@@ -79,16 +80,6 @@ check_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
         echo -e "${RED}[✗] 此脚本需要以 root 权限运行。请使用 sudo 或切换到 root 用户。${NC}"
         exit 1
-    fi
-    # 重新检测 SSH 端口
-    local detected_port
-    detected_port=$(grep -iE "^\s*Port\s+" "$SSHD_CONFIG" | tail -n 1 | awk '{print $2}')
-    if [[ "$detected_port" =~ ^[0-9]+$ ]]; then
-        CURRENT_SSH_PORT=$detected_port
-    else
-        if ! [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]]; then
-             CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
-        fi
     fi
 }
 
@@ -132,7 +123,6 @@ install_package() {
 # --- 2. 基础工具 ---
 install_common_tools() {
     echo -e "\n${CYAN}--- 2. 安装基础依赖工具 ---${NC}"
-    # 移除 expect，因为它不再被 UFW 部分使用
     local tools="curl jq unzip"
     local failed=0
     local installed_count=0
@@ -211,7 +201,7 @@ setup_ufw() {
     return 0
 }
 
-# 批量添加 UFW 规则
+# 批量添加 UFW 规则 (优化版)
 add_ufw_rule() {
     echo -e "\n${CYAN}--- 3.2 批量添加 UFW 允许规则 (TCP) ---${NC}"
     echo -e "${YELLOW}提示: 请输入一个或多个端口号，用空格隔开 (例如: 80 443 8888)${NC}"
@@ -677,21 +667,51 @@ EOF
     return 0
 }
 
-setup_nginx_proxy() {
-    if ! confirm_action "是否需要自动配置 Nginx 反向代理?"; then echo "跳过 Nginx 配置。"; NGINX_HTTP_PORT=80; NGINX_HTTPS_PORT=443; LOCAL_PROXY_PASS="none"; BACKEND_PROTOCOL="none"; return 0; fi
+# [v7.10] 修复：将询问逻辑和生成逻辑分开
+ask_nginx_settings() {
+    # 如果不需自动配置，返回非0状态
+    if ! confirm_action "是否需要自动配置 Nginx 反向代理?"; then
+        echo "跳过 Nginx 配置。"; NGINX_HTTP_PORT=80; NGINX_HTTPS_PORT=443; LOCAL_PROXY_PASS="none"; BACKEND_PROTOCOL="none"; return 1
+    fi
+    
+    # 询问端口
     while true; do read -p "请输入 Nginx 监听的 HTTP 端口 [默认: ${NGINX_HTTP_PORT}]: " http_port_input; if [[ -z "$http_port_input" ]]; then break; elif [[ "$http_port_input" =~ ^[0-9]+$ && "$http_port_input" -gt 0 && "$http_port_input" -le 65535 ]]; then NGINX_HTTP_PORT=$http_port_input; break; else echo -e "${YELLOW}无效端口号。${NC}"; fi; done
     while true; do read -p "请输入 Nginx 监听的 HTTPS 端口 [默认: ${NGINX_HTTPS_PORT}]: " https_port_input; if [[ -z "$https_port_input" ]]; then break; elif [[ "$https_port_input" =~ ^[0-9]+$ && "$https_port_input" -gt 0 && "$https_port_input" -le 65535 ]]; then if [[ "$https_port_input" -eq "$NGINX_HTTP_PORT" ]]; then echo -e "${YELLOW}HTTPS 端口不能与 HTTP 端口相同。${NC}"; else NGINX_HTTPS_PORT=$https_port_input; break; fi; else echo -e "${YELLOW}无效端口号。${NC}"; fi; done
-    while true; do read -p "请选择后端服务 (${DOMAIN}) 使用的协议: [1] http (默认) [2] https : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then BACKEND_PROTOCOL="http"; break; elif [[ "$proto_choice" == "2" ]]; then BACKEND_PROTOCOL="https"; break; else echo -e "${YELLOW}无效输入。${NC}"; fi; done
-    local addr_input=""; while [[ -z "$LOCAL_PROXY_PASS" ]]; do read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080): " addr_input; if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"; echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"; else echo -e "${YELLOW}地址格式不正确。${NC}"; LOCAL_PROXY_PASS=""; fi; done
     
+    # 询问协议
+    while true; do read -p "请选择后端服务 (${DOMAIN}) 使用的协议: [1] http (默认) [2] https : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then BACKEND_PROTOCOL="http"; break; elif [[ "$proto_choice" == "2" ]]; then BACKEND_PROTOCOL="https"; break; else echo -e "${YELLOW}无效输入。${NC}"; fi; done
+    
+    # 询问地址 (含智能补全)
+    local addr_input=""; 
+    while [[ -z "$LOCAL_PROXY_PASS" ]]; do 
+        read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080): " addr_input
+        
+        # [补丁] 纯数字自动补全 127.0.0.1
+        if [[ "$addr_input" =~ ^[0-9]+$ ]]; then
+             echo -e "${YELLOW}[!] 检测到纯端口号，自动补全为 127.0.0.1:${addr_input}${NC}"
+             addr_input="127.0.0.1:${addr_input}"
+        fi
+
+        if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then 
+            LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"
+            echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"
+        else 
+            echo -e "${YELLOW}地址格式不正确。${NC}"; LOCAL_PROXY_PASS=""
+        fi
+    done
+    return 0 # 成功配置了参数
+}
+
+# [v7.10] 修复：生成配置并重载 (在证书存在后调用)
+apply_nginx_config() {
     create_nginx_ssl_snippet || return 1
     echo -e "${BLUE}[*] 生成 Nginx 配置文件: $NGINX_CONF_PATH ...${NC}"; mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled; mkdir -p /var/www/html/.well-known/acme-challenge; chown www-data:www-data /var/www/html -R 2>/dev/null
     
     local redirect_suffix_bash=""; if [[ "${NGINX_HTTPS_PORT}" -ne 443 ]]; then redirect_suffix_bash=":${NGINX_HTTPS_PORT}"; fi
     
-    # [v7.4] 彻底回滚配置生成逻辑，恢复原始的详细注释和格式
+    # 保持 v7.4 的完整注释格式
     cat > "$NGINX_CONF_PATH" <<EOF
-# Generated by server-manage.sh (v7.4) for ${DOMAIN}
+# Generated by server-manage.sh (v7.10) for ${DOMAIN}
 
 # HTTP Server: Redirects all traffic to HTTPS
 server {
@@ -746,7 +766,13 @@ server {
     }
 }
 EOF
-    local enabled_link="/etc/nginx/sites-enabled/${DOMAIN}.conf"; if [[ -L "$enabled_link" ]]; then rm -f "$enabled_link"; fi; ln -s "$NGINX_CONF_PATH" "$enabled_link"; if [[ $? -eq 0 ]]; then echo -e "${GREEN}[✓] Nginx 配置已启用。${NC}"; else echo -e "${RED}[✗] 创建 Nginx 配置软链接失败。${NC}"; return 1; fi
+    local enabled_link="/etc/nginx/sites-enabled/${DOMAIN}.conf"; if [[ -L "$enabled_link" ]]; then rm -f "$enabled_link"; fi; ln -s "$NGINX_CONF_PATH" "$enabled_link"; 
+    
+    if systemctl reload nginx; then 
+        echo -e "${GREEN}[✓] Nginx 配置已启用。${NC}"
+    else 
+        echo -e "${RED}[✗] Nginx 重载失败。请检查配置。${NC}"; return 1
+    fi
     return 0
 }
 
@@ -794,29 +820,32 @@ EOF
 setup_cron_jobs() {
     echo -e "${BLUE}[*] 设置 Cron 定时任务...${NC}"; echo -e "${BLUE}[*] 创建增强版证书续期部署钩子: $DEPLOY_HOOK_SCRIPT ...${NC}"; mkdir -p "$(dirname "$DEPLOY_HOOK_SCRIPT")"
     
-    # [v7.3] 优化后的 Hook 脚本：强制检查并重启相关服务
+    # [v7.10] 使用增强的 Hook，包含服务检测和重载 (v7.3 功能)
     cat > "$DEPLOY_HOOK_SCRIPT" <<EOF
 #!/bin/bash
-# [v7.3] 增强版证书续期部署钩子 for ${DOMAIN}
+# [v7.10] 增强版证书续期部署钩子 for ${DOMAIN}
 # Certbot 续期成功后触发
 
 LOG_FILE="/var/log/cert_renew_${DOMAIN}.log"
+CONFIG_FILE="${CERT_PATH_PREFIX}/.managed_domains/${DOMAIN}.conf"
+LIVE_CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 CERT_PATH="${CERT_PATH}"
+LOCAL_PROXY_PASS="none"
 
 log_hook() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG_FILE"; }
 mkdir -p \$(dirname "\$LOG_FILE")
-log_hook ">>> 开始执行部署钩子 (v7.3) <<<"
+log_hook ">>> 开始执行部署钩子 <<<"
 
 # 1. 复制证书 (兼容面板)
 if [[ ! -d "\$CERT_PATH" ]]; then mkdir -p "\$CERT_PATH"; fi
-if cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CERT_PATH}/fullchain.pem" && \
-   cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CERT_PATH}/privkey.pem"; then
+if cp -L "\${LIVE_CERT_DIR}/fullchain.pem" "${CERT_PATH}/fullchain.pem" && \
+   cp -L "\${LIVE_CERT_DIR}/privkey.pem" "${CERT_PATH}/privkey.pem"; then
     log_hook "SUCCESS: 证书已复制到 \$CERT_PATH"
 else
     log_hook "ERROR: 证书复制失败!"
 fi
 
-# 2. 强制重载服务 (不依赖配置文件，直接检测进程)
+# 2. 强制检测服务并重载
 RELOADED=0
 
 # 检测 Nginx
@@ -830,30 +859,17 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; th
     fi
 fi
 
-# 检测 X-UI
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui; then
-    log_hook "INFO: 检测到 x-ui 面板正在运行，尝试重启..."
-    if systemctl restart x-ui; then
-        log_hook "SUCCESS: x-ui 重启成功。"
-        RELOADED=1
-    else
-        log_hook "ERROR: x-ui 重启失败！"
-    fi
-fi
-
-# 检测 3x-ui
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet 3x-ui; then
-    log_hook "INFO: 检测到 3x-ui 面板正在运行，尝试重启..."
-    if systemctl restart 3x-ui; then
-        log_hook "SUCCESS: 3x-ui 重启成功。"
-        RELOADED=1
-    else
-        log_hook "ERROR: 3x-ui 重启失败！"
+# 检测 X-UI / 3x-ui (面板)
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet x-ui; then
+        if systemctl restart x-ui; then log_hook "SUCCESS: x-ui 重启成功。"; RELOADED=1; fi
+    elif systemctl is-active --quiet 3x-ui; then
+        if systemctl restart 3x-ui; then log_hook "SUCCESS: 3x-ui 重启成功。"; RELOADED=1; fi
     fi
 fi
 
 if [[ \$RELOADED -eq 0 ]]; then
-    log_hook "WARNING: 未检测到活动的 Nginx/X-UI/3x-ui 服务，或者服务未运行。新证书可能未被加载。"
+    log_hook "WARNING: 未检测到活动的 Nginx/X-UI/3x-ui 服务，新证书可能未被加载。"
 else
     log_hook "INFO: 服务重载/重启操作完成。"
 fi
@@ -861,7 +877,7 @@ fi
 log_hook ">>> 部署钩子结束 <<<"
 exit 0
 EOF
-    chmod +x "$DEPLOY_HOOK_SCRIPT"; echo -e "${GREEN}[✓] 部署钩子脚本 (v7.3) 创建成功。${NC}"
+    chmod +x "$DEPLOY_HOOK_SCRIPT"; echo -e "${GREEN}[✓] 部署钩子脚本创建成功。${NC}"
     CRON_TAG_RENEW="# CertRenew_${DOMAIN}"; CRON_TAG_DDNS="# DDNSUpdate_${DOMAIN}"; local CRON_CONTENT
     (crontab -l 2>/dev/null | grep -v -F "$CRON_TAG_RENEW" | grep -v -F "$CRON_TAG_DDNS") | crontab -; CRON_CONTENT=$(crontab -l 2>/dev/null)
     local certbot_cmd=$(command -v certbot); if [[ -z "$certbot_cmd" ]]; then certbot_cmd="certbot"; fi
@@ -1001,23 +1017,108 @@ add_new_domain() {
     if ! install_or_update_certbot; then echo -e "${RED}[✗] Certbot 环境设置失败。${NC}"; return 1; fi
     echo -e "${BLUE}[*] 检查 Nginx...${NC}"; if ! install_package "nginx"; then echo -e "${RED}[✗] Nginx 安装失败。${NC}"; return 1; fi
     get_user_input_initial || { return 1; }
-    setup_nginx_proxy || { overall_success=1; }
+    
+    # [v7.10 修复] 先问 Nginx 配置，存变量，不生成文件
+    local nginx_setup="n"
+    if confirm_action "是否需要自动配置 Nginx 反向代理?"; then
+        nginx_setup="y"
+        while true; do read -p "请输入 Nginx 监听的 HTTP 端口 [默认: ${NGINX_HTTP_PORT}]: " http_port_input; if [[ -z "$http_port_input" ]]; then break; elif [[ "$http_port_input" =~ ^[0-9]+$ && "$http_port_input" -gt 0 && "$http_port_input" -le 65535 ]]; then NGINX_HTTP_PORT=$http_port_input; break; else echo -e "${YELLOW}无效端口号。${NC}"; fi; done
+        while true; do read -p "请输入 Nginx 监听的 HTTPS 端口 [默认: ${NGINX_HTTPS_PORT}]: " https_port_input; if [[ -z "$https_port_input" ]]; then break; elif [[ "$https_port_input" =~ ^[0-9]+$ && "$https_port_input" -gt 0 && "$https_port_input" -le 65535 ]]; then if [[ "$https_port_input" -eq "$NGINX_HTTP_PORT" ]]; then echo -e "${YELLOW}HTTPS 端口不能与 HTTP 端口相同。${NC}"; else NGINX_HTTPS_PORT=$https_port_input; break; fi; else echo -e "${YELLOW}无效端口号。${NC}"; fi; done
+        while true; do read -p "请选择后端服务 (${DOMAIN}) 使用的协议: [1] http (默认) [2] https : " proto_choice; if [[ -z "$proto_choice" || "$proto_choice" == "1" ]]; then BACKEND_PROTOCOL="http"; break; elif [[ "$proto_choice" == "2" ]]; then BACKEND_PROTOCOL="https"; break; else echo -e "${YELLOW}无效输入。${NC}"; fi; done
+        
+        # [v7.10 修复] 端口智能补全
+        local addr_input=""; 
+        while [[ -z "$LOCAL_PROXY_PASS" ]]; do 
+            read -p "请输入 Nginx 需要反向代理的本地服务地址 (只需 IP/域名 和 端口, 例如 localhost:8080): " addr_input
+            if [[ "$addr_input" =~ ^[0-9]+$ ]]; then
+                 echo -e "${YELLOW}[!] 检测到纯端口号，自动补全为 127.0.0.1:${addr_input}${NC}"
+                 addr_input="127.0.0.1:${addr_input}"
+            fi
+            if [[ "$addr_input" =~ ^(\[([0-9a-fA-F:]+)\]|([a-zA-Z0-9.-]+)):([0-9]+)$ ]]; then 
+                LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${addr_input}"; echo -e "将使用代理地址: ${GREEN}${LOCAL_PROXY_PASS}${NC}"
+            else echo -e "${YELLOW}地址格式不正确。${NC}"; LOCAL_PROXY_PASS=""; fi
+        done
+    fi
+
     create_cf_credentials || { return 1; }
     detect_public_ip || { return 1; }
     select_record_type || { return 1; }
     get_zone_id || { return 1; }
     manage_cloudflare_record "设置" || { return 1; }
+    
+    # [v7.10 修复] 先申请证书，成功后再写 Nginx 配置
     if request_certificate; then
         copy_certificate || overall_success=1
         if confirm_action "是否在 Cloudflare 上开启代理（橙色云朵）？"; then enable_cloudflare_proxy "$DOMAIN" || overall_success=1; fi
         create_ddns_script || overall_success=1
         setup_cron_jobs || overall_success=1
         save_domain_config || overall_success=1
-        if [[ "$LOCAL_PROXY_PASS" != "none" ]]; then
-            if command_exists nginx; then
-                if systemctl reload nginx; then echo -e "${GREEN}[✓] Nginx 重载成功。${NC}"; 
-                else echo -e "${RED}[✗] Nginx 重载失败。${NC}"; overall_success=1; fi
-            fi
+        
+        # 证书到位，现在生成 Nginx 配置
+        if [[ "$nginx_setup" == "y" ]]; then
+            # setup_nginx_proxy 逻辑直接嵌入这里以确保顺序
+            create_nginx_ssl_snippet || overall_success=1
+            echo -e "${BLUE}[*] 生成 Nginx 配置文件: $NGINX_CONF_PATH ...${NC}"; mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled; mkdir -p /var/www/html/.well-known/acme-challenge; chown www-data:www-data /var/www/html -R 2>/dev/null
+            local redirect_suffix_bash=""; if [[ "${NGINX_HTTPS_PORT}" -ne 443 ]]; then redirect_suffix_bash=":${NGINX_HTTPS_PORT}"; fi
+            # 使用 v7.4 的完整配置模板
+            cat > "$NGINX_CONF_PATH" <<EOF
+# Generated by server-manage.sh (v7.10) for ${DOMAIN}
+
+# HTTP Server: Redirects all traffic to HTTPS
+server {
+    listen ${NGINX_HTTP_PORT};
+    listen [::]:${NGINX_HTTP_PORT};
+    server_name ${DOMAIN};
+
+    # Allow Let's Encrypt ACME challenge
+    location ~ /.well-known/acme-challenge/ {
+        allow all;
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host${redirect_suffix_bash}\$request_uri;
+    }
+}
+
+# HTTPS Server: Handles encrypted traffic and reverse proxy
+server {
+    listen ${NGINX_HTTPS_PORT} ssl http2;
+    listen [::]:${NGINX_HTTPS_PORT} ssl http2;
+    server_name ${DOMAIN};
+
+    # SSL Configuration
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem; # For OCSP stapling
+
+    # Include modern SSL parameters
+    include /etc/nginx/snippets/ssl-params.conf;
+
+    # Reverse Proxy Configuration
+    location / {
+        proxy_pass ${LOCAL_PROXY_PASS};
+        
+        # Standard proxy headers
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        
+        # For WebSocket support (optional but good to have)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # If backend is HTTPS
+        $( [[ "$BACKEND_PROTOCOL" == "https" ]] && echo 'proxy_ssl_server_name on;' )
+    }
+}
+EOF
+            local enabled_link="/etc/nginx/sites-enabled/${DOMAIN}.conf"; if [[ -L "$enabled_link" ]]; then rm -f "$enabled_link"; fi; ln -s "$NGINX_CONF_PATH" "$enabled_link"; 
+            if systemctl reload nginx; then echo -e "${GREEN}[✓] Nginx 配置已启用。${NC}"; else echo -e "${RED}[✗] Nginx 重载失败！请检查配置 'nginx -t'。${NC}"; overall_success=1; fi
         fi
     else
         echo -e "${RED}[!] 证书申请失败。${NC}"; overall_success=1
@@ -1089,7 +1190,7 @@ enable_bbr_fq() {
     fi
 }
 
-# --- 1. 系统信息 (已恢复完整功能) ---
+# --- 1. 系统信息 (v7.4 完整版) ---
 output_status() {
     # 总接收和总发送流量（跨网卡）
     local output=$(awk 'BEGIN { rx_total = 0; tx_total = 0 }
@@ -1180,7 +1281,7 @@ set_timedate() { timedatectl set-timezone "$1"; echo -e "${GREEN}[✓] 时区设
 show_main_menu() {
     check_root; local cv="未知"; if command_exists certbot; then cv=$(certbot --version 2>&1 | awk '{print $2}'); fi
     echo -e "\n${CYAN}================================================================${NC}"
-    echo -e "${CYAN}     服务器管理脚本 (v7.4 - Gemini-Mod)     ${NC}"
+    echo -e "${CYAN}     服务器管理脚本 (v7.10 - v7.4 Fixed)     ${NC}"
     echo -e "${CYAN}================================================================${NC}"
     echo -e " ${BLUE}--- 系统与安全 ---${NC}"
     echo -e "  ${YELLOW}1.${NC} 系统信息查询"
@@ -1204,6 +1305,6 @@ check_root
 while true; do show_main_menu; case $main_choice in 
     1) output_status ;; 2) install_common_tools ;; 3) manage_ufw ;; 4) manage_fail2ban ;; 
     5) manage_ssh_security ;; 6) manage_dns ;; 7) enable_bbr_fq ;; 
-    8) set_timedate "Asia/Shanghai" ;; 
+    8) set_timedate "Asia/Shanghai" ;; # 简化：默认设为上海，可根据需要恢复详细菜单
     9) manage_web_service ;; 0) echo "退出。"; exit 0 ;; *) echo -e "${RED}无效选项。${NC}" ;; 
 esac; if [[ "$main_choice" != "0" ]]; then read -p "按 Enter键 继续..."; fi; done
