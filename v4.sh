@@ -1,14 +1,13 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v11.0 - The Ironclad Edition)
+# 服务器初始化与管理脚本 (v11.3 - The Bulletproof Edition)
 #
-# 更新日志 v11.0 (基于深度 Code Review 终极加固):
-# 1. [Hook修复] 证书续期脚本恢复非 Systemd 环境支持 (nginx -s reload)，兼容容器。
-# 2. [防崩加固] 修复 set -o errtrace 模式下，grep/curl 失败导致脚本意外退出的问题：
-#    - 系统信息查询中的 IP/地理位置解析增加空值与 grep 失败保护。
-#    - DNS 查看中的 resolvectl grep 增加 || true 保护。
-# 3. [环境兼容] 修复 timedatectl 在精简容器中不存在导致的报错。
+# 更新日志 v11.3 (基于深度 Code Review 终极加固):
+# 1. [防崩] prepare_web_env 内部安装命令全量增加错误捕获 (if ! cmd)，
+#    防止 snap install 失败直接触发 ERR trap 导致脚本闪退。
+# 2. [逻辑] add_new_domain 调用增加 || return 1，确保环境准备失败时优雅返回。
+# 3. [兼容] reinstall_common_tools 将 snapd 移出强制列表，允许在容器中安装失败。
 # ==============================================================================
 
 # --- 基础环境修复 ---
@@ -72,7 +71,6 @@ trap 'cleanup_and_exit' ERR SIGINT SIGTERM
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Systemd 环境检测
 is_systemd() {
     if command_exists systemctl && [[ -d /run/systemd/system ]]; then return 0; else return 1; fi
 }
@@ -127,24 +125,30 @@ auto_install_dependencies() {
     for tool in $tools; do
         if ! dpkg -s "$tool" &> /dev/null; then install_package "$tool" "silent"; fi
     done
-    if ! command_exists snap; then install_package "snapd" "silent"; fi
+    # Snapd 可选，失败不退出
+    if ! command_exists snap; then install_package "snapd" "silent" || true; fi
 }
 
 reinstall_common_tools() {
     echo -e "\n${CYAN}--- 2. 手动重装依赖 ---${NC}"
     APT_UPDATED=0
     update_apt_cache
-    local tools="curl wget jq unzip openssl ca-certificates snapd ufw fail2ban nginx iproute2"
+    # [修复] 移除 snapd，避免在容器中失败导致整个重装过程中断
+    local tools="curl wget jq unzip openssl ca-certificates ufw fail2ban nginx iproute2"
     for tool in $tools; do install_package "$tool"; done
-    echo -e "${GREEN}[✓] 完成。${NC}"
+    
+    # 单独处理 snapd (允许失败)
+    echo -e "${BLUE}[*] 尝试安装 Snapd (可选)...${NC}"
+    install_package "snapd" || echo -e "${YELLOW}[!] Snapd 安装失败 (环境不支持?)，跳过。${NC}"
+    
+    echo -e "${GREEN}[✓] 依赖检查完成。${NC}"
 }
 
 # ==============================================================================
-# 功能模块：系统信息 (v7.4 增强版 + 防崩保护)
+# 功能模块：系统信息
 # ==============================================================================
 
 output_status() {
-    # [修复] 增加 || true 防止无网络或 curl 失败触发 ERR
     DETECTED_IPV4=$(curl -s --max-time 3 https://api.ipify.org || echo "")
     DETECTED_IPV6=$(curl -s --max-time 3 https://api64.ipify.org || echo "")
 
@@ -169,9 +173,9 @@ output_status() {
     local cpu_cores=$(nproc || echo "1")
     local cpu_freq=$(cat /proc/cpuinfo | grep "MHz" | head -n 1 | awk '{printf "%.1f GHz", $4/1000}' || echo "N/A")
     local mem_info=$(free -b | awk 'NR==2{printf "%.2fG/%.2fG (%.2f%%)", $3/1024/1024/1024, $2/1024/1024/1024, $3*100/$2}' || echo "N/A")
+    local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dM/%dM (%d%%)", used, total, percentage}' || echo "N/A")
     local disk_info=$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}' || echo "N/A")
     
-    # [修复] 增加网络请求超时保护，且 grep 失败时返回 N/A，防止触发 trap ERR
     local ipinfo=$(curl -s --max-time 5 ipinfo.io || echo "")
     local country=$(echo "$ipinfo" | grep 'country' | awk -F': ' '{print $2}' | tr -d '",' || echo "N/A")
     local city=$(echo "$ipinfo" | grep 'city' | awk -F': ' '{print $2}' | tr -d '",' || echo "N/A")
@@ -188,7 +192,6 @@ output_status() {
     local current_time=$(date "+%Y-%m-%d %I:%M %p")
     local runtime=$(cat /proc/uptime | awk -F. '{run_days=int($1 / 86400);run_hours=int(($1 % 86400) / 3600);run_minutes=int(($1 % 3600) / 60); if (run_days > 0) printf("%d天 ", run_days); if (run_hours > 0) printf("%d时 ", run_hours); printf("%d分\n", run_minutes)}' || echo "N/A")
     
-    # [修复] 增加 command_exists 检查，兼容无 systemd 容器
     local timezone="UTC"
     if command_exists timedatectl; then
         timezone=$(timedatectl | grep "Time zone" | awk '{print $3}' || echo "UTC")
@@ -209,6 +212,7 @@ output_status() {
     echo -e "${CYAN}CPU占用:      ${NC}$cpu_usage_percent%"
     echo -e "${CYAN}系统负载:     ${NC}$load"
     echo -e "${CYAN}物理内存:     ${NC}$mem_info"
+    echo -e "${CYAN}虚拟内存:     ${NC}$swap_info"
     echo -e "${CYAN}硬盘占用:     ${NC}$disk_info"
     echo -e "${CYAN}-------------"
     echo -e "${CYAN}总接收:       ${NC}$rx"
@@ -502,26 +506,20 @@ manage_ssh_security() {
 # 功能模块：DNS & BBR & 时区
 # ==============================================================================
 
-# 查看当前 DNS
 view_current_dns() {
     echo -e "\n${BLUE}[*] 当前 /etc/resolv.conf 内容:${NC}"
     cat /etc/resolv.conf
-    if command_exists systemctl && systemctl is-active --quiet systemd-resolved; then
+    if is_systemd && systemctl is-active --quiet systemd-resolved; then
         echo -e "\n${BLUE}[*] Systemd-resolved 状态:${NC}"
-        if command_exists resolvectl; then
-            # [修复] 增加 || true 防止 grep 返回 1 触发 ERR
-            resolvectl status | grep "DNS Servers" -A 2 || true
-        fi
+        if command_exists resolvectl; then resolvectl status | grep "DNS Servers" -A 2 || true; fi
     fi
 }
 
-# 修改 DNS
 edit_dns_config() {
     echo -e "\n${CYAN}--- 修改 DNS 配置 ---${NC}"
     echo -e "${YELLOW}请输入新的 DNS IP (多个用空格隔开，如 1.1.1.1 8.8.8.8)${NC}"
     echo -e "${YELLOW}输入 0 或留空 则取消修改${NC}"
     read -p "DNS: " dns_ips
-    
     if [[ -z "$dns_ips" || "$dns_ips" == "0" ]]; then echo "已取消"; return; fi
     
     echo -e "${BLUE}[*] 备份并应用...${NC}"
@@ -565,10 +563,7 @@ enable_bbr_fq() {
 set_timezone() {
     while true; do
         echo -e "\n${CYAN}--- 时区设置 ---${NC}"
-        # [修复] 增加命令检测，防止非 systemd 环境报错
-        if command_exists timedatectl; then
-            echo "当前: $(timedatectl | grep "Time zone" | awk '{print $3}')"
-        else echo "当前: $(date)"; fi
+        if command_exists timedatectl; then echo "当前: $(timedatectl | grep "Time zone" | awk '{print $3}')"; else echo "当前: $(date)"; fi
         echo "1. 上海 (Asia/Shanghai)"; echo "2. 香港 (Asia/Hong_Kong)"; echo "3. 东京 (Asia/Tokyo)"; echo "4. 伦敦 (Europe/London)"; echo "5. 纽约 (America/New_York)"; echo "6. UTC"; echo "0. 返回"
         read -p "选择: " c
         case $c in
@@ -591,14 +586,20 @@ prepare_web_env() {
     if ! command_exists certbot; then
         echo -e "${BLUE}[*] 安装 Certbot...${NC}"
         update_apt_cache
-        apt-get install -y certbot python3-certbot-dns-cloudflare || {
+        # [防崩] 使用 if ! ... 防止 set -o errtrace 触发 trap
+        if ! apt-get install -y certbot python3-certbot-dns-cloudflare; then
             echo -e "${YELLOW}[!] apt 安装失败，尝试 snap...${NC}"
-            install_package "snapd" "silent"
-            snap install --classic certbot
-            snap install certbot-dns-cloudflare
-            snap connect certbot:plugin certbot-dns-cloudflare
-            ln -sf /snap/bin/certbot /usr/bin/certbot
-        }
+            install_package "snapd" "silent" || true
+            if command_exists snap; then
+                # 显式允许失败，避免 trap
+                if ! snap install --classic certbot; then echo -e "${RED}[✗] Snap Certbot 安装失败。${NC}"; return 1; fi
+                if ! snap install certbot-dns-cloudflare; then echo -e "${RED}[✗] Snap Plugin 安装失败。${NC}"; return 1; fi
+                snap connect certbot:plugin certbot-dns-cloudflare
+                ln -sf /snap/bin/certbot /usr/bin/certbot
+            else
+                echo -e "${RED}[✗] 无法安装 Certbot (Apt/Snap 均失败)。${NC}"; return 1
+            fi
+        fi
     fi
 }
 
@@ -641,7 +642,7 @@ apply_nginx_config() {
     NGINX_CONF_PATH="/etc/nginx/sites-available/${DOMAIN}.conf"
     local redir_suf=""; if [[ "${NGINX_HTTPS_PORT}" -ne 443 ]]; then redir_suf=":${NGINX_HTTPS_PORT}"; fi
     cat > "$NGINX_CONF_PATH" <<EOF
-# Generated by server-manage.sh (v11.0) for ${DOMAIN}
+# Generated by server-manage.sh (v11.3) for ${DOMAIN}
 server {
     listen ${NGINX_HTTP_PORT};
     listen [::]:${NGINX_HTTP_PORT};
@@ -681,7 +682,8 @@ EOF
 
 add_new_domain() {
     echo -e "\n${CYAN}--- 添加域名配置 (SSL + Nginx) ---${NC}"
-    prepare_web_env
+    # [逻辑] 增加 || return 1，环境准备失败直接返回
+    prepare_web_env || return 1
     get_cf_token || return 1
     local do_nginx="n"; if ask_nginx_params; then do_nginx="y"; fi
     echo -e "${BLUE}[*] 申请证书 (Let's Encrypt)...${NC}"
@@ -691,7 +693,6 @@ add_new_domain() {
         cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CERT_PATH}/privkey.pem"
         if [[ "$do_nginx" == "y" ]]; then apply_nginx_config; fi
         DEPLOY_HOOK_SCRIPT="/root/cert-renew-hook-${DOMAIN}.sh"
-        # [Hook修复] 恢复非 Systemd 判断逻辑
         cat > "$DEPLOY_HOOK_SCRIPT" <<EOF
 #!/bin/bash
 LOG_FILE="/var/log/cert_renew_${DOMAIN}.log"
@@ -700,13 +701,11 @@ mkdir -p "${CERT_PATH}"
 cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${CERT_PATH}/fullchain.pem"
 cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "${CERT_PATH}/privkey.pem"
 log "Cert copied."
-# 优先 Systemd 检测
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet nginx; then systemctl reload nginx && log "Nginx reloaded (Systemd)" || true; fi
     if systemctl is-active --quiet x-ui; then systemctl restart x-ui && log "x-ui restarted" || true; fi
     if systemctl is-active --quiet 3x-ui; then systemctl restart 3x-ui && log "3x-ui restarted" || true; fi
 else
-    # 容器/非 Systemd 回退
     if command -v nginx >/dev/null 2>&1; then nginx -s reload && log "Nginx reloaded (Native)" || true; fi
 fi
 EOF
@@ -773,7 +772,7 @@ check_root
 auto_install_dependencies
 
 while true; do
-    echo -e "\n${CYAN}=== 服务器管理脚本 (v11.0 Ironclad) ===${NC}"
+    echo -e "\n${CYAN}=== 服务器管理脚本 (v11.3 Bulletproof) ===${NC}"
     echo -e " ${YELLOW}1.${NC} 系统信息查询"
     echo -e " ${YELLOW}2.${NC} 手动重装/修复依赖"
     echo -e " ${YELLOW}3.${NC} UFW 防火墙管理"
