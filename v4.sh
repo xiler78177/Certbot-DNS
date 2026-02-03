@@ -1,17 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v13.15 - The Robust Hook)
+# 服务器初始化与管理脚本 (v13.13 - Functionality Restored)
 #
-# 更新日志 v13.15:
-# 1. [修复] web_add_domain: 重构证书续签 Hook 的重启逻辑。
-#    采纳用户建议，优先尝试 'x-ui restart' 和 '3x-ui restart' CLI 命令，
-#    并在失败后回退尝试 systemctl 重启 x-ui/3x-ui 服务。
-#    这确保了无论面板服务名称如何变化，都能成功重启并加载新证书。
+# 更新日志 v13.13:
+# 1. [回归] web_delete_domain: 恢复并重写了"删除配置"功能。
+#    - 支持菜单选择已添加的域名。
+#    - 自动执行全套清理：Certbot证书、Nginx配置、Hook脚本、Crontab任务、本地配置。
+#    - 解决了之前版本只弹提示不干活的问题。
 # ==============================================================================
 
 # --- 全局常量配置 (Readonly) ---
-readonly VERSION="v13.15"
+readonly VERSION="v13.13"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -885,6 +885,103 @@ web_env_check() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets
 }
 
+# [重要] 恢复交互式删除功能 (v13.13)
+web_delete_domain() {
+    print_title "删除域名配置"
+    
+    local i=1
+    local domains=()
+    local files=()
+    
+    # 启用 nullglob 避免没有文件时报错
+    shopt -s nullglob
+    local conf_files=("${CONFIG_DIR}"/*.conf)
+    shopt -u nullglob
+    
+    if [[ ${#conf_files[@]} -eq 0 ]]; then
+        print_warn "当前没有已保存的域名配置。"
+        pause
+        return
+    fi
+    
+    echo "发现以下配置:"
+    for conf in "${conf_files[@]}"; do
+        # 子 shell 提取变量，防止污染
+        local d=$(grep '^DOMAIN=' "$conf" | cut -d'"' -f2)
+        if [[ -n "$d" ]]; then
+            domains+=("$d")
+            files+=("$conf")
+            echo "$i. $d"
+            ((i++))
+        fi
+    done
+    echo "0. 返回"
+    
+    echo ""
+    read -r -p "请输入序号删除: " idx
+    
+    if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
+        print_error "无效序号。"
+        pause
+        return
+    fi
+    
+    local target_domain="${domains[$((idx-1))]}"
+    local target_conf="${files[$((idx-1))]}"
+    
+    echo -e "${C_RED}"
+    echo "!!! 危险操作 !!!"
+    echo "即将删除域名: $target_domain"
+    echo "这将执行:"
+    echo "1. 删除 SSL 证书 (certbot delete)"
+    echo "2. 删除 Nginx 配置文件并重载"
+    echo "3. 删除 自动续签 Hook 脚本"
+    echo "4. 清理 Crontab 定时任务"
+    echo "5. 删除 脚本保存的配置"
+    echo -e "${C_RESET}"
+    
+    if ! confirm "确认彻底删除吗?"; then return; fi
+    
+    print_info "正在执行清理..."
+    
+    # 1. Certbot 删除
+    if certbot delete --cert-name "$target_domain" --non-interactive; then
+        print_success "证书已吊销/删除。"
+    else
+        print_warn "Certbot 删除失败或证书不存在。"
+    fi
+    
+    # 2. Nginx 清理
+    local nginx_conf="/etc/nginx/sites-enabled/${target_domain}.conf"
+    local nginx_conf_src="/etc/nginx/sites-available/${target_domain}.conf"
+    if [[ -f "$nginx_conf" || -f "$nginx_conf_src" ]]; then
+        rm -f "$nginx_conf" "$nginx_conf_src"
+        if is_systemd; then systemctl reload nginx; else nginx -s reload; fi
+        print_success "Nginx 配置已删除。"
+    fi
+    
+    # 3. Hook 清理
+    local hook_script="/root/cert-renew-hook-${target_domain}.sh"
+    if [[ -f "$hook_script" ]]; then
+        rm -f "$hook_script"
+        print_success "Hook 脚本已删除。"
+    fi
+    
+    # 4. Crontab 清理
+    if crontab -l 2>/dev/null | grep -q "$hook_script"; then
+        crontab -l | grep -v "$hook_script" | crontab -
+        print_success "Crontab 任务已清理。"
+    fi
+    
+    # 5. 自身配置清理
+    rm -f "$target_conf"
+    print_success "管理配置已移除。"
+    
+    log_action "Deleted domain config: $target_domain"
+    pause
+}
+
 web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
     # [隔离] 显式声明局部变量，建立沙箱
@@ -991,13 +1088,14 @@ server {
 mkdir -p \"$cert_dir\"
 cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem \"$cert_dir/fullchain.pem\"
 cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem \"$cert_dir/privkey.pem\"
+# 权限修正 (v13.14 fix)
 chmod 644 \"$cert_dir/fullchain.pem\"
 chmod 644 \"$cert_dir/privkey.pem\"
 
 # Reload Nginx
 if [ -d /run/systemd/system ]; then systemctl reload nginx || true; else nginx -s reload || true; fi
 
-# Restart 3x-ui/x-ui (Robust method)
+# Restart 3x-ui/x-ui (Robust method v13.15)
 command -v x-ui >/dev/null 2>&1 && x-ui restart || \\
 command -v 3x-ui >/dev/null 2>&1 && 3x-ui restart || \\
 systemctl restart x-ui 2>/dev/null || \\
@@ -1072,7 +1170,7 @@ menu_web() {
                     fi
                 done
                 pause ;;
-            4) print_warn "请手动删除: certbot delete --cert-name <DOMAIN>" && pause ;;
+            4) web_delete_domain ;;
             0|q) break ;; *) print_error "无效" ;;
         esac
     done
