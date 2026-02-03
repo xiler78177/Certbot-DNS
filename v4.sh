@@ -1,17 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v13.13 - Functionality Restored)
+# 服务器初始化与管理脚本 (v13.20 - The Executive Summary)
 #
-# 更新日志 v13.13:
-# 1. [回归] web_delete_domain: 恢复并重写了"删除配置"功能。
-#    - 支持菜单选择已添加的域名。
-#    - 自动执行全套清理：Certbot证书、Nginx配置、Hook脚本、Crontab任务、本地配置。
-#    - 解决了之前版本只弹提示不干活的问题。
+# 更新日志 v13.20 (基于用户补丁的配置可视化优化):
+# 1. [精简] web_view_config:
+#    - Nginx: 将整段 cat 替换为关键指令摘要 (listen/server_name/proxy_pass/ssl_*)。
+#    - Nginx: 增加配置状态显示 (已启用/未启用)，便于排查软链问题。
+#    - Hook: 仅展示关键动作 (PATH注入/证书复制/服务重启)，大幅减少屏幕噪音。
 # ==============================================================================
 
 # --- 全局常量配置 (Readonly) ---
-readonly VERSION="v13.13"
+readonly VERSION="v13.20"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -86,6 +86,7 @@ print_title() {
 
 # 统一状态输出
 print_info() { echo -e "${C_BLUE}[i] $1${C_RESET}"; }
+print_guide() { echo -e "${C_GREEN}>> $1${C_RESET}"; }
 print_success() { echo -e "${C_GREEN}[✓] $1${C_RESET}"; }
 print_warn() { echo -e "${C_YELLOW}[!] $1${C_RESET}"; }
 print_error() { echo -e "${C_RED}[✗] $1${C_RESET}"; }
@@ -885,7 +886,124 @@ web_env_check() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets
 }
 
-# [重要] 恢复交互式删除功能 (v13.13)
+# 新增：查看详细配置功能 (v13.16 + v13.20 Simplified)
+web_view_config() {
+    print_title "查看详细配置"
+    
+    shopt -s nullglob
+    local conf_files=("${CONFIG_DIR}"/*.conf)
+    shopt -u nullglob
+    
+    if [[ ${#conf_files[@]} -eq 0 ]]; then
+        print_warn "当前没有已保存的域名配置。"
+        pause
+        return
+    fi
+    
+    local i=1
+    local domains=()
+    local files=()
+    
+    echo "请选择要查看的域名:"
+    for conf in "${conf_files[@]}"; do
+        local d=$(grep '^DOMAIN=' "$conf" | cut -d'"' -f2)
+        if [[ -n "$d" ]]; then
+            domains+=("$d")
+            files+=("$conf")
+            echo "$i. $d"
+            ((i++))
+        fi
+    done
+    echo "0. 返回"
+    
+    echo ""
+    read -r -p "请输入序号: " idx
+    
+    if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
+        print_error "无效序号。"
+        pause
+        return
+    fi
+    
+    local target_domain="${domains[$((idx-1))]}"
+    local target_conf="${files[$((idx-1))]}"
+    
+    # [增强] 变量清洗与默认值 (v13.17)
+    local DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
+    source "$target_conf"
+    
+    CERT_PATH=${CERT_PATH:-"${CERT_PATH_PREFIX}/${target_domain}"}
+    DEPLOY_HOOK_SCRIPT=${DEPLOY_HOOK_SCRIPT:-"/root/cert-renew-hook-${target_domain}.sh"}
+    
+    # 打印概览
+    print_title "配置详情: $target_domain"
+    
+    echo -e "${C_CYAN}[基础信息]${C_RESET}"
+    echo "域名: $target_domain"
+    echo "证书目录: $CERT_PATH"
+    echo "Hook 脚本: $DEPLOY_HOOK_SCRIPT"
+    
+    echo -e "\n${C_CYAN}[自动续签计划 (Crontab)]${C_RESET}"
+    if [[ -n "$DEPLOY_HOOK_SCRIPT" ]] && crontab -l 2>/dev/null | grep -F -q "$DEPLOY_HOOK_SCRIPT"; then
+        crontab -l 2>/dev/null | grep -F "$DEPLOY_HOOK_SCRIPT"
+    else
+        echo -e "${C_YELLOW}未配置自动续签任务${C_RESET}"
+    fi
+    
+    echo -e "\n${C_CYAN}[证书状态]${C_RESET}"
+    local fullchain="$CERT_PATH/fullchain.pem"
+    local privkey="$CERT_PATH/privkey.pem"
+    
+    if [[ -f "$fullchain" ]]; then
+        local end_date=$(openssl x509 -enddate -noout -in "$fullchain" | cut -d= -f2)
+        echo -e "过期时间: ${C_GREEN}${end_date}${C_RESET}"
+    else
+        echo -e "公钥文件: ${C_RED}未找到${C_RESET}"
+    fi
+    
+    if [[ -f "$privkey" ]]; then
+        echo "私钥文件: $privkey (存在)"
+    else
+        echo -e "私钥文件: ${C_RED}未找到${C_RESET}"
+    fi
+    
+    echo -e "\n${C_CYAN}[Nginx 配置摘要]${C_RESET}"
+    local nginx_conf="/etc/nginx/sites-enabled/${target_domain}.conf"
+    local nginx_status="已启用"
+    
+    # [增强] Nginx 配置查找兜底
+    if [[ ! -f "$nginx_conf" ]]; then
+        local avail_conf="/etc/nginx/sites-available/${target_domain}.conf"
+        if [[ -f "$avail_conf" ]]; then
+            nginx_conf="$avail_conf"
+            nginx_status="${C_YELLOW}未启用${C_RESET}"
+        fi
+    fi
+    
+    if [[ -f "$nginx_conf" ]]; then
+        echo "配置文件: $nginx_conf ($nginx_status)"
+        echo "关键指令:"
+        # [精简] 仅显示关键信息 (v13.20)
+        grep -E "^\s*(listen|server_name|proxy_pass|ssl_certificate|ssl_certificate_key|ssl_trusted_certificate)\b" "$nginx_conf" | sed 's/^[[:space:]]*//'
+    else
+        echo -e "${C_YELLOW}该域名未配置 Nginx 反代。${C_RESET}"
+    fi
+    
+    echo -e "\n${C_CYAN}[Hook 脚本摘要]${C_RESET}"
+    if [[ -f "$DEPLOY_HOOK_SCRIPT" ]]; then
+        echo "脚本路径: $DEPLOY_HOOK_SCRIPT"
+        echo "关键动作:"
+        # [精简] 仅显示重启命令 (v13.20)
+        grep -E 'export PATH=|cp -L|reload nginx|x-ui|3x-ui' "$DEPLOY_HOOK_SCRIPT" | sed 's/^[[:space:]]*//'
+    else
+        echo -e "${C_RED}Hook 脚本丢失！建议重新添加域名。${C_RESET}"
+    fi
+    
+    pause
+}
+
+# 恢复交互式删除功能 (v13.13)
 web_delete_domain() {
     print_title "删除域名配置"
     
@@ -893,7 +1011,6 @@ web_delete_domain() {
     local domains=()
     local files=()
     
-    # 启用 nullglob 避免没有文件时报错
     shopt -s nullglob
     local conf_files=("${CONFIG_DIR}"/*.conf)
     shopt -u nullglob
@@ -906,7 +1023,6 @@ web_delete_domain() {
     
     echo "发现以下配置:"
     for conf in "${conf_files[@]}"; do
-        # 子 shell 提取变量，防止污染
         local d=$(grep '^DOMAIN=' "$conf" | cut -d'"' -f2)
         if [[ -n "$d" ]]; then
             domains+=("$d")
@@ -945,14 +1061,12 @@ web_delete_domain() {
     
     print_info "正在执行清理..."
     
-    # 1. Certbot 删除
     if certbot delete --cert-name "$target_domain" --non-interactive; then
         print_success "证书已吊销/删除。"
     else
         print_warn "Certbot 删除失败或证书不存在。"
     fi
     
-    # 2. Nginx 清理
     local nginx_conf="/etc/nginx/sites-enabled/${target_domain}.conf"
     local nginx_conf_src="/etc/nginx/sites-available/${target_domain}.conf"
     if [[ -f "$nginx_conf" || -f "$nginx_conf_src" ]]; then
@@ -961,20 +1075,17 @@ web_delete_domain() {
         print_success "Nginx 配置已删除。"
     fi
     
-    # 3. Hook 清理
     local hook_script="/root/cert-renew-hook-${target_domain}.sh"
     if [[ -f "$hook_script" ]]; then
         rm -f "$hook_script"
         print_success "Hook 脚本已删除。"
     fi
     
-    # 4. Crontab 清理
     if crontab -l 2>/dev/null | grep -q "$hook_script"; then
         crontab -l | grep -v "$hook_script" | crontab -
         print_success "Crontab 任务已清理。"
     fi
     
-    # 5. 自身配置清理
     rm -f "$target_conf"
     print_success "管理配置已移除。"
     
@@ -984,31 +1095,62 @@ web_delete_domain() {
 
 web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
-    # [隔离] 显式声明局部变量，建立沙箱
+    # [隔离] 显式声明局部变量，建立沙箱 (v13.8)
     local DOMAIN="" CF_API_TOKEN="" LOCAL_PROXY_PASS="" NGINX_HTTP_PORT="" NGINX_HTTPS_PORT="" BACKEND_PROTOCOL="" CLOUDFLARE_CREDENTIALS="" DEPLOY_HOOK_SCRIPT="" NGINX_CONF_PATH="" hp="" sp="" proto="" inp=""
     
     web_env_check || { pause; return; }
     
-    while [[ -z "$DOMAIN" ]]; do read -r -p "域名: " DOMAIN; done
+    # [体验] 增加引导文字 (v13.16)
+    print_guide "此步骤将申请 SSL 证书并（可选）配置 Nginx 反向代理。"
+    print_guide "请确保您的域名已解析到本机 IP，且 Cloudflare 的云朵图标为灰色（仅 DNS）。"
+    echo ""
+    
+    while [[ -z "$DOMAIN" ]]; do read -r -p "请输入域名 (如 example.com): " DOMAIN; done
     if [[ -f "${CONFIG_DIR}/${DOMAIN}.conf" ]]; then print_warn "配置已存在，请先删除。"; pause; return; fi
     
+    print_guide "脚本使用 DNS API 申请证书，需要您的 Cloudflare API Token。"
+    print_guide "Token 仅保存在本地 root 目录，用于自动续签。"
     while [[ -z "$CF_API_TOKEN" ]]; do read -s -r -p "Cloudflare API Token: " CF_API_TOKEN; echo ""; done
     
     local do_nginx=0
-    if confirm "配置 Nginx 反代?"; then
+    echo ""
+    if confirm "是否配置 Nginx 反向代理 (用于隐藏后端端口)?"; then
         do_nginx=1
-        read -r -p "HTTP 端口 [80]: " hp; NGINX_HTTP_PORT=${hp:-80}
-        read -r -p "HTTPS 端口 [443]: " sp; NGINX_HTTPS_PORT=${sp:-443}
+        print_guide "请输入 Nginx 监听的端口 (通常 HTTP=80, HTTPS=443)"
+        
+        # [严谨] 端口校验增强 (v13.18)
+        while true; do
+            read -r -p "HTTP 端口 [80]: " hp; NGINX_HTTP_PORT=${hp:-80}
+            if [[ "$NGINX_HTTP_PORT" =~ ^[0-9]+$ ]] && [ "$NGINX_HTTP_PORT" -ge 1 ] && [ "$NGINX_HTTP_PORT" -le 65535 ]; then break; fi
+            print_warn "端口无效 (1-65535)"
+        done
+        
+        while true; do
+            read -r -p "HTTPS 端口 [443]: " sp; NGINX_HTTPS_PORT=${sp:-443}
+            if [[ "$NGINX_HTTPS_PORT" =~ ^[0-9]+$ ]] && [ "$NGINX_HTTPS_PORT" -ge 1 ] && [ "$NGINX_HTTPS_PORT" -le 65535 ]; then break; fi
+            print_warn "端口无效 (1-65535)"
+        done
+        
+        print_guide "后端服务（如 x-ui 面板）的协议是什么？"
         read -r -p "后端协议 [1]http [2]https: " proto
         BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
         
+        print_guide "请输入后端服务的实际地址 (例如 127.0.0.1:54321)"
         while [[ -z "$LOCAL_PROXY_PASS" ]]; do
-            read -r -p "反代目标 (如 127.0.0.1:10000): " inp
+            read -r -p "反代目标: " inp
             [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
             if [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
                 LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${inp}"
-            else print_warn "格式错误"; fi
+            else print_warn "格式错误，请重试"; fi
         done
+    else
+        # [体验] 不配置 Nginx 时的提示 (v13.19 dynamic)
+        echo ""
+        print_guide "您选择了【不配置 Nginx】。"
+        print_guide "证书生成后，请手动在 3x-ui 面板设置中填写以下路径："
+        print_guide "公钥: ${CERT_PATH_PREFIX}/$DOMAIN/fullchain.pem"
+        print_guide "私钥: ${CERT_PATH_PREFIX}/$DOMAIN/privkey.pem"
+        echo ""
     fi
     
     mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
@@ -1016,9 +1158,9 @@ web_add_domain() {
     write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
     chmod 600 "$CLOUDFLARE_CREDENTIALS"
     
-    print_info "申请证书中 (请稍候)..."
+    print_info "正在申请证书 (这可能需要 1-2 分钟)..."
     if certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" --dns-cloudflare-propagation-seconds 60 -d "$DOMAIN" --email "$EMAIL" --agree-tos --no-eff-email --non-interactive; then
-        print_success "证书获取成功。"
+        print_success "证书获取成功！"
         local cert_dir="${CERT_PATH_PREFIX}/${DOMAIN}"
         cp -L "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert_dir/fullchain.pem"
         cp -L "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" "$cert_dir/privkey.pem"
@@ -1083,8 +1225,10 @@ server {
         fi
         
         DEPLOY_HOOK_SCRIPT="/root/cert-renew-hook-${DOMAIN}.sh"
-        # [修复] 增加 3x-ui 重启逻辑 (v13.15 logic)
+        # [关键] 注入 PATH 环境变量 (v13.17 fix)
         local hook_content="#!/bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 mkdir -p \"$cert_dir\"
 cp -L /etc/letsencrypt/live/$DOMAIN/fullchain.pem \"$cert_dir/fullchain.pem\"
 cp -L /etc/letsencrypt/live/$DOMAIN/privkey.pem \"$cert_dir/privkey.pem\"
@@ -1112,10 +1256,16 @@ systemctl restart 3x-ui 2>/dev/null || true"
         (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\"") | sort -u | crontab -
         
         print_success "域名添加完成！"
+        echo -e "------------------------------------------------"
+        echo -e "证书公钥: ${C_GREEN}$cert_dir/fullchain.pem${C_RESET}"
+        echo -e "证书私钥: ${C_GREEN}$cert_dir/privkey.pem${C_RESET}"
+        echo -e "------------------------------------------------"
         log_action "Added domain $DOMAIN"
     else
         print_error "证书申请失败。"
         rm -f "$CLOUDFLARE_CREDENTIALS"
+        # [完善] 失败时清理空目录 (v13.19)
+        rm -rf "${CERT_PATH_PREFIX}/${DOMAIN}"
     fi
     pause
 }
@@ -1124,9 +1274,11 @@ menu_web() {
     while true; do
         print_title "Web 服务管理"
         echo "1. 添加域名 (SSL+Nginx)"
-        echo "2. 证书状态监控"
-        echo "3. 手动强制续期"
-        echo "4. 删除配置"
+        # [新增] 查看配置入口
+        echo "2. 查看详细配置 (证书/Nginx/Hook)"
+        echo "3. 证书状态监控"
+        echo "4. 手动强制续期"
+        echo "5. 删除配置"
         echo "0. 返回"
         echo ""
         
@@ -1136,41 +1288,53 @@ menu_web() {
         read -r -p "选择: " c
         case $c in
             1) web_add_domain ;;
-            2) 
+            2) web_view_config ;;
+            3) 
                 print_info "检查证书..."
-                for conf in "${CONFIG_DIR}"/*.conf; do
-                    if [[ -f "$conf" ]]; then
-                        # [修复] source 前显式清空
-                        DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
-                        source "$conf"
-                        
-                        local check_path="${CERT_PATH}/fullchain.pem"
-                        if [[ -f "$check_path" ]]; then
-                            local end_date
-                            end_date=$(openssl x509 -enddate -noout -in "$check_path" | cut -d= -f2)
-                            echo -e "域名: ${C_GREEN}${DOMAIN}${C_RESET} | 到期: ${end_date}"
-                        else
-                            echo -e "域名: ${DOMAIN} | ${C_RED}证书丢失${C_RESET}"
-                        fi
+                
+                # [健壮] 空目录检查 (v13.19)
+                shopt -s nullglob
+                local conf_files=("${CONFIG_DIR}"/*.conf)
+                shopt -u nullglob
+                if [[ ${#conf_files[@]} -eq 0 ]]; then print_warn "无配置"; pause; continue; fi
+                
+                for conf in "${conf_files[@]}"; do
+                    # [修复] source 前显式清空 + 变量兜底 (v13.19)
+                    DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
+                    source "$conf"
+                    CERT_PATH=${CERT_PATH:-"${CERT_PATH_PREFIX}/${DOMAIN}"}
+                    
+                    local check_path="${CERT_PATH}/fullchain.pem"
+                    if [[ -f "$check_path" ]]; then
+                        local end_date=$(openssl x509 -enddate -noout -in "$check_path" | cut -d= -f2)
+                        echo -e "域名: ${C_GREEN}${DOMAIN}${C_RESET} | 到期: ${end_date}"
+                    else
+                        echo -e "域名: ${DOMAIN} | ${C_RED}证书丢失${C_RESET}"
                     fi
                 done
                 pause ;;
-            3)
+            4)
                 print_info "正在执行 renew..."
-                for conf in "${CONFIG_DIR}"/*.conf; do
-                    if [[ -f "$conf" ]]; then
-                        # [修复] source 前显式清空
-                        DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
-                        source "$conf"
-                        
-                        if [[ -n "$DOMAIN" && -n "$DEPLOY_HOOK_SCRIPT" ]]; then
-                            print_info "Renewing $DOMAIN ..."
-                            certbot renew --cert-name "$DOMAIN" --deploy-hook "$DEPLOY_HOOK_SCRIPT" --force-renewal
-                        fi
+                
+                # [健壮] 空目录检查 (v13.19)
+                shopt -s nullglob
+                local conf_files=("${CONFIG_DIR}"/*.conf)
+                shopt -u nullglob
+                if [[ ${#conf_files[@]} -eq 0 ]]; then print_warn "无配置"; pause; continue; fi
+                
+                for conf in "${conf_files[@]}"; do
+                    # [修复] source 前显式清空 + 变量兜底 (v13.19)
+                    DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
+                    source "$conf"
+                    DEPLOY_HOOK_SCRIPT=${DEPLOY_HOOK_SCRIPT:-"/root/cert-renew-hook-${DOMAIN}.sh"}
+                    
+                    if [[ -n "$DOMAIN" && -n "$DEPLOY_HOOK_SCRIPT" ]]; then
+                        print_info "Renewing $DOMAIN ..."
+                        certbot renew --cert-name "$DOMAIN" --deploy-hook "$DEPLOY_HOOK_SCRIPT" --force-renewal
                     fi
                 done
                 pause ;;
-            4) web_delete_domain ;;
+            5) web_delete_domain ;;
             0|q) break ;; *) print_error "无效" ;;
         esac
     done
