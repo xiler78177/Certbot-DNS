@@ -1,17 +1,18 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v13.20 - The Executive Summary)
+# 服务器初始化与管理脚本 (v13.25 - The Ultimate UX)
 #
-# 更新日志 v13.20 (基于用户补丁的配置可视化优化):
-# 1. [精简] web_view_config:
-#    - Nginx: 将整段 cat 替换为关键指令摘要 (listen/server_name/proxy_pass/ssl_*)。
-#    - Nginx: 增加配置状态显示 (已启用/未启用)，便于排查软链问题。
-#    - Hook: 仅展示关键动作 (PATH注入/证书复制/服务重启)，大幅减少屏幕噪音。
+# 更新日志 v13.25 (用户体验的最后打磨):
+# 1. [体验] web_add_domain: Crontab 写入失败时的指引升级。
+#    - 如果自动写入失败（因原文件损坏等），直接打印出完整的 Cron 语句。
+#    - 明确提示用户执行 "crontab -e" 进行手动修复和添加。
+# 2. [兼容] 全局: Crontab 脏行过滤正则升级为 "^[[:space:]]*no crontab for "，
+#    兼容部分系统输出中可能存在的缩进空格。
 # ==============================================================================
 
 # --- 全局常量配置 (Readonly) ---
-readonly VERSION="v13.20"
+readonly VERSION="v13.25"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -886,7 +887,7 @@ web_env_check() {
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets
 }
 
-# 新增：查看详细配置功能 (v13.16 + v13.20 Simplified)
+# 新增：查看详细配置功能 (v13.16 + v13.20 Simplified + v13.23 Faster)
 web_view_config() {
     print_title "查看详细配置"
     
@@ -929,7 +930,7 @@ web_view_config() {
     local target_domain="${domains[$((idx-1))]}"
     local target_conf="${files[$((idx-1))]}"
     
-    # [增强] 变量清洗与默认值 (v13.17)
+    # [增强] 变量清洗与默认值
     local DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
     source "$target_conf"
     
@@ -945,8 +946,12 @@ web_view_config() {
     echo "Hook 脚本: $DEPLOY_HOOK_SCRIPT"
     
     echo -e "\n${C_CYAN}[自动续签计划 (Crontab)]${C_RESET}"
-    if [[ -n "$DEPLOY_HOOK_SCRIPT" ]] && crontab -l 2>/dev/null | grep -F -q "$DEPLOY_HOOK_SCRIPT"; then
-        crontab -l 2>/dev/null | grep -F "$DEPLOY_HOOK_SCRIPT"
+    # [提速 + 修复] 读取一次，过滤脏行 (v13.23 + v13.25 regex)
+    local cron_out
+    cron_out=$(crontab -l 2>/dev/null | grep -v -E "^[[:space:]]*no crontab for " || true)
+    
+    if [[ -n "$DEPLOY_HOOK_SCRIPT" ]] && echo "$cron_out" | grep -F -q "$DEPLOY_HOOK_SCRIPT"; then
+        echo "$cron_out" | grep -F "$DEPLOY_HOOK_SCRIPT"
     else
         echo -e "${C_YELLOW}未配置自动续签任务${C_RESET}"
     fi
@@ -1003,7 +1008,7 @@ web_view_config() {
     pause
 }
 
-# 恢复交互式删除功能 (v13.13)
+# 恢复交互式删除功能 (v13.13) + 安全重构 (v13.23) + 防崩 (v13.24)
 web_delete_domain() {
     print_title "删除域名配置"
     
@@ -1081,10 +1086,29 @@ web_delete_domain() {
         print_success "Hook 脚本已删除。"
     fi
     
-    if crontab -l 2>/dev/null | grep -q "$hook_script"; then
-        crontab -l | grep -v "$hook_script" | crontab -
-        print_success "Crontab 任务已清理。"
+    # [重构] 安全的 Crontab 清理 (v13.23: temp file + filter + pipe safe)
+    local cron_tmp
+    cron_tmp=$(mktemp)
+    
+    # 1. 导出 (容错)
+    crontab -l > "$cron_tmp" 2>/dev/null || true
+    
+    # 2. 清洗脏行 (带空格 v13.25 regex)
+    grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean"
+    mv "${cron_tmp}.clean" "$cron_tmp"
+    
+    # 3. 过滤掉目标任务并写回 (Pipe Safe: 2>/dev/null || print_warn - v13.24)
+    if grep -F -q "$hook_script" "$cron_tmp"; then
+        grep -F -v "$hook_script" "$cron_tmp" > "${cron_tmp}.new"
+        if ! crontab "${cron_tmp}.new" 2>/dev/null; then
+            print_warn "Crontab 写回失败，请手动检查: crontab -e"
+        else
+            print_success "Crontab 任务已清理。"
+        fi
+    else
+        print_info "Crontab 中未发现相关任务。"
     fi
+    rm -f "$cron_tmp" "${cron_tmp}.new"
     
     rm -f "$target_conf"
     print_success "管理配置已移除。"
@@ -1253,7 +1277,38 @@ systemctl restart 3x-ui 2>/dev/null || true"
         write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "DOMAIN=\"$DOMAIN\"; CERT_PATH=\"$cert_dir\"; DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\""
         chmod 600 "${CONFIG_DIR}/${DOMAIN}.conf"
         
-        (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\"") | sort -u | crontab -
+        # [关键修复] Crontab 写入防崩 - 临时文件法 (v13.23 hygiene)
+        local cron_line="0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\""
+        local cron_tmp
+        cron_tmp=$(mktemp)
+        
+        # 1. 导出现有 crontab (忽略错误)
+        crontab -l > "$cron_tmp" 2>/dev/null || true
+        
+        # 2. 关键：过滤脏行 (no crontab for... 带空格 v13.25 regex)
+        grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean"
+        mv "${cron_tmp}.clean" "$cron_tmp"
+        
+        # 3. 先尝试将清洗后的版本写回 (防崩逻辑: || print_warn v13.24)
+        if ! crontab "$cron_tmp" 2>/dev/null; then
+            print_warn "旧 Crontab 可能已损坏/含非法行，自动清洗回写失败。"
+            print_warn "请执行: crontab -e 先修复，然后手动添加本行:"
+            print_warn "$cron_line"
+        fi
+        
+        # 4. 去重追加新任务
+        if ! grep -F -q "$DEPLOY_HOOK_SCRIPT" "$cron_tmp"; then
+            echo "$cron_line" >> "$cron_tmp"
+            if ! crontab "$cron_tmp" 2>/dev/null; then
+                print_warn "Crontab 写入失败，请手动添加以下行:"
+                print_warn "$cron_line"
+            else
+                print_success "Crontab 任务已添加。"
+            fi
+        else
+            print_info "Crontab 任务已存在。"
+        fi
+        rm -f "$cron_tmp"
         
         print_success "域名添加完成！"
         echo -e "------------------------------------------------"
