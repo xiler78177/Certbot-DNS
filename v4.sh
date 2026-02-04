@@ -561,12 +561,44 @@ reinstall_deps() {
 # 3. 系统信息模块
 # ==============================================================================
 
+# 获取公网 IPv6 地址
+get_public_ipv6() {
+    local ipv6=""
+    
+    # 方法 1: api64.ipify.org (强制 IPv6)
+    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null || true)
+    if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
+        echo "$ipv6"
+        return 0
+    fi
+    
+    # 方法 2: ifconfig.co
+    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://ifconfig.co 2>/dev/null || true)
+    if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
+        echo "$ipv6"
+        return 0
+    fi
+    
+    # 方法 3: 本地接口
+    if command -v ip >/dev/null 2>&1; then
+        ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+' | grep -v '^fe80:' | head -n1 || true)
+        if [[ -n "$ipv6" ]]; then
+            echo "$ipv6"
+            return 0
+        fi
+    fi
+    
+    echo "未检测到"
+    return 1
+}
+
+
 sys_info() {
     print_title "系统状态查询"
     
     # 网络信息
     local ip4=$(safe_curl https://api.ipify.org || echo "N/A")
-    local ip6=$(safe_curl https://api64.ipify.org || echo "N/A")
+    local ip6=$(get_public_ipv6)
     
     local ipinfo_json=$(safe_curl https://ipinfo.io/json || echo "{}")
     local country=$(echo "$ipinfo_json" | jq -r '.country // "N/A"' 2>/dev/null || echo "N/A")
@@ -1220,7 +1252,7 @@ net_iperf3() {
     fi
     
     local ip4=$(safe_curl https://api.ipify.org)
-    local ip6=$(safe_curl https://api64.ipify.org)
+    local ip6=$(get_public_ipv6)
     
     echo -e "\n${C_BLUE}=== 客户端测速命令 ===${C_RESET}"
     [[ -n "$ip4" ]] && echo -e "IPv4 Upload: ${C_YELLOW}iperf3 -c $ip4 -p $port${C_RESET}"
