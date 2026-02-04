@@ -262,85 +262,10 @@ trap 'handle_interrupt' SIGINT SIGTERM
 
 # 环境检查
 check_root() {
-
-check_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        print_error "不支持的操作系统。"
-        exit $E_GENERAL
-    fi
-    
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
-        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
-        if ! confirm "是否继续？"; then
-            exit 0
-        fi
-    fi
-}
     if [[ "$(id -u)" -ne 0 ]]; then
-
-check_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        print_error "不支持的操作系统。"
-        exit $E_GENERAL
-    fi
-    
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
-        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
-        if ! confirm "是否继续？"; then
-            exit 0
-        fi
-    fi
-}
         print_error "请使用 root 权限运行 (sudo)。"
-
-check_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        print_error "不支持的操作系统。"
-        exit $E_GENERAL
-    fi
-    
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
-        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
-        if ! confirm "是否继续？"; then
-            exit 0
-        fi
-    fi
-}
         exit $E_PERMISSION
-
-check_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        print_error "不支持的操作系统。"
-        exit $E_GENERAL
     fi
-    
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
-        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
-        if ! confirm "是否继续？"; then
-            exit 0
-        fi
-    fi
-}
-    fi
-
-check_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        print_error "不支持的操作系统。"
-        exit $E_GENERAL
-    fi
-    
-    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
-        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
-        if ! confirm "是否继续？"; then
-            exit 0
-        fi
-    fi
-}
 }
 
 check_os() {
@@ -357,6 +282,7 @@ check_os() {
         fi
     fi
 }
+
 
 command_exists() { 
     command -v "$1" >/dev/null 2>&1
@@ -588,9 +514,11 @@ get_public_ipv6() {
         fi
     fi
     
+    # 所有方法都失败，返回提示信息（不触发错误）
     echo "未检测到"
-    return 1
+    return 0  # 改为返回 0，避免触发 ERR trap
 }
+
 
 
 sys_info() {
@@ -598,7 +526,7 @@ sys_info() {
     
     # 网络信息
     local ip4=$(safe_curl https://api.ipify.org || echo "N/A")
-    local ip6=$(get_public_ipv6)
+    local ip6=$(get_public_ipv6)  # 这里不会再触发错误
     
     local ipinfo_json=$(safe_curl https://ipinfo.io/json || echo "{}")
     local country=$(echo "$ipinfo_json" | jq -r '.country // "N/A"' 2>/dev/null || echo "N/A")
@@ -1315,14 +1243,26 @@ net_proxy() {
         1)
             local proxy_url=""
             while [[ -z "$proxy_url" ]]; do
-                read -e -r -p "输入代理地址 (格式 http://[IP]:Port): " proxy_url
-                if [[ ! "$proxy_url" =~ ^http://.+ ]]; then
-                    print_warn "地址格式错误，必须以 http:// 开头"
+                read -e -r -p "输入代理地址 (格式: IP:Port 或 http://IP:Port): " proxy_url
+                
+                # 自动补全 http:// 前缀
+                if [[ ! "$proxy_url" =~ ^https?:// ]]; then
+                    proxy_url="http://${proxy_url}"
+                    print_info "已自动补全为: $proxy_url"
+                fi
+                
+                # 验证格式
+                if [[ ! "$proxy_url" =~ ^https?://(\[?[a-zA-Z0-9:.-]+\]?):([0-9]+)$ ]]; then
+                    print_warn "地址格式错误，请重试"
+                    print_info "示例: 192.168.1.1:3128 或 http://192.168.1.1:3128"
                     proxy_url=""
                 fi
             done
             
             print_info "正在写入配置..."
+            
+            # ... 其余代码保持不变
+
             
             local apt_conf="Acquire::http::Proxy \"$proxy_url\";
 Acquire::https::Proxy \"$proxy_url\";"
@@ -1418,6 +1358,7 @@ Environment=\"no_proxy=localhost,127.0.0.1,::1\""
             print_title "系统代理状态"
             echo -e "${C_CYAN}[当前会话]${C_RESET}"
             echo "http_proxy=${http_proxy:-未设置}"
+            echo "https_proxy=${https_proxy:-未设置}"
             echo "no_proxy=${no_proxy:-未设置}"
             
             echo -e "\n${C_CYAN}[配置文件]${C_RESET}"
@@ -1427,14 +1368,36 @@ Environment=\"no_proxy=localhost,127.0.0.1,::1\""
             [[ -f "$DOCKER_PROXY_CONF" ]] && echo "Docker: 已配置" || echo "Docker: 未配置"
             
             echo -e "\n${C_CYAN}[连接测试]${C_RESET}"
-            if curl -I -s --connect-timeout 3 https://www.google.com | grep -q "HTTP/"; then
-                print_success "代理连接正常。"
+            
+            # 测试 1: 直连测试
+            print_info "测试 1: 直连 Google (不使用代理)..."
+            if curl -I -s --connect-timeout 5 https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
+                print_success "直连成功 (本机有 IPv4/IPv6 出口)"
             else
-                print_warn "代理连接失败或未配置。"
+                print_warn "直连失败 (需要代理)"
+            fi
+            
+            # 测试 2: 代理测试
+            if [[ -n "$http_proxy" ]]; then
+                print_info "测试 2: 通过代理连接 Google..."
+                if curl -I -s --connect-timeout 5 -x "$http_proxy" https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
+                    print_success "代理连接成功！"
+                else
+                    print_error "代理连接失败，请检查:"
+                    echo "  1. 代理服务端是否正常运行"
+                    echo "  2. 防火墙是否放行客户端 IP"
+                    echo "  3. 代理地址和端口是否正确"
+                    echo ""
+                    echo "调试命令:"
+                    echo "  curl -v -x \"$http_proxy\" https://www.google.com"
+                fi
+            else
+                print_warn "未配置代理，跳过代理测试"
             fi
             
             pause
             ;;
+
         0|q) return ;;
         *) print_error "无效选项"; pause ;;
     esac
@@ -1444,6 +1407,7 @@ net_setup_squid() {
     print_title "搭建 Squid 代理服务端"
     install_package "squid"
     
+    # 端口配置
     local port="3128"
     read -e -r -p "请输入监听端口 [$port]: " p
     [[ -n "$p" ]] && port="$p"
@@ -1453,29 +1417,34 @@ net_setup_squid() {
         port=3128
     fi
     
+    # 客户端 IP 配置
     local client_ip=""
     while [[ -z "$client_ip" ]]; do
-        read -e -r -p "请输入允许连接的客户端 IPv6 地址 (支持 CIDR): " client_ip
+        read -e -r -p "请输入允许连接的客户端 IP 地址 (支持 CIDR): " client_ip
         if [[ -z "$client_ip" ]]; then
             print_warn "必须输入 IP 地址！"
         fi
     done
     
+    # 自动补全 CIDR
     if [[ "$client_ip" != */* ]]; then
         if [[ "$client_ip" == *:* ]]; then
             client_ip="${client_ip}/128"
+            print_info "已自动补全为: $client_ip"
         else
             client_ip="${client_ip}/32"
+            print_info "已自动补全为: $client_ip"
         fi
     fi
     
+    # 配置 Squid
     print_info "正在配置 Squid..."
     
     local squid_conf_content="# Squid Proxy Configuration
 # Generated by $SCRIPT_NAME $VERSION
 
-# Port (Listen on IPv6 explicitly)
-http_port [::]:$port
+# Port (Listen on all interfaces)
+http_port $port
 
 # Optimization
 shutdown_lifetime 1 seconds
@@ -1494,40 +1463,105 @@ http_access deny all"
     
     write_file_atomic "$SQUID_CONF" "$squid_conf_content"
     
+    # 配置防火墙
     if command_exists ufw && ufw status | grep -q "Status: active"; then
-        if ufw allow from "$client_ip" to any port "$port" proto tcp comment "Squid-Proxy" >/dev/null 2>&1; then
+        # 提取纯 IP（去除 CIDR）
+        local client_ip_only="${client_ip%/*}"
+        if ufw allow from "$client_ip_only" to any port "$port" proto tcp comment "Squid-Proxy" >/dev/null 2>&1; then
             print_success "UFW 规则已更新。"
         else
-            print_warn "UFW 规则添加失败。"
+            print_warn "UFW 规则添加失败，请手动配置。"
         fi
     fi
     
+    # 重启服务
     if is_systemd; then
         systemctl enable squid >/dev/null 2>&1 || true
         systemctl restart squid 2>/dev/null || systemctl restart squid3 2>/dev/null || true
+        sleep 2
     elif command_exists service; then
         service squid restart || service squid3 restart || true
+        sleep 2
     fi
     
+    # 服务端自测
     print_info "正在进行服务端自测 (Self-Test)..."
-    sleep 2
-    if curl -I -s -x "http://[::1]:$port" --connect-timeout 3 https://github.com | grep -q "HTTP/" || \
-       curl -I -s -x "http://127.0.0.1:$port" --connect-timeout 3 https://github.com | grep -q "HTTP/"; then
-        print_success "自测通过！"
-    else
-        print_warn "自测失败！请检查防火墙或日志。"
-        pause; return
+    local self_test_passed=0
+    
+    if curl -I -s -x "http://127.0.0.1:$port" --connect-timeout 5 https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
+        self_test_passed=1
+    elif curl -I -s -x "http://[::1]:$port" --connect-timeout 5 https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
+        self_test_passed=1
     fi
     
-    local my_ipv6=$(curl -6 -s --connect-timeout 3 ifconfig.co || echo "本机IPv6")
+    if [[ $self_test_passed -eq 1 ]]; then
+        print_success "自测通过！Squid 服务正常运行。"
+    else
+        print_warn "自测失败！请检查:"
+        echo "  1. Squid 服务是否正常启动: systemctl status squid"
+        echo "  2. 防火墙是否正确配置"
+        echo "  3. 查看日志: tail -f /var/log/squid/access.log"
+        pause
+        return
+    fi
+    
+    # 获取服务端公网 IP
+    print_info "正在获取服务端公网 IP..."
+    local server_ipv4=$(safe_curl -4 https://api.ipify.org 2>/dev/null || echo "")
+    local server_ipv6=$(get_public_ipv6)
+    
+    # 输出配置信息
     echo ""
-    draw_line
-    echo -e "客户端配置地址: ${C_GREEN}http://[$my_ipv6]:$port${C_RESET}"
-    draw_line
+    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════╗${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}Squid 代理服务端配置完成！${C_RESET}                                  ${C_CYAN}║${C_RESET}"
+    echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}服务端信息:${C_RESET}                                                  ${C_CYAN}║${C_RESET}"
+    
+    if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
+        printf "${C_CYAN}║${C_RESET}    IPv4: %-52s ${C_CYAN}║${C_RESET}\n" "$server_ipv4"
+    fi
+    
+    if [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
+        printf "${C_CYAN}║${C_RESET}    IPv6: %-52s ${C_CYAN}║${C_RESET}\n" "$server_ipv6"
+    fi
+    
+    printf "${C_CYAN}║${C_RESET}    端口: %-52s ${C_CYAN}║${C_RESET}\n" "$port"
+    printf "${C_CYAN}║${C_RESET}    允许客户端: %-45s ${C_CYAN}║${C_RESET}\n" "$client_ip"
+    
+    echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}客户端配置命令 (复制到客户端执行):${C_RESET}                        ${C_CYAN}║${C_RESET}"
+    echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
+    
+    # 生成客户端配置命令
+    local proxy_url=""
+    if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
+        proxy_url="http://${server_ipv4}:${port}"
+    elif [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
+        proxy_url="http://[${server_ipv6}]:${port}"
+    else
+        proxy_url="http://YOUR_SERVER_IP:${port}"
+    fi
+    
+    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 方法 1: 临时设置 (当前会话有效)${C_RESET}                          ${C_CYAN}║${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
+    printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
+    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 方法 2: 永久设置 (写入配置文件)${C_RESET}                          ${C_CYAN}║${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}cat >> ~/.bashrc << 'EOF'${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export https_proxy=\"$proxy_url\"${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export no_proxy=\"localhost,127.0.0.1,::1\"${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}EOF${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}source ~/.bashrc${C_RESET}"
+    printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
+    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 测试代理连接${C_RESET}                                              ${C_CYAN}║${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}curl -I -x \"$proxy_url\" https://www.google.com${C_RESET}"
+    
+    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════╝${C_RESET}"
     
     log_action "Squid proxy configured on port $port for $client_ip"
     pause
 }
+
 
 net_dns() {
     print_title "DNS 配置"
