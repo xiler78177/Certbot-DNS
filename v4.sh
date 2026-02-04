@@ -1,24 +1,24 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v13.57 - The Production-Ready Edition)
+# 服务器初始化与管理脚本 (v13.58 - Backup-Free Edition)
 #
-# 核心优化 v13.57:
-# 1. [架构] 函数模块化: 按功能域拆分为独立模块
-# 2. [安全] 输入验证增强: 所有用户输入进行严格校验
-# 3. [性能] 智能缓存: 减少重复的系统调用和网络请求
-# 4. [可靠] 原子操作: 关键配置修改支持自动回滚
-# 5. [体验] 进度反馈: 长时间操作显示实时进度
-# 6. [日志] 结构化记录: JSON 格式便于后续分析
+# 核心优化 v13.58:
+# 1. [精简] 移除备份/恢复功能模块
+# 2. [架构] 函数模块化: 按功能域拆分为独立模块
+# 3. [安全] 输入验证增强: 所有用户输入进行严格校验
+# 4. [性能] 智能缓存: 减少重复的系统调用和网络请求
+# 5. [可靠] 原子操作: 关键配置修改支持自动回滚
+# 6. [体验] 进度反馈: 长时间操作显示实时进度
+# 7. [日志] 结构化记录: JSON 格式便于后续分析
 # ==============================================================================
 
 # --- 全局常量配置 ---
-readonly VERSION="v13.57"
+readonly VERSION="v13.58"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
-readonly BACKUP_DIR="/var/backups/${SCRIPT_NAME}"
 
 # 错误码
 readonly E_SUCCESS=0
@@ -69,12 +69,75 @@ APT_UPDATED=0
 
 set -o errtrace
 
-# 终端修复
-[[ -t 0 ]] && stty erase '^?' 2>/dev/null || true
+
+# 终端修复 - 增强版
+fix_terminal() {
+    # 检查是否为交互式终端
+    [[ -t 0 ]] || return 0
+    
+    # 修复删除键
+    stty erase '^?' 2>/dev/null || true
+    stty erase '^H' 2>/dev/null || true
+    
+    # 修复其他控制字符
+    stty intr '^C' 2>/dev/null || true
+    stty susp '^Z' 2>/dev/null || true
+    
+    # 启用行编辑
+    stty icanon 2>/dev/null || true
+    stty echo 2>/dev/null || true
+    
+    # 设置终端类型
+    export TERM="${TERM:-xterm-256color}"
+    
+    # 绑定删除键（如果支持 bind 命令）
+    if command -v bind >/dev/null 2>&1 && [[ $- == *i* ]]; then
+        bind '"\e[3~": delete-char' 2>/dev/null || true
+        bind '"\C-?": backward-delete-char' 2>/dev/null || true
+        bind '"\C-h": backward-delete-char' 2>/dev/null || true
+    fi
+}
+
+# 在脚本开始时调用
+fix_terminal
 
 # 获取终端宽度
 get_term_width() {
     tput cols 2>/dev/null || echo 80
+}
+
+# 输入辅助函数
+safe_read() {
+    local prompt="$1"
+    local var_name="$2"
+    local options="$3"  # 可选参数：-s (密码), -n (单字符)
+    
+    # 确保终端状态正常
+    stty sane 2>/dev/null || true
+    
+    local input=""
+    if [[ "$options" == "-s" ]]; then
+        # 密码输入
+        read -e -r -s -p "$prompt" input
+        echo ""
+    elif [[ "$options" == "-n" ]]; then
+        # 单字符输入
+        read -n 1 -s -r -p "$prompt" input
+        echo ""
+    else
+        # 普通输入
+        read -e -r -p "$prompt" input
+    fi
+    
+    # 清理输入（移除控制字符）
+    input=$(echo "$input" | tr -d '\000-\037' | tr -d '\177')
+    
+    # 返回结果
+    if [[ -n "$var_name" ]]; then
+        eval "$var_name=\"\$input\""
+    else
+        echo "$input"
+    fi
 }
 
 # 画分隔线
@@ -199,9 +262,99 @@ trap 'handle_interrupt' SIGINT SIGTERM
 
 # 环境检查
 check_root() {
+
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "不支持的操作系统。"
+        exit $E_GENERAL
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
+        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
+        if ! confirm "是否继续？"; then
+            exit 0
+        fi
+    fi
+}
     if [[ "$(id -u)" -ne 0 ]]; then
+
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "不支持的操作系统。"
+        exit $E_GENERAL
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
+        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
+        if ! confirm "是否继续？"; then
+            exit 0
+        fi
+    fi
+}
         print_error "请使用 root 权限运行 (sudo)。"
+
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "不支持的操作系统。"
+        exit $E_GENERAL
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
+        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
+        if ! confirm "是否继续？"; then
+            exit 0
+        fi
+    fi
+}
         exit $E_PERMISSION
+
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "不支持的操作系统。"
+        exit $E_GENERAL
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
+        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
+        if ! confirm "是否继续？"; then
+            exit 0
+        fi
+    fi
+}
+    fi
+
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "不支持的操作系统。"
+        exit $E_GENERAL
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
+        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
+        if ! confirm "是否继续？"; then
+            exit 0
+        fi
+    fi
+}
+}
+
+check_os() {
+    if [[ ! -f /etc/os-release ]]; then
+        print_error "不支持的操作系统。"
+        exit $E_GENERAL
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
+        print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
+        if ! confirm "是否继续？"; then
+            exit 0
+        fi
     fi
 }
 
@@ -229,7 +382,7 @@ confirm() {
     local prompt="$1"
     local reply
     while true; do
-        read -r -p "$(echo -e "${C_YELLOW}${prompt} [Y/n]:${C_RESET} ")" reply
+        read -e -r -p "$(echo -e "${C_YELLOW}${prompt} [Y/n]:${C_RESET} ")" reply
         case "${reply,,}" in
             y|yes|"") return 0 ;;
             n|no) return 1 ;;
@@ -276,9 +429,9 @@ get_os_info() {
 }
 
 # 脚本初始化
-init_script() {
+init_environment() {
     # 创建必要目录
-    mkdir -p "$CACHE_DIR" "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
+    mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
     
     # 初始化日志
     if [[ ! -f "$LOG_FILE" ]]; then
@@ -295,12 +448,12 @@ init_script() {
     log_action "Script initialized" "INFO"
 }
 
-
 # ==============================================================================
-# 1. 系统更新模块（补充缺失菜单）
+# 1. 系统更新模块
 # ==============================================================================
 
 menu_update() {
+    fix_terminal
     while true; do
         print_title "系统更新与软件包管理"
         echo "1. 更新软件源"
@@ -310,7 +463,7 @@ menu_update() {
         echo "5. 查看系统信息"
         echo "0. 返回"
         echo ""
-        read -r -p "请选择: " c
+        read -e -r -p "请选择: " c
         
         case $c in
             1)
@@ -344,11 +497,11 @@ menu_update() {
 }
 
 menu_firewall() {
-    menu_ufw  # 调用已有的 UFW 菜单
+    menu_ufw
 }
 
 # ==============================================================================
-# 1. 依赖管理模块
+# 2. 依赖管理模块
 # ==============================================================================
 
 update_apt_cache() {
@@ -405,7 +558,7 @@ reinstall_deps() {
 }
 
 # ==============================================================================
-# 2. 系统信息模块
+# 3. 系统信息模块
 # ==============================================================================
 
 sys_info() {
@@ -511,7 +664,7 @@ sys_info() {
 }
 
 # ==============================================================================
-# 3. UFW 防火墙模块
+# 4. UFW 防火墙模块
 # ==============================================================================
 
 check_port_usage() {
@@ -573,7 +726,7 @@ ufw_setup() {
 ufw_del() {
     command_exists ufw || { print_error "UFW 未安装。"; pause; return; }
     ufw status numbered
-    read -r -p "输入要删除的规则编号 (空格隔开): " nums
+    read -e -r -p "输入要删除的规则编号 (空格隔开): " nums
     [[ -z "$nums" ]] && return
     
     for num in $(echo "$nums" | tr ' ' '\n' | sort -nr); do
@@ -599,11 +752,32 @@ ufw_safe_reset() {
     pause
 }
 
+ufw_add() {
+    if ! command_exists ufw; then
+        print_error "UFW 未安装。"
+        pause; return
+    fi
+    
+    read -e -r -p "请输入要放行的端口 (空格隔开): " ports
+    [[ -z "$ports" ]] && return
+    
+    for port in $ports; do
+        if validate_port "$port"; then
+            ufw allow "$port/tcp" comment "Manual-Add-$port" >/dev/null
+            print_success "端口 $port/tcp 已放行。"
+            log_action "UFW allowed port $port"
+        else
+            print_error "端口 $port 无效。"
+        fi
+    done
+    pause
+}
+
 menu_ufw() {
+    fix_terminal
     while true; do
         print_title "UFW 防火墙管理"
         
-        # 显示 UFW 状态
         if command_exists ufw; then
             local ufw_status=$(ufw status 2>/dev/null | head -n 1 || echo "未运行")
             echo -e "${C_CYAN}当前状态:${C_RESET} $ufw_status"
@@ -622,7 +796,7 @@ menu_ufw() {
         echo "7. 重置默认规则 (安全模式)"
         echo "0. 返回主菜单"
         echo ""
-        read -r -p "请选择: " c
+        read -e -r -p "请选择: " c
         
         case $c in
             1) ufw_setup ;;
@@ -671,30 +845,8 @@ menu_ufw() {
     done
 }
 
-ufw_add() {
-    if ! command_exists ufw; then
-        print_error "UFW 未安装。"
-        pause; return
-    fi
-    
-    read -r -p "请输入要放行的端口 (空格隔开): " ports
-    [[ -z "$ports" ]] && return
-    
-    for port in $ports; do
-        if validate_port "$port"; then
-            ufw allow "$port/tcp" comment "Manual-Add-$port" >/dev/null
-            print_success "端口 $port/tcp 已放行。"
-            log_action "UFW allowed port $port"
-        else
-            print_error "端口 $port 无效。"
-        fi
-    done
-    pause
-}
-
-
 # ==============================================================================
-# 4. Fail2ban 模块
+# 5. Fail2ban 模块
 # ==============================================================================
 
 f2b_setup() {
@@ -709,7 +861,7 @@ f2b_setup() {
         backend="systemd"
     fi
 
-    read -r -p "监控 SSH 端口 [$CURRENT_SSH_PORT]: " port
+    read -e -r -p "监控 SSH 端口 [$CURRENT_SSH_PORT]: " port
     port=${port:-$CURRENT_SSH_PORT}
     
     local conf_content="[DEFAULT]
@@ -735,13 +887,14 @@ backend = $backend"
 }
 
 menu_f2b() {
+    fix_terminal
     while true; do
         print_title "Fail2ban 入侵防御"
         echo "1. 安装/重置配置"
         echo "2. 查看状态/日志"
         echo "0. 返回主菜单"
         echo ""
-        read -r -p "请选择: " c
+        read -e -r -p "请选择: " c
         case $c in
             1) f2b_setup ;;
             2) 
@@ -758,12 +911,12 @@ menu_f2b() {
 }
 
 # ==============================================================================
-# 5. SSH 安全模块
+# 6. SSH 安全模块
 # ==============================================================================
 
 ssh_change_port() {
     print_title "修改 SSH 端口"
-    read -r -p "请输入新端口 [$CURRENT_SSH_PORT]: " port
+    read -e -r -p "请输入新端口 [$CURRENT_SSH_PORT]: " port
     [[ -z "$port" ]] && return
     
     if ! validate_port "$port"; then
@@ -771,23 +924,19 @@ ssh_change_port() {
         pause; return
     fi
 
-    # 备份配置
     cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
     
-    # UFW 放行
     if command_exists ufw && ufw status | grep -q "Status: active"; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
         print_success "UFW 已放行新端口 $port。"
     fi
 
-    # 修改配置
     if grep -qE "^\s*#?\s*Port\s" "$SSHD_CONFIG"; then
         sed -i -E "s|^\s*#?\s*Port\s+.*|Port ${port}|" "$SSHD_CONFIG"
     else
         echo "Port ${port}" >> "$SSHD_CONFIG"
     fi
 
-    # 重启服务
     if is_systemd; then
         if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
             print_success "SSH 重启成功。请使用新端口 $port 连接。"
@@ -806,16 +955,16 @@ ssh_keys() {
     print_title "SSH 密钥管理"
     echo "1. 导入公钥"
     echo "2. 禁用密码登录"
-    read -r -p "选择: " c
+    read -e -r -p "选择: " c
     
     if [[ "$c" == "1" ]]; then
-        read -r -p "用户名: " user
+        read -e -r -p "用户名: " user
         if ! id "$user" >/dev/null 2>&1; then 
             print_error "用户不存在"
             pause; return
         fi
         
-        read -r -p "粘贴公钥: " key
+        read -e -r -p "粘贴公钥: " key
         [[ -z "$key" ]] && return
         
         local dir="/home/$user/.ssh"
@@ -843,6 +992,7 @@ ssh_keys() {
 }
 
 menu_ssh() {
+    fix_terminal
     while true; do
         print_title "SSH 安全管理 (当前端口: $CURRENT_SSH_PORT)"
         echo "1. 修改 SSH 端口"
@@ -852,11 +1002,11 @@ menu_ssh() {
         echo "5. 修改用户密码"
         echo "0. 返回主菜单"
         echo ""
-        read -r -p "请选择: " c
+        read -e -r -p "请选择: " c
         case $c in
             1) ssh_change_port ;;
             2) 
-                read -r -p "新用户名: " u
+                read -e -r -p "新用户名: " u
                 if [[ -n "$u" ]]; then
                     adduser "$u" && usermod -aG sudo "$u" && \
                     print_success "用户创建成功。" && \
@@ -873,7 +1023,7 @@ menu_ssh() {
                 pause ;;
             4) ssh_keys ;;
             5) 
-                read -r -p "用户名 [root]: " u
+                read -e -r -p "用户名 [root]: " u
                 u=${u:-root}
                 passwd "$u"
                 pause ;;
@@ -885,7 +1035,7 @@ menu_ssh() {
 }
 
 # ==============================================================================
-# 6. 系统优化模块
+# 7. 系统优化模块
 # ==============================================================================
 
 opt_cleanup() {
@@ -895,7 +1045,6 @@ opt_cleanup() {
     apt-get autoclean -y >/dev/null 2>&1
     apt-get clean >/dev/null 2>&1
     
-    # 清理日志
     journalctl --vacuum-time=7d >/dev/null 2>&1 || true
     
     print_success "清理完成。"
@@ -906,10 +1055,9 @@ opt_cleanup() {
 opt_hostname() {
     print_title "修改主机名"
     echo "当前: $(hostname)"
-    read -r -p "新主机名: " new_name
+    read -e -r -p "新主机名: " new_name
     [[ -z "$new_name" ]] && return
     
-    # 验证主机名格式
     if [[ ! "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
         print_error "主机名格式无效。"
         pause; return
@@ -919,7 +1067,6 @@ opt_hostname() {
     hostname "$new_name"
     echo "$new_name" > /etc/hostname
     
-    # 更新 hosts
     sed -i "s/127.0.0.1.*localhost.*/127.0.0.1 localhost $new_name/g" /etc/hosts
     
     print_success "主机名已修改为: $new_name"
@@ -935,10 +1082,10 @@ opt_swap() {
     echo "1. 开启/修改 Swap"
     echo "2. 关闭/删除 Swap"
     echo "0. 返回"
-    read -r -p "选择: " c
+    read -e -r -p "选择: " c
     
     if [[ "$c" == "1" ]]; then
-        read -r -p "大小 (MB): " s
+        read -e -r -p "大小 (MB): " s
         if [[ ! "$s" =~ ^[0-9]+$ ]] || [ "$s" -lt 128 ]; then
             print_error "大小无效 (最小 128MB)。"
             pause; return
@@ -978,7 +1125,6 @@ opt_swap() {
 opt_bbr() {
     print_title "BBR 加速"
     
-    # 检查当前状态
     local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
     
@@ -993,14 +1139,11 @@ opt_bbr() {
     fi
     
     if confirm "开启 BBR 加速？"; then
-        # 备份配置
         [[ ! -f /etc/sysctl.conf.bak ]] && cp /etc/sysctl.conf /etc/sysctl.conf.bak
         
-        # 移除旧配置
         sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
         
-        # 添加新配置
         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
         echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
         
@@ -1013,6 +1156,7 @@ opt_bbr() {
 }
 
 menu_opt() {
+    fix_terminal
     while true; do
         print_title "系统优化"
         echo "1. 开启 BBR 加速"
@@ -1022,7 +1166,7 @@ menu_opt() {
         echo "5. 修改时区"
         echo "0. 返回"
         echo ""
-        read -r -p "选择: " c
+        read -e -r -p "选择: " c
         case $c in
             1) opt_bbr ;;
             2) opt_swap ;;
@@ -1030,7 +1174,7 @@ menu_opt() {
             4) opt_cleanup ;;
             5)
                 echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
-                read -r -p "选择: " t
+                read -e -r -p "选择: " t
                 case $t in
                     1) z="Asia/Shanghai" ;;
                     2) z="Asia/Hong_Kong" ;;
@@ -1051,14 +1195,14 @@ menu_opt() {
 }
 
 # ==============================================================================
-# 7. 网络工具模块
+# 8. 网络工具模块
 # ==============================================================================
 
 net_iperf3() {
     print_title "iPerf3 测速"
     install_package "iperf3"
     
-    read -r -p "监听端口 [5201]: " port
+    read -e -r -p "监听端口 [5201]: " port
     port=${port:-5201}
     
     if ! validate_port "$port"; then
@@ -1093,21 +1237,17 @@ net_iperf3() {
         fi
     }
     
-    # 信号处理
     local interrupted=0
     handle_local_int() {
         interrupted=1
     }
     trap 'handle_local_int' SIGINT
     
-    # 后台运行
     iperf3 -s -p "$port" &
     local iperf_pid=$!
     
-    # 等待进程
     wait $iperf_pid 2>/dev/null || true
     
-    # 恢复全局 trap
     trap 'handle_interrupt' SIGINT
     
     if [[ $interrupted -eq 1 ]]; then
@@ -1137,13 +1277,13 @@ net_proxy() {
     echo "3. 查看状态与测试"
     echo "0. 返回"
     echo ""
-    read -r -p "请选择: " choice
+    read -e -r -p "请选择: " choice
     
     case $choice in
         1)
             local proxy_url=""
             while [[ -z "$proxy_url" ]]; do
-                read -r -p "输入代理地址 (格式 http://[IP]:Port): " proxy_url
+                read -e -r -p "输入代理地址 (格式 http://[IP]:Port): " proxy_url
                 if [[ ! "$proxy_url" =~ ^http://.+ ]]; then
                     print_warn "地址格式错误，必须以 http:// 开头"
                     proxy_url=""
@@ -1152,12 +1292,10 @@ net_proxy() {
             
             print_info "正在写入配置..."
             
-            # APT 代理
             local apt_conf="Acquire::http::Proxy \"$proxy_url\";
 Acquire::https::Proxy \"$proxy_url\";"
             write_file_atomic "$APT_PROXY_CONF" "$apt_conf"
             
-            # Shell 环境
             local env_conf="export http_proxy=\"$proxy_url\"
 export https_proxy=\"$proxy_url\"
 export ftp_proxy=\"$proxy_url\"
@@ -1168,7 +1306,6 @@ export no_proxy=\"localhost,127.0.0.1,::1\"
 export NO_PROXY=\"localhost,127.0.0.1,::1\""
             write_file_atomic "$ENV_PROXY_CONF" "$env_conf"
             
-            # /etc/environment
             if [[ -f "$ETC_ENVIRONMENT" ]]; then
                 [[ ! -f "${ETC_ENVIRONMENT}.bak.proxy" ]] && cp "$ETC_ENVIRONMENT" "${ETC_ENVIRONMENT}.bak.proxy"
             else
@@ -1193,7 +1330,6 @@ EOF
             write_file_atomic "$ETC_ENVIRONMENT" "$env_content"
             rm -f "$env_tmp"
             
-            # Docker 代理
             if command_exists docker && is_systemd && systemctl status docker >/dev/null 2>&1; then
                 mkdir -p "$DOCKER_PROXY_DIR"
                 local docker_conf="[Service]
@@ -1209,7 +1345,6 @@ Environment=\"no_proxy=localhost,127.0.0.1,::1\""
                 print_success "Docker 代理配置已生效。"
             fi
             
-            # 当前会话
             export http_proxy="$proxy_url"
             export https_proxy="$proxy_url"
             export ftp_proxy="$proxy_url"
@@ -1247,7 +1382,6 @@ Environment=\"no_proxy=localhost,127.0.0.1,::1\""
             log_action "System proxy removed"
             pause
             ;;
-            
         3)
             print_title "系统代理状态"
             echo -e "${C_CYAN}[当前会话]${C_RESET}"
@@ -1279,7 +1413,7 @@ net_setup_squid() {
     install_package "squid"
     
     local port="3128"
-    read -r -p "请输入监听端口 [$port]: " p
+    read -e -r -p "请输入监听端口 [$port]: " p
     [[ -n "$p" ]] && port="$p"
     
     if ! validate_port "$port"; then
@@ -1289,13 +1423,12 @@ net_setup_squid() {
     
     local client_ip=""
     while [[ -z "$client_ip" ]]; do
-        read -r -p "请输入允许连接的客户端 IPv6 地址 (支持 CIDR): " client_ip
+        read -e -r -p "请输入允许连接的客户端 IPv6 地址 (支持 CIDR): " client_ip
         if [[ -z "$client_ip" ]]; then
             print_warn "必须输入 IP 地址！"
         fi
     done
     
-    # 自动补全 CIDR
     if [[ "$client_ip" != */* ]]; then
         if [[ "$client_ip" == *:* ]]; then
             client_ip="${client_ip}/128"
@@ -1329,7 +1462,6 @@ http_access deny all"
     
     write_file_atomic "$SQUID_CONF" "$squid_conf_content"
     
-    # UFW 规则
     if command_exists ufw && ufw status | grep -q "Status: active"; then
         if ufw allow from "$client_ip" to any port "$port" proto tcp comment "Squid-Proxy" >/dev/null 2>&1; then
             print_success "UFW 规则已更新。"
@@ -1338,7 +1470,6 @@ http_access deny all"
         fi
     fi
     
-    # 启动服务
     if is_systemd; then
         systemctl enable squid >/dev/null 2>&1 || true
         systemctl restart squid 2>/dev/null || systemctl restart squid3 2>/dev/null || true
@@ -1346,7 +1477,6 @@ http_access deny all"
         service squid restart || service squid3 restart || true
     fi
     
-    # 自测
     print_info "正在进行服务端自测 (Self-Test)..."
     sleep 2
     if curl -I -s -x "http://[::1]:$port" --connect-timeout 3 https://github.com | grep -q "HTTP/" || \
@@ -1372,10 +1502,9 @@ net_dns() {
     echo "当前 DNS:"
     cat /etc/resolv.conf
     echo -e "\n${C_YELLOW}输入新 DNS IP (空格隔开)，输入 0 取消${C_RESET}"
-    read -r -p "DNS: " dns
+    read -e -r -p "DNS: " dns
     if [[ -z "$dns" || "$dns" == "0" ]]; then return; fi
     
-    # 验证输入
     for ip in $dns; do
         if ! validate_ip "$ip"; then
             print_error "IP 地址 $ip 格式无效！"
@@ -1385,7 +1514,6 @@ net_dns() {
     
     local res_conf="/etc/systemd/resolved.conf"
     if is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        # 修复：正确转义方括号
         if ! grep -q "^[[:space:]]*\[Resolve\]" "$res_conf"; then
             echo "" >> "$res_conf"
             echo "[Resolve]" >> "$res_conf"
@@ -1402,8 +1530,8 @@ net_dns() {
     pause
 }
 
-
 menu_net() {
+    fix_terminal
     while true; do
         print_title "网络管理工具"
         echo -e "${C_CYAN}--- 通用功能 ---${C_RESET}"
@@ -1417,12 +1545,12 @@ menu_net() {
         echo ""
         echo "0. 返回"
         echo ""
-        read -r -p "选择: " c
+        read -e -r -p "选择: " c
         case $c in
             1) net_dns ;;
             2) 
                 echo "1. 优先 IPv4  2. 优先 IPv6"
-                read -r -p "选: " p
+                read -e -r -p "选: " p
                 [[ ! -f /etc/gai.conf ]] && touch /etc/gai.conf
                 if [[ "$p" == "1" ]]; then
                     sed -i 's/^#precedence ::ffff:0:0\/96  100/precedence ::ffff:0:0\/96  100/' /etc/gai.conf
@@ -1444,7 +1572,7 @@ menu_net() {
 }
 
 # ==============================================================================
-# 8. Web 服务模块 (Part 1 - 环境与 DNS)
+# 9. Web 服务模块 (Part 1 - 环境与 DNS)
 # ==============================================================================
 
 web_env_check() {
@@ -1471,7 +1599,7 @@ web_env_check() {
     fi
     
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets
-    mkdir -p "$CONFIG_DIR" "$BACKUP_DIR"
+    mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
 }
 
@@ -1533,7 +1661,7 @@ web_cf_dns_update() {
     echo "2. 仅解析 IPv6 (AAAA)"
     echo "3. 双栈解析 (A + AAAA)"
     echo "0. 跳过"
-    read -r -p "请选择: " mode
+    read -e -r -p "请选择: " mode
     if [[ "$mode" == "0" ]]; then return; fi
     
     while [[ -z "$CF_API_TOKEN" ]]; do
@@ -1542,7 +1670,7 @@ web_cf_dns_update() {
     done
     
     while [[ -z "$DOMAIN" ]]; do
-        read -r -p "请输入域名: " DOMAIN
+        read -e -r -p "请输入域名: " DOMAIN
         if ! validate_domain "$DOMAIN"; then
             print_error "域名格式无效。"
             DOMAIN=""
@@ -1630,7 +1758,7 @@ web_cf_dns_update() {
 }
 
 # ==============================================================================
-# 8. Web 服务模块 (Part 2 - 域名管理)
+# 9. Web 服务模块 (Part 2 - 域名管理)
 # ==============================================================================
 
 web_view_config() {
@@ -1661,7 +1789,7 @@ web_view_config() {
     echo "0. 返回"
     
     echo ""
-    read -r -p "请输入序号: " idx
+    read -e -r -p "请输入序号: " idx
     
     if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
@@ -1672,7 +1800,6 @@ web_view_config() {
     local target_domain="${domains[$((idx-1))]}"
     local target_conf="${files[$((idx-1))]}"
     
-    # 加载配置
     local DOMAIN="" CERT_PATH="" DEPLOY_HOOK_SCRIPT=""
     source "$target_conf"
     
@@ -1783,7 +1910,7 @@ web_delete_domain() {
     echo "0. 返回"
     
     echo ""
-    read -r -p "请输入序号删除: " idx
+    read -e -r -p "请输入序号删除: " idx
     
     if [[ "$idx" == "0" || -z "$idx" ]]; then return; fi
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -gt ${#domains[@]} ]]; then
@@ -1809,14 +1936,12 @@ web_delete_domain() {
     
     print_info "正在执行清理..."
     
-    # 删除证书
     if certbot delete --cert-name "$target_domain" --non-interactive 2>/dev/null; then
         print_success "证书已吊销/删除。"
     else
         print_warn "Certbot 删除失败或证书不存在。"
     fi
     
-    # 删除 Nginx 配置
     local nginx_conf="/etc/nginx/sites-enabled/${target_domain}.conf"
     local nginx_conf_src="/etc/nginx/sites-available/${target_domain}.conf"
     if [[ -f "$nginx_conf" || -f "$nginx_conf_src" ]]; then
@@ -1829,14 +1954,12 @@ web_delete_domain() {
         print_success "Nginx 配置已删除。"
     fi
     
-    # 删除 Hook 脚本
     local hook_script="/root/cert-renew-hook-${target_domain}.sh"
     if [[ -f "$hook_script" ]]; then
         rm -f "$hook_script"
         print_success "Hook 脚本已删除。"
     fi
     
-    # 清理 Crontab
     local cron_tmp=$(mktemp)
     crontab -l > "$cron_tmp" 2>/dev/null || true
     grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean" || true
@@ -1853,7 +1976,6 @@ web_delete_domain() {
     fi
     rm -f "$cron_tmp" "${cron_tmp}.new"
     
-    # 删除配置文件
     rm -f "$target_conf"
     print_success "管理配置已移除。"
     
@@ -1862,7 +1984,7 @@ web_delete_domain() {
 }
 
 # ==============================================================================
-# 8. Web 服务模块 (Part 3 - 添加域名)
+# 9. Web 服务模块 (Part 3 - 添加域名)
 # ==============================================================================
 
 web_add_domain() {
@@ -1879,9 +2001,8 @@ web_add_domain() {
         echo ""
     fi
     
-    # 输入域名
     while [[ -z "$DOMAIN" ]]; do
-        read -r -p "请输入域名 (如 example.com): " DOMAIN
+        read -e -r -p "请输入域名 (如 example.com): " DOMAIN
         if ! validate_domain "$DOMAIN"; then
             print_error "域名格式无效。"
             DOMAIN=""
@@ -1893,14 +2014,12 @@ web_add_domain() {
         pause; return
     fi
     
-    # API Token
     print_guide "脚本使用 DNS API 申请证书，需要您的 Cloudflare API Token。"
     while [[ -z "$CF_API_TOKEN" ]]; do
         read -s -r -p "Cloudflare API Token: " CF_API_TOKEN
         echo ""
     done
     
-    # Nginx 配置
     local do_nginx=0
     echo ""
     if confirm "是否配置 Nginx 反向代理 (用于隐藏后端端口)?"; then
@@ -1908,25 +2027,25 @@ web_add_domain() {
         print_guide "请输入 Nginx 监听的端口 (通常 HTTP=80, HTTPS=443)"
         
         while true; do
-            read -r -p "HTTP 端口 [80]: " hp
+            read -e -r -p "HTTP 端口 [80]: " hp
             NGINX_HTTP_PORT=${hp:-80}
             if validate_port "$NGINX_HTTP_PORT"; then break; fi
             print_warn "端口无效"
         done
         
         while true; do
-            read -r -p "HTTPS 端口 [443]: " sp
+            read -e -r -p "HTTPS 端口 [443]: " sp
             NGINX_HTTPS_PORT=${sp:-443}
             if validate_port "$NGINX_HTTPS_PORT"; then break; fi
             print_warn "端口无效"
         done
         
-        read -r -p "后端协议 [1]http [2]https: " proto
+        read -e -r -p "后端协议 [1]http [2]https: " proto
         BACKEND_PROTOCOL=$([[ "$proto" == "2" ]] && echo "https" || echo "http")
         
         print_guide "请输入后端服务的实际地址 (例如 127.0.0.1:54321)"
         while [[ -z "$LOCAL_PROXY_PASS" ]]; do
-            read -r -p "反代目标: " inp
+            read -e -r -p "反代目标: " inp
             [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
             if [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
                 LOCAL_PROXY_PASS="${BACKEND_PROTOCOL}://${inp}"
@@ -1941,13 +2060,11 @@ web_add_domain() {
         echo ""
     fi
     
-    # 创建证书目录
     mkdir -p "${CERT_PATH_PREFIX}/${DOMAIN}"
     local CLOUDFLARE_CREDENTIALS="/root/.cloudflare-${DOMAIN}.ini"
     write_file_atomic "$CLOUDFLARE_CREDENTIALS" "dns_cloudflare_api_token = $CF_API_TOKEN"
     chmod 600 "$CLOUDFLARE_CREDENTIALS"
     
-    # 申请证书
     print_info "正在申请证书 (这可能需要 1-2 分钟)..."
     if certbot certonly \
         --dns-cloudflare \
@@ -1966,11 +2083,9 @@ web_add_domain() {
         chmod 644 "$cert_dir/fullchain.pem"
         chmod 600 "$cert_dir/privkey.pem"
         
-        # 配置 Nginx
         if [[ $do_nginx -eq 1 ]]; then
             local NGINX_CONF_PATH="/etc/nginx/sites-available/${DOMAIN}.conf"
             
-            # SSL 参数片段
             if [[ ! -f /etc/nginx/snippets/ssl-params.conf ]]; then
                 local ssl_params="ssl_session_timeout 1d;
 ssl_session_cache shared:SSL:10m;
@@ -2018,11 +2133,9 @@ server {
     }
 }"
 
-          
             write_file_atomic "$NGINX_CONF_PATH" "$nginx_conf"
             ln -sf "$NGINX_CONF_PATH" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-          
-            # 测试配置
+            
             if nginx -t 2>&1 | grep -q "successful"; then
                 if is_systemd; then
                     systemctl reload nginx || systemctl restart nginx
@@ -2035,16 +2148,14 @@ server {
                 rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
                 pause; return
             fi
-          
-            # UFW 放行
+            
             if command_exists ufw && ufw status | grep -q "Status: active"; then
                 ufw allow "$NGINX_HTTP_PORT/tcp" comment "Nginx-HTTP" >/dev/null 2>&1 || true
                 ufw allow "$NGINX_HTTPS_PORT/tcp" comment "Nginx-HTTPS" >/dev/null 2>&1 || true
                 print_success "防火墙规则已更新。"
             fi
         fi
-      
-        # 创建续签 Hook
+        
         local DEPLOY_HOOK_SCRIPT="/root/cert-renew-hook-${DOMAIN}.sh"
         local hook_content="#!/bin/bash
 # Auto-generated renewal hook for $DOMAIN
@@ -2084,7 +2195,7 @@ fi
 echo \"[\$(date)] Nginx reloaded\" >> /var/log/cert-renew.log
 "
         fi
-      
+        
         hook_content+="
 # Optional: Restart 3x-ui (uncomment if needed)
 # if command -v x-ui >/dev/null 2>&1; then
@@ -2094,16 +2205,15 @@ echo \"[\$(date)] Nginx reloaded\" >> /var/log/cert-renew.log
 echo \"[\$(date)] Renewal hook completed for \$DOMAIN\" >> /var/log/cert-renew.log
 exit 0
 "
-      
+        
         write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content"
         chmod +x "$DEPLOY_HOOK_SCRIPT"
-      
-        # 添加 Crontab
+        
         local cron_tmp=$(mktemp)
         crontab -l > "$cron_tmp" 2>/dev/null || true
         grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean" || true
         mv "${cron_tmp}.clean" "$cron_tmp"
-      
+        
         if ! grep -F -q "$DEPLOY_HOOK_SCRIPT" "$cron_tmp"; then
             echo "0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\" --quiet" >> "$cron_tmp"
             if crontab "$cron_tmp" 2>/dev/null; then
@@ -2113,8 +2223,7 @@ exit 0
             fi
         fi
         rm -f "$cron_tmp"
-      
-        # 保存配置
+        
         local config_content="# Domain configuration for $DOMAIN
 # Generated by $SCRIPT_NAME $VERSION at $(date)
 
@@ -2123,7 +2232,7 @@ CERT_PATH=\"${cert_dir}\"
 DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\"
 CLOUDFLARE_CREDENTIALS=\"$CLOUDFLARE_CREDENTIALS\"
 "
-      
+        
         if [[ $do_nginx -eq 1 ]]; then
             config_content+="NGINX_CONF_PATH=\"$NGINX_CONF_PATH\"
 NGINX_HTTP_PORT=\"$NGINX_HTTP_PORT\"
@@ -2131,10 +2240,9 @@ NGINX_HTTPS_PORT=\"$NGINX_HTTPS_PORT\"
 LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
 "
         fi
-      
+        
         write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
-      
-        # 显示结果
+        
         echo ""
         draw_line
         print_success "域名配置完成！"
@@ -2142,7 +2250,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         echo -e "${C_CYAN}[证书路径]${C_RESET}"
         echo "  公钥: ${cert_dir}/fullchain.pem"
         echo "  私钥: ${cert_dir}/privkey.pem"
-      
+        
         if [[ $do_nginx -eq 1 ]]; then
             echo -e "\n${C_CYAN}[访问地址]${C_RESET}"
             echo "  https://${DOMAIN}:${NGINX_HTTPS_PORT}"
@@ -2152,14 +2260,14 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
             echo -e "\n${C_YELLOW}[手动配置提示]${C_RESET}"
             echo "  请在 3x-ui 面板设置中填写上述证书路径"
         fi
-      
+        
         echo -e "\n${C_CYAN}[自动续签]${C_RESET}"
         echo "  Hook 脚本: $DEPLOY_HOOK_SCRIPT"
         echo "  Crontab: 每日 3:00 AM 自动检查"
         draw_line
-      
+        
         log_action "Domain configured: $DOMAIN (Nginx: $do_nginx)"
-      
+        
     else
         print_error "证书申请失败！请检查:"
         echo "1. 域名 DNS 是否正确解析到本机"
@@ -2167,15 +2275,16 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         echo "3. 网络连接是否正常"
         rm -f "$CLOUDFLARE_CREDENTIALS"
     fi
-  
+    
     pause
 }
 
 # ==============================================================================
-# 8. Web 服务模块 (Part 4 - 菜单)
+# 9. Web 服务模块 (Part 4 - 菜单)
 # ==============================================================================
 
 menu_web() {
+    fix_terminal
     while true; do
         print_title "Web 服务管理 (SSL + Nginx)"
         echo -e "${C_CYAN}--- 域名管理 ---${C_RESET}"
@@ -2190,8 +2299,8 @@ menu_web() {
         echo ""
         echo "0. 返回主菜单"
         echo ""
-        read -r -p "请选择: " c
-      
+        read -e -r -p "请选择: " c
+        
         case $c in
             1) web_add_domain ;;
             2) web_view_config ;;
@@ -2211,7 +2320,6 @@ menu_web() {
                 if certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log; then
                     print_success "续签完成。"
                     
-                    # 执行所有 Hook
                     shopt -s nullglob
                     local hooks=(/root/cert-renew-hook-*.sh)
                     shopt -u nullglob
@@ -2247,11 +2355,11 @@ menu_web() {
 }
 
 # ==============================================================================
-# 9. Docker 管理模块
+# 10. Docker 模块
 # ==============================================================================
 
 docker_install() {
-    print_title "安装 Docker"
+    print_title "Docker 安装"
     
     if command_exists docker; then
         print_warn "Docker 已安装。"
@@ -2261,54 +2369,111 @@ docker_install() {
     
     print_info "正在安装 Docker..."
     
-    # 官方脚本安装
-    if safe_curl https://get.docker.com -o /tmp/get-docker.sh; then
-        if bash /tmp/get-docker.sh; then
-            rm -f /tmp/get-docker.sh
-            
-            # 启动服务
-            if is_systemd; then
-                systemctl enable --now docker >/dev/null 2>&1 || true
-            fi
-            
-            # 添加当前用户到 docker 组
-            if [[ -n "$SUDO_USER" ]]; then
-                usermod -aG docker "$SUDO_USER" 2>/dev/null || true
-                print_info "用户 $SUDO_USER 已添加到 docker 组，需重新登录生效。"
-            fi
-            
-            print_success "Docker 安装成功！"
-            docker --version
-            log_action "Docker installed"
-        else
-            print_error "Docker 安装失败。"
+    update_apt_cache
+    install_package "ca-certificates" "silent"
+    install_package "curl" "silent"
+    install_package "gnupg" "silent"
+    
+    local keyring_dir="/etc/apt/keyrings"
+    mkdir -p "$keyring_dir"
+    
+    local docker_gpg="$keyring_dir/docker.gpg"
+    if [[ ! -f "$docker_gpg" ]]; then
+        print_info "添加 Docker GPG 密钥..."
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o "$docker_gpg" 2>/dev/null || \
+        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o "$docker_gpg" 2>/dev/null || {
+            print_error "GPG 密钥下载失败。"
+            pause; return
+        }
+        chmod a+r "$docker_gpg"
+    fi
+    
+    local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+    local version_codename=$(grep 'VERSION_CODENAME' /etc/os-release | cut -d= -f2)
+    
+    local docker_list="/etc/apt/sources.list.d/docker.list"
+    if [[ ! -f "$docker_list" ]]; then
+        print_info "添加 Docker 软件源..."
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=$docker_gpg] https://download.docker.com/linux/$os_id $version_codename stable" > "$docker_list"
+    fi
+    
+    apt-get update -qq 2>/dev/null || true
+    
+    if apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1; then
+        print_success "Docker 安装成功。"
+        
+        if is_systemd; then
+            systemctl enable docker >/dev/null 2>&1 || true
+            systemctl start docker || true
         fi
+        
+        docker --version
+        log_action "Docker installed"
     else
-        print_error "无法下载安装脚本。"
+        print_error "Docker 安装失败。"
     fi
     
     pause
 }
 
-docker_compose_install() {
-    print_title "安装 Docker Compose"
+docker_uninstall() {
+    print_title "Docker 卸载"
     
-    if command_exists docker-compose || docker compose version >/dev/null 2>&1; then
-        print_warn "Docker Compose 已安装。"
-        docker compose version 2>/dev/null || docker-compose --version
+    if ! command_exists docker; then
+        print_warn "Docker 未安装。"
+        pause; return
+    fi
+    
+    echo -e "${C_RED}警告: 这将删除 Docker 及所有容器、镜像、卷！${C_RESET}"
+    if ! confirm "确认卸载？"; then return; fi
+    
+    print_info "正在停止服务..."
+    if is_systemd; then
+        systemctl stop docker docker.socket containerd 2>/dev/null || true
+        systemctl disable docker docker.socket containerd 2>/dev/null || true
+    fi
+    
+    print_info "正在卸载软件包..."
+    apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    
+    if confirm "是否删除所有 Docker 数据 (/var/lib/docker)?"; then
+        rm -rf /var/lib/docker /var/lib/containerd
+        print_success "数据已删除。"
+    fi
+    
+    rm -f /etc/apt/sources.list.d/docker.list
+    rm -f /etc/apt/keyrings/docker.gpg
+    
+    print_success "Docker 已卸载。"
+    log_action "Docker uninstalled"
+    pause
+}
+
+docker_compose_install() {
+    print_title "Docker Compose 独立安装"
+    
+    if command_exists docker && docker compose version >/dev/null 2>&1; then
+        print_warn "Docker Compose (Plugin) 已安装。"
+        docker compose version
+        pause; return
+    fi
+    
+    if command_exists docker-compose; then
+        print_warn "Docker Compose (Standalone) 已安装。"
+        docker-compose --version
         pause; return
     fi
     
     print_info "正在安装 Docker Compose..."
     
-    # 获取最新版本
-    local latest_version=$(safe_curl https://api.github.com/repos/docker/compose/releases/latest | grep -Po '"tag_name": "\K.*?(?=")' || echo "v2.24.0")
-    local compose_url="https://github.com/docker/compose/releases/download/${latest_version}/docker-compose-$(uname -s)-$(uname -m)"
+    local compose_version="v2.24.5"
+    local arch=$(uname -m)
+    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${arch}"
     
-    if safe_curl -L "$compose_url" -o /usr/local/bin/docker-compose; then
+    if curl -L "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
         chmod +x /usr/local/bin/docker-compose
-        ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose 2>/dev/null || true
-        print_success "Docker Compose 安装成功！"
+        print_success "Docker Compose 安装成功。"
         docker-compose --version
         log_action "Docker Compose installed"
     else
@@ -2318,77 +2483,201 @@ docker_compose_install() {
     pause
 }
 
-docker_uninstall() {
-    print_title "卸载 Docker"
+docker_proxy_config() {
+    print_title "Docker 代理配置"
     
     if ! command_exists docker; then
-        print_warn "Docker 未安装。"
+        print_error "Docker 未安装。"
         pause; return
     fi
     
-    echo -e "${C_RED}警告: 这将删除所有容器、镜像、卷和网络！${C_RESET}"
-    if ! confirm "确认卸载 Docker？"; then return; fi
+    echo "1. 配置 Docker 守护进程代理 (拉取镜像用)"
+    echo "2. 清除代理配置"
+    echo "0. 返回"
+    read -e -r -p "选择: " c
     
-    print_info "正在停止服务..."
-    if is_systemd; then
-        systemctl stop docker docker.socket containerd 2>/dev/null || true
-        systemctl disable docker docker.socket containerd 2>/dev/null || true
+    case $c in
+        1)
+            read -e -r -p "代理地址 (如 http://proxy.example.com:3128): " proxy
+            if [[ -z "$proxy" ]]; then return; fi
+            
+            mkdir -p "$DOCKER_PROXY_DIR"
+            local proxy_conf="[Service]
+Environment=\"HTTP_PROXY=$proxy\"
+Environment=\"HTTPS_PROXY=$proxy\"
+Environment=\"NO_PROXY=localhost,127.0.0.1,::1\"
+Environment=\"http_proxy=$proxy\"
+Environment=\"https_proxy=$proxy\"
+Environment=\"no_proxy=localhost,127.0.0.1,::1\""
+            
+            write_file_atomic "$DOCKER_PROXY_CONF" "$proxy_conf"
+            
+            if is_systemd; then
+                systemctl daemon-reload || true
+                systemctl restart docker || true
+            fi
+            
+            print_success "Docker 代理已配置。"
+            log_action "Docker proxy configured: $proxy"
+            ;;
+        2)
+            rm -f "$DOCKER_PROXY_CONF"
+            if is_systemd; then
+                systemctl daemon-reload || true
+                systemctl restart docker || true
+            fi
+            print_success "代理配置已清除。"
+            log_action "Docker proxy removed"
+            ;;
+        0|q) return ;;
+    esac
+    pause
+}
+
+docker_images_manage() {
+    print_title "Docker 镜像管理"
+    
+    if ! command_exists docker; then
+        print_error "Docker 未安装。"
+        pause; return
     fi
     
-    print_info "正在卸载软件包..."
-    apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-compose 2>/dev/null || true
-    apt-get autoremove -y 2>/dev/null || true
+    echo "1. 列出所有镜像"
+    echo "2. 删除未使用的镜像"
+    echo "3. 删除所有镜像 (危险)"
+    echo "0. 返回"
+    read -e -r -p "选择: " c
     
-    print_info "正在清理数据..."
-    rm -rf /var/lib/docker /var/lib/containerd /etc/docker
-    rm -f /usr/local/bin/docker-compose /usr/bin/docker-compose
+    case $c in
+        1)
+            docker images
+            ;;
+        2)
+            if confirm "删除未使用的镜像？"; then
+                docker image prune -a -f
+                print_success "清理完成。"
+                log_action "Docker unused images pruned"
+            fi
+            ;;
+        3)
+            if confirm "删除所有镜像？这将影响所有容器！"; then
+                local all_images=$(docker images -q)
+                if [[ -n "$all_images" ]]; then
+                    docker rmi -f $all_images
+                    print_success "所有镜像已删除。"
+                    log_action "Docker all images removed"
+                else
+                    print_warn "没有镜像可删除。"
+                fi
+                print_success "所有镜像已删除。"
+                log_action "Docker all images removed"
+            fi
+            ;;
+        0|q) return ;;
+    esac
+    pause
+}
+
+docker_containers_manage() {
+    print_title "Docker 容器管理"
     
-    print_success "Docker 已卸载。"
-    log_action "Docker uninstalled"
+    if ! command_exists docker; then
+        print_error "Docker 未安装。"
+        pause; return
+    fi
+    
+    echo "1. 列出运行中的容器"
+    echo "2. 列出所有容器"
+    echo "3. 停止所有容器"
+    echo "4. 删除所有容器 (危险)"
+    echo "5. 查看容器日志"
+    echo "0. 返回"
+    read -e -r -p "选择: " c
+    
+    case $c in
+        1)
+            docker ps
+            ;;
+        2)
+            docker ps -a
+            ;;
+        3)
+            if confirm "停止所有容器？"; then
+                local running=$(docker ps -q)
+                if [[ -n "$running" ]]; then
+                    docker stop $running
+                    print_success "所有容器已停止。"
+                    log_action "Docker all containers stopped"
+                else
+                    print_warn "没有运行中的容器。"
+                fi
+                print_success "所有容器已停止。"
+                log_action "Docker all containers stopped"
+            fi
+            ;;
+        4)
+            if confirm "删除所有容器？"; then
+                local all_containers=$(docker ps -aq)
+                if [[ -n "$all_containers" ]]; then
+                    docker rm -f $all_containers
+                    print_success "所有容器已删除。"
+                    log_action "Docker all containers removed"
+                else
+                    print_warn "没有容器可删除。"
+                fi
+                print_success "所有容器已删除。"
+                log_action "Docker all containers removed"
+            fi
+            ;;
+        5)
+            read -e -r -p "容器名称或 ID: " cid
+            if [[ -n "$cid" ]]; then
+                docker logs --tail 100 -f "$cid"
+            fi
+            ;;
+        0|q) return ;;
+    esac
     pause
 }
 
 menu_docker() {
+    fix_terminal
     while true; do
         print_title "Docker 管理"
         
         if command_exists docker; then
-            echo -e "${C_GREEN}Docker 状态: 已安装${C_RESET}"
-            docker --version 2>/dev/null || true
+            echo -e "${C_GREEN}Docker 已安装${C_RESET}"
+            docker --version
+            echo ""
         else
-            echo -e "${C_YELLOW}Docker 状态: 未安装${C_RESET}"
+            echo -e "${C_YELLOW}Docker 未安装${C_RESET}"
+            echo ""
         fi
         
-        echo ""
         echo "1. 安装 Docker"
-        echo "2. 安装 Docker Compose"
-        echo "3. 卸载 Docker"
-        echo "4. 查看运行容器"
-        echo "5. 清理未使用资源"
-        echo "0. 返回"
+        echo "2. 卸载 Docker"
+        echo "3. 安装 Docker Compose"
+        echo "4. 配置 Docker 代理"
+        echo "5. 镜像管理"
+        echo "6. 容器管理"
+        echo "7. 系统清理 (prune)"
+        echo "0. 返回主菜单"
         echo ""
-        read -r -p "请选择: " c
+        read -e -r -p "请选择: " c
         
         case $c in
             1) docker_install ;;
-            2) docker_compose_install ;;
-            3) docker_uninstall ;;
-            4)
+            2) docker_uninstall ;;
+            3) docker_compose_install ;;
+            4) docker_proxy_config ;;
+            5) docker_images_manage ;;
+            6) docker_containers_manage ;;
+            7)
                 if command_exists docker; then
-                    print_title "运行中的容器"
-                    docker ps
-                else
-                    print_error "Docker 未安装。"
-                fi
-                pause
-                ;;
-            5)
-                if command_exists docker; then
-                    print_title "清理 Docker 资源"
-                    if confirm "清理未使用的镜像、容器、网络？"; then
-                        docker system prune -af --volumes
+                    if confirm "清理未使用的容器、网络、镜像、构建缓存？"; then
+                        docker system prune -a -f --volumes
                         print_success "清理完成。"
-                        log_action "Docker resources cleaned"
+                        log_action "Docker system pruned"
                     fi
                 else
                     print_error "Docker 未安装。"
@@ -2402,12 +2691,12 @@ menu_docker() {
 }
 
 # ==============================================================================
-# 10. 主菜单
+# 11. 主菜单
 # ==============================================================================
 
 show_main_menu() {
-    clear
-    print_banner
+    fix_terminal
+    print_title "$SCRIPT_NAME v$VERSION"
     
     echo -e "${C_CYAN}=== 系统信息 ===${C_RESET}"
     echo "主机名: $(hostname)"
@@ -2420,376 +2709,118 @@ show_main_menu() {
     local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
     echo "负载: $load_avg"
     
-    local mem_info=$(free -h | awk '/^Mem:/ {printf "%s / %s (%.1f%%)", $3, $2, ($3/$2)*100}')
-    echo "内存: $mem_info"
+    local mem_info=$(free -m | awk '/^Mem:/ {
+        used=$3; total=$2
+        if (total > 0) {
+            pct = (used/total)*100
+            printf "%dM / %dM (%.1f%%)", used, total, pct
+        } else {
+            print "N/A"
+        }
+    }')
     
     local disk_info=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
     echo "磁盘: $disk_info"
     
-    if command_exists docker && docker info >/dev/null 2>&1; then
-        local container_count=$(docker ps -q | wc -l)
-        echo "Docker: 运行中 $container_count 个容器"
-    fi
-    
     echo ""
-    draw_line
     echo -e "${C_CYAN}=== 功能菜单 ===${C_RESET}"
+    echo "1.  系统更新与软件包管理"
+    echo "2.  UFW 防火墙管理"
+    echo "3.  Fail2ban 入侵防御"
+    echo "4.  SSH 安全配置"
+    echo "5.  系统优化 (BBR/Swap/清理)"
+    echo "6.  网络工具 (DNS/代理/测速)"
+    echo "7.  Web 服务 (SSL + Nginx)"
+    echo "8.  Docker 管理"
+    echo "9.  查看操作日志"
+    echo "10. 关于脚本"
     echo ""
-    echo -e "${C_YELLOW}[基础管理]${C_RESET}"
-    echo "  1. 系统更新与软件包"
-    echo "  2. 防火墙管理 (UFW)"
-    echo "  3. SSH 安全配置"
-    echo "  4. Fail2ban 入侵防御"  # ← 新增
-    echo "  5. 系统优化工具"
+    echo "0.  退出脚本"
     echo ""
-    echo -e "${C_YELLOW}[网络服务]${C_RESET}"
-    echo "  6. 网络工具 (DNS/代理/测速)"
-    echo "  7. Web 服务 (SSL + Nginx)"
-    echo "  8. Docker 管理"
-    echo ""
-    echo -e "${C_YELLOW}[其他功能]${C_RESET}"
-    echo "  9. 查看操作日志"
-    echo "  10. 备份/恢复配置"
-    echo "  0. 退出脚本"
-    echo ""
-    draw_line
 }
 
+show_about() {
+    print_title "关于 $SCRIPT_NAME"
+    cat << 'EOF'
+┌─────────────────────────────────────────────────────────────┐
+│  VPS 一键管理脚本                                           │
+│  Version: 1.0.0                                             │
+│  Author: Claude (Anthropic)                                 │
+│  License: MIT                                               │
+├─────────────────────────────────────────────────────────────┤
+│  功能特性:                                                  │
+│  • 系统更新与软件包管理                                     │
+│  • UFW 防火墙智能配置                                       │
+│  • Fail2ban 入侵防御                                        │
+│  • SSH 安全加固 (端口/密钥/禁用Root)                        │
+│  • 系统优化 (BBR/Swap/时区/清理)                            │
+│  • 网络工具 (DNS/系统代理/Squid/iPerf3)                     │
+│  • Web 服务 (Cloudflare DNS + SSL + Nginx 反代)            │
+│  • Docker 完整管理                                          │
+│  • 原子化文件写入 (防止配置损坏)                            │
+│  • 详细操作日志记录                                         │
+├─────────────────────────────────────────────────────────────┤
+│  适用场景:                                                  │
+│  • IPv6-only VPS 配置代理访问 GitHub/Docker Hub            │
+│  • 双栈 VPS 搭建 Squid 代理服务端                           │
+│  • 自动化 SSL 证书申请与续签                                │
+│  • 3x-ui 面板证书自动部署                                   │
+│  • 生产环境服务器安全加固                                   │
+├─────────────────────────────────────────────────────────────┤
+│  使用建议:                                                  │
+│  1. 首次使用建议先执行 "系统更新"                           │
+│  2. 修改 SSH 端口后请先测试新端口连接                       │
+│  3. 配置防火墙前确保 SSH 端口已放行                         │
+│  4. 重要操作前脚本会自动备份配置文件                        │
+│  5. 所有操作均记录在 /var/log/vps-manager.log              │
+├─────────────────────────────────────────────────────────────┤
+│  技术支持:                                                  │
+│  • 问题反馈: 请提供操作日志和系统信息                       │
+│  • 日志路径: /var/log/vps-manager.log                      │
+│  • 配置目录: /root/.vps-manager/                            │
+└─────────────────────────────────────────────────────────────┘
+EOF
+    echo ""
+    pause
+}
 
-main_menu() {
+main() {
+    check_root
+    check_os
+    init_environment
+    refresh_ssh_port
+    
     while true; do
         show_main_menu
-        read -r -p "请输入选项 [0-10]: " choice
+        read -e -r -p "请选择功能 [0-10]: " choice
         
         case $choice in
             1) menu_update ;;
-            2) menu_firewall ;;
-            3) menu_ssh ;;
-            4) menu_f2b ;;
+            2) menu_ufw ;;
+            3) menu_f2b ;;
+            4) menu_ssh ;;
             5) menu_opt ;;
             6) menu_net ;;
             7) menu_web ;;
             8) menu_docker ;;
             9)
-                print_title "操作日志"
+                print_title "操作日志 (最近 50 条)"
                 if [[ -f "$LOG_FILE" ]]; then
-                    tail -n 100 "$LOG_FILE"
+                    tail -n 50 "$LOG_FILE"
                 else
                     print_warn "日志文件不存在。"
                 fi
                 pause
                 ;;
-            10)  # 备份/恢复配置
-                print_title "备份/恢复"
-                echo "1. 备份配置"
-                echo "2. 恢复配置"
-                echo "3. 查看备份列表"
-                echo "4. 删除旧备份"
-                echo "0. 返回"
-                read -r -p "选择: " bc
-                
-                case $bc in
-                    1)
-                        # 完整备份功能
-                        local backup_name="backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-                        local backup_path="${BACKUP_DIR}/${backup_name}"
-                        
-                        print_info "正在备份配置..."
-                        
-                        local temp_backup_dir=$(mktemp -d)
-                        
-                        print_info "备份系统配置..."
-                        mkdir -p "$temp_backup_dir/etc"
-                        
-                        [[ -f /etc/ssh/sshd_config ]] && cp -p /etc/ssh/sshd_config "$temp_backup_dir/etc/" 2>/dev/null || true
-                        [[ -d /etc/ufw ]] && cp -rp /etc/ufw "$temp_backup_dir/etc/" 2>/dev/null || true
-                        
-                        if [[ -f /etc/fail2ban/jail.local ]]; then
-                            mkdir -p "$temp_backup_dir/etc/fail2ban"
-                            cp -p /etc/fail2ban/jail.local "$temp_backup_dir/etc/fail2ban/" 2>/dev/null || true
-                        fi
-                        
-                        [[ -d /etc/nginx ]] && cp -rp /etc/nginx "$temp_backup_dir/etc/" 2>/dev/null || true
-                        [[ -f "$APT_PROXY_CONF" ]] && cp -p "$APT_PROXY_CONF" "$temp_backup_dir/etc/" 2>/dev/null || true
-                        [[ -f "$ENV_PROXY_CONF" ]] && cp -p "$ENV_PROXY_CONF" "$temp_backup_dir/etc/" 2>/dev/null || true
-                        [[ -f "$ETC_ENVIRONMENT" ]] && cp -p "$ETC_ENVIRONMENT" "$temp_backup_dir/etc/" 2>/dev/null || true
-                        [[ -f "$SQUID_CONF" ]] && cp -p "$SQUID_CONF" "$temp_backup_dir/etc/" 2>/dev/null || true
-                        
-                        if [[ -d "$DOCKER_PROXY_DIR" ]]; then
-                            mkdir -p "$temp_backup_dir/etc/systemd/system/docker.service.d"
-                            cp -rp "$DOCKER_PROXY_DIR"/* "$temp_backup_dir/etc/systemd/system/docker.service.d/" 2>/dev/null || true
-                        fi
-                        
-                        print_info "备份用户数据..."
-                        mkdir -p "$temp_backup_dir/root"
-                        
-                        [[ -d /root/.ssh ]] && cp -rp /root/.ssh "$temp_backup_dir/root/" 2>/dev/null || true
-                        [[ -d "$CONFIG_DIR" ]] && cp -rp "$CONFIG_DIR" "$temp_backup_dir/root/" 2>/dev/null || true
-                        [[ -d "$CERT_PATH_PREFIX" ]] && cp -rp "$CERT_PATH_PREFIX" "$temp_backup_dir/root/" 2>/dev/null || true
-                        
-                        cp -p /root/.cloudflare-*.ini "$temp_backup_dir/root/" 2>/dev/null || true
-                        cp -p /root/cert-renew-hook-*.sh "$temp_backup_dir/root/" 2>/dev/null || true
-                        crontab -l > "$temp_backup_dir/root/crontab.txt" 2>/dev/null || true
-                        [[ -f "$LOG_FILE" ]] && cp -p "$LOG_FILE" "$temp_backup_dir/root/" 2>/dev/null || true
-                        
-                        cat > "$temp_backup_dir/BACKUP_INFO.txt" <<INFOEOF
-备份时间: $(date '+%Y-%m-%d %H:%M:%S')
-脚本版本: $VERSION
-主机名: $(hostname)
-系统: $(get_os_info)
-内核: $(uname -r)
-SSH 端口: $CURRENT_SSH_PORT
-
-备份内容:
-- SSH 配置与密钥
-- UFW 防火墙规则
-- Fail2ban 配置
-- Nginx 配置
-- 系统代理配置
-- Squid 配置
-- Docker 代理配置
-- SSL 证书与域名配置
-- Cloudflare API 凭证
-- Crontab 定时任务
-- 脚本操作日志
-INFOEOF
-                        
-                        print_info "正在压缩备份文件..."
-                        tar -czf "$backup_path" -C "$temp_backup_dir" . 2>/dev/null
-                        rm -rf "$temp_backup_dir"
-                        
-                        if [[ -f "$backup_path" ]]; then
-                            local backup_size=$(du -h "$backup_path" | cut -f1)
-                            print_success "备份完成: $backup_path ($backup_size)"
-                            log_action "Configuration backed up: $backup_name"
-                            
-                            echo ""
-                            echo -e "${C_CYAN}备份内容摘要:${C_RESET}"
-                            tar -tzf "$backup_path" | head -n 20
-                            echo "..."
-                            echo ""
-                            echo -e "${C_YELLOW}提示: 建议将备份文件下载到本地保存${C_RESET}"
-                        else
-                            print_error "备份失败。"
-                        fi
-                        pause
-                        ;;
-                        
-                    2)
-                        # 恢复配置
-                        shopt -s nullglob
-                        local backups=("${BACKUP_DIR}"/backup-*.tar.gz)
-                        shopt -u nullglob
-                        
-                        if [[ ${#backups[@]} -eq 0 ]]; then
-                            print_warn "没有可用备份。"
-                            pause
-                            continue
-                        fi
-                        
-                        echo "可用备份:"
-                        local i=1
-                        for bak in "${backups[@]}"; do
-                            local size=$(du -h "$bak" | cut -f1)
-                            local date=$(stat -c %y "$bak" | cut -d' ' -f1,2 | cut -d'.' -f1)
-                            echo "$i. $(basename "$bak") - $size - $date"
-                            ((i++))
-                        done
-                        echo ""
-                        
-                        read -r -p "选择备份序号 (0 取消): " idx
-                        if [[ "$idx" == "0" || -z "$idx" ]]; then
-                            continue
-                        fi
-                        
-                        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le ${#backups[@]} ]; then
-                            local selected="${backups[$((idx-1))]}"
-                            
-                            print_title "备份详情"
-                            tar -xzf "$selected" -O BACKUP_INFO.txt 2>/dev/null || print_warn "无法读取备份信息"
-                            
-                            echo ""
-                            if confirm "确认恢复 $(basename "$selected")？"; then
-                                print_info "正在恢复..."
-                                
-                                local pre_restore_backup="${BACKUP_DIR}/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
-                                print_info "创建恢复前备份: $pre_restore_backup"
-                                tar -czf "$pre_restore_backup" \
-                                    -C / \
-                                    etc/ssh/sshd_config \
-                                    etc/ufw \
-                                    etc/nginx 2>/dev/null \
-                                    "$CONFIG_DIR" 2>/dev/null \
-                                    root/.ssh 2>/dev/null \
-                                    2>/dev/null || true
-                                
-                                if tar -xzf "$selected" -C / 2>/dev/null; then
-                                    print_success "恢复完成。"
-                                    log_action "Configuration restored from: $(basename "$selected")"
-                                    
-                                    echo ""
-                                    print_warn "重要提示:"
-                                    echo "1. SSH 配置已恢复，请确认端口正确"
-                                    echo "2. 防火墙规则已恢复，请检查是否需要调整"
-                                    echo "3. 建议重启相关服务: SSH, Nginx, UFW"
-                                    echo ""
-                                    
-                                    if confirm "是否立即重启相关服务？"; then
-                                        print_info "重启服务中..."
-                                        
-                                        if is_systemd; then
-                                            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-                                            print_success "SSH 服务已重启"
-                                        fi
-                                        
-                                        if command_exists nginx; then
-                                            if is_systemd; then
-                                                systemctl restart nginx 2>/dev/null || true
-                                            else
-                                                nginx -s reload 2>/dev/null || true
-                                            fi
-                                            print_success "Nginx 已重启"
-                                        fi
-                                        
-                                        if command_exists ufw; then
-                                            ufw reload 2>/dev/null || true
-                                            print_success "UFW 已重载"
-                                        fi
-                                        
-                                        if command_exists fail2ban-client && is_systemd; then
-                                            systemctl restart fail2ban 2>/dev/null || true
-                                            print_success "Fail2ban 已重启"
-                                        fi
-                                    fi
-                                else
-                                    print_error "恢复失败！"
-                                    print_info "正在回滚..."
-                                    tar -xzf "$pre_restore_backup" -C / 2>/dev/null || true
-                                    print_warn "已回滚到恢复前状态"
-                                fi
-                            fi
-                        else
-                            print_error "无效序号。"
-                        fi
-                        pause
-                        ;;
-                        
-                    3)
-                        # 查看备份列表
-                        print_title "备份列表"
-                        shopt -s nullglob
-                        local backups=("${BACKUP_DIR}"/backup-*.tar.gz)
-                        shopt -u nullglob
-                        
-                        if [[ ${#backups[@]} -eq 0 ]]; then
-                            print_warn "没有备份文件。"
-                        else
-                            echo -e "${C_CYAN}文件名${C_RESET} | ${C_CYAN}大小${C_RESET} | ${C_CYAN}创建时间${C_RESET}"
-                            draw_line
-                            for bak in "${backups[@]}"; do
-                                local size=$(du -h "$bak" | cut -f1)
-                                local date=$(stat -c %y "$bak" | cut -d' ' -f1,2 | cut -d'.' -f1)
-                                printf "%-40s | %-8s | %s\n" "$(basename "$bak")" "$size" "$date"
-                            done
-                            echo ""
-                            echo "总计: ${#backups[@]} 个备份文件"
-                            echo "备份目录: $BACKUP_DIR"
-                        fi
-                        pause
-                        ;;
-                        
-                    4)
-                        # 删除旧备份
-                        print_title "清理旧备份"
-                        shopt -s nullglob
-                        local backups=("${BACKUP_DIR}"/backup-*.tar.gz)
-                        shopt -u nullglob
-                        
-                        if [[ ${#backups[@]} -eq 0 ]]; then
-                            print_warn "没有备份文件。"
-                            pause
-                            continue
-                        fi
-                        
-                        echo "当前有 ${#backups[@]} 个备份文件"
-                        echo ""
-                        echo "1. 删除 7 天前的备份"
-                        echo "2. 删除 30 天前的备份"
-                        echo "3. 只保留最新 5 个备份"
-                        echo "4. 手动选择删除"
-                        echo "0. 取消"
-                        echo ""
-                        read -r -p "请选择: " clean_opt
-                        
-                        case $clean_opt in
-                            1)
-                                local count=0
-                                for bak in "${backups[@]}"; do
-                                    if [[ $(find "$bak" -mtime +7 2>/dev/null) ]]; then
-                                        rm -f "$bak"
-                                        ((count++))
-                                    fi
-                                done
-                                print_success "已删除 $count 个 7 天前的备份"
-                                log_action "Cleaned up $count old backups (7 days)"
-                                ;;
-                            2)
-                                local count=0
-                                for bak in "${backups[@]}"; do
-                                    if [[ $(find "$bak" -mtime +30 2>/dev/null) ]]; then
-                                        rm -f "$bak"
-                                        ((count++))
-                                    fi
-                                done
-                                print_success "已删除 $count 个 30 天前的备份"
-                                log_action "Cleaned up $count old backups (30 days)"
-                                ;;
-                            3)
-                                local sorted_backups=($(ls -t "${BACKUP_DIR}"/backup-*.tar.gz 2>/dev/null))
-                                local count=0
-                                for ((i=5; i<${#sorted_backups[@]}; i++)); do
-                                    rm -f "${sorted_backups[$i]}"
-                                    ((count++))
-                                done
-                                print_success "已删除 $count 个旧备份，保留最新 5 个"
-                                log_action "Kept only 5 latest backups"
-                                ;;
-                            4)
-                                local i=1
-                                for bak in "${backups[@]}"; do
-                                    local size=$(du -h "$bak" | cut -f1)
-                                    local date=$(stat -c %y "$bak" | cut -d' ' -f1,2 | cut -d'.' -f1)
-                                    echo "$i. $(basename "$bak") - $size - $date"
-                                    ((i++))
-                                done
-                                echo ""
-                                read -r -p "输入要删除的序号 (空格隔开): " nums
-                                
-                                for num in $nums; do
-                                    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le ${#backups[@]} ]; then
-                                        local target="${backups[$((num-1))]}"
-                                        rm -f "$target"
-                                        print_success "已删除: $(basename "$target")"
-                                    fi
-                                done
-                                ;;
-                            0) ;;
-                            *) print_error "无效选项" ;;
-                        esac
-                        pause
-                        ;;
-                        
-                    0|q) ;;
-                    *) print_error "无效选项"; pause ;;
-                esac
-                ;;
-            0|q)
-                print_info "感谢使用 $SCRIPT_NAME！"
-                log_action "Script exited normally"
+            10) show_about ;;
+            0|q|Q)
+                echo ""
+                print_success "感谢使用 $SCRIPT_NAME！"
+                echo ""
                 exit 0
                 ;;
             *)
-                print_error "无效选项，请重新输入。"
+                print_error "无效选项，请重新选择。"
                 sleep 1
                 ;;
         esac
@@ -2797,14 +2828,7 @@ INFOEOF
 }
 
 # ==============================================================================
-# 11. 脚本入口
+# 脚本入口
 # ==============================================================================
-
-main() {
-    check_root
-    init_script
-    trap 'handle_interrupt' SIGINT SIGTERM
-    main_menu
-}
 
 main "$@"
