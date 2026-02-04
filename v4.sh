@@ -1532,15 +1532,43 @@ http_access deny all"
     echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}客户端配置命令 (复制到客户端执行):${C_RESET}                        ${C_CYAN}║${C_RESET}"
     echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
     
-    # 生成客户端配置命令
-    local proxy_url=""
+# 生成客户端配置命令
+local proxy_url=""
+local proxy_url_alt=""
+# 优先使用 IPv6（如果客户端 IP 是 IPv6）
+if [[ "$client_ip" == *:* ]]; then
+    # 客户端是 IPv6，优先推荐 IPv6 代理
+    if [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
+        proxy_url="http://[${server_ipv6}]:${port}"
+        if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
+            proxy_url_alt="http://${server_ipv4}:${port}"
+        fi
+    elif [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
+        proxy_url="http://${server_ipv4}:${port}"
+    fi
+else
+    # 客户端是 IPv4，优先推荐 IPv4 代理
     if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
         proxy_url="http://${server_ipv4}:${port}"
+        if [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
+            proxy_url_alt="http://[${server_ipv6}]:${port}"
+        fi
     elif [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
         proxy_url="http://[${server_ipv6}]:${port}"
-    else
-        proxy_url="http://YOUR_SERVER_IP:${port}"
     fi
+fi
+if [[ -z "$proxy_url" ]]; then
+    proxy_url="http://YOUR_SERVER_IP:${port}"
+fi
+echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 推荐配置（根据客户端 IP 类型自动选择）${C_RESET}                ${C_CYAN}║${C_RESET}"
+echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
+echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export https_proxy=\"$proxy_url\"${C_RESET}"
+printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
+if [[ -n "$proxy_url_alt" ]]; then
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}# 备用配置（如果上面的不工作）${C_RESET}                          ${C_CYAN}║${C_RESET}"
+    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url_alt\"${C_RESET}"
+    printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
+fi
     
     echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 方法 1: 临时设置 (当前会话有效)${C_RESET}                          ${C_CYAN}║${C_RESET}"
     echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
