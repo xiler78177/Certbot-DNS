@@ -1,18 +1,18 @@
 #!/bin/bash
 
 # ==============================================================================
-# 服务器初始化与管理脚本 (v13.25 - The Ultimate UX)
+# 服务器初始化与管理脚本 (v13.26 - The Grep Fix)
 #
-# 更新日志 v13.25 (用户体验的最后打磨):
-# 1. [体验] web_add_domain: Crontab 写入失败时的指引升级。
-#    - 如果自动写入失败（因原文件损坏等），直接打印出完整的 Cron 语句。
-#    - 明确提示用户执行 "crontab -e" 进行手动修复和添加。
-# 2. [兼容] 全局: Crontab 脏行过滤正则升级为 "^[[:space:]]*no crontab for "，
-#    兼容部分系统输出中可能存在的缩进空格。
+# 更新日志 v13.26 (修复 grep 返回值导致的误崩):
+# 1. [修复] web_delete_domain & web_add_domain:
+#    - 给所有 grep -v 过滤操作增加了 "|| true" 容错。
+#    - 原因：当 grep -v 过滤后结果为空时，grep 会返回 exit code 1。
+#      在 trap ERR 模式下，这会被误判为脚本错误导致强制退出。
+#      修复后，即使 Crontab 为空也能正常完成流程。
 # ==============================================================================
 
 # --- 全局常量配置 (Readonly) ---
-readonly VERSION="v13.25"
+readonly VERSION="v13.26"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -946,7 +946,7 @@ web_view_config() {
     echo "Hook 脚本: $DEPLOY_HOOK_SCRIPT"
     
     echo -e "\n${C_CYAN}[自动续签计划 (Crontab)]${C_RESET}"
-    # [提速 + 修复] 读取一次，过滤脏行 (v13.23 + v13.25 regex)
+    # [修复] 读取一次，过滤脏行 (v13.23) + 正则优化 (v13.25)
     local cron_out
     cron_out=$(crontab -l 2>/dev/null | grep -v -E "^[[:space:]]*no crontab for " || true)
     
@@ -1093,13 +1093,13 @@ web_delete_domain() {
     # 1. 导出 (容错)
     crontab -l > "$cron_tmp" 2>/dev/null || true
     
-    # 2. 清洗脏行 (带空格 v13.25 regex)
-    grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean"
+    # 2. 清洗脏行 (带空格 v13.25 regex + || true v13.26 fix)
+    grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean" || true
     mv "${cron_tmp}.clean" "$cron_tmp"
     
     # 3. 过滤掉目标任务并写回 (Pipe Safe: 2>/dev/null || print_warn - v13.24)
     if grep -F -q "$hook_script" "$cron_tmp"; then
-        grep -F -v "$hook_script" "$cron_tmp" > "${cron_tmp}.new"
+        grep -F -v "$hook_script" "$cron_tmp" > "${cron_tmp}.new" || true
         if ! crontab "${cron_tmp}.new" 2>/dev/null; then
             print_warn "Crontab 写回失败，请手动检查: crontab -e"
         else
@@ -1277,7 +1277,7 @@ systemctl restart 3x-ui 2>/dev/null || true"
         write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "DOMAIN=\"$DOMAIN\"; CERT_PATH=\"$cert_dir\"; DEPLOY_HOOK_SCRIPT=\"$DEPLOY_HOOK_SCRIPT\""
         chmod 600 "${CONFIG_DIR}/${DOMAIN}.conf"
         
-        # [关键修复] Crontab 写入防崩 - 临时文件法 (v13.23 hygiene)
+        # [关键修复] Crontab 写入防崩 - 临时文件法 (v13.23 hygiene + v13.24 no-crash + v13.25 UX + v13.26 grep fix)
         local cron_line="0 3 * * * certbot renew --deploy-hook \"$DEPLOY_HOOK_SCRIPT\""
         local cron_tmp
         cron_tmp=$(mktemp)
@@ -1285,12 +1285,13 @@ systemctl restart 3x-ui 2>/dev/null || true"
         # 1. 导出现有 crontab (忽略错误)
         crontab -l > "$cron_tmp" 2>/dev/null || true
         
-        # 2. 关键：过滤脏行 (no crontab for... 带空格 v13.25 regex)
-        grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean"
+        # 2. 关键：过滤脏行 (带空格 regex + grep fix)
+        grep -v -E "^[[:space:]]*no crontab for " "$cron_tmp" > "${cron_tmp}.clean" || true
         mv "${cron_tmp}.clean" "$cron_tmp"
         
-        # 3. 先尝试将清洗后的版本写回 (防崩逻辑: || print_warn v13.24)
+        # 3. 先尝试将清洗后的版本写回 (防崩逻辑: || print_warn)
         if ! crontab "$cron_tmp" 2>/dev/null; then
+            # [体验] 失败时的明确指引 (v13.25)
             print_warn "旧 Crontab 可能已损坏/含非法行，自动清洗回写失败。"
             print_warn "请执行: crontab -e 先修复，然后手动添加本行:"
             print_warn "$cron_line"
@@ -1300,6 +1301,7 @@ systemctl restart 3x-ui 2>/dev/null || true"
         if ! grep -F -q "$DEPLOY_HOOK_SCRIPT" "$cron_tmp"; then
             echo "$cron_line" >> "$cron_tmp"
             if ! crontab "$cron_tmp" 2>/dev/null; then
+                # [体验] 失败时的明确指引 (v13.25)
                 print_warn "Crontab 写入失败，请手动添加以下行:"
                 print_warn "$cron_line"
             else
