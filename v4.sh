@@ -39,7 +39,7 @@ readonly C_GRAY='\033[0;90m'
 # --- 配置变量 ---
 CF_API_TOKEN=""
 DOMAIN=""
-EMAIL="admin@example.com"
+EMAIL="your@mail.com"
 CERT_PATH_PREFIX="/root/cert"
 CONFIG_DIR="${CERT_PATH_PREFIX}/.managed_domains"
 DEFAULT_SSH_PORT=22
