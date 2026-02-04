@@ -570,22 +570,6 @@ ufw_setup() {
     pause
 }
 
-ufw_add() {
-    read -r -p "请输入要放行的端口 (空格隔开): " ports
-    [[ -z "$ports" ]] && return
-    
-    for port in $ports; do
-        if validate_port "$port"; then
-            ufw allow "$port/tcp" comment "Manual-Add-$port" >/dev/null
-            print_success "端口 $port/tcp 已放行。"
-            log_action "UFW allowed port $port"
-        else
-            print_error "端口 $port 无效。"
-        fi
-    done
-    pause
-}
-
 ufw_del() {
     command_exists ufw || { print_error "UFW 未安装。"; pause; return; }
     ufw status numbered
@@ -618,27 +602,96 @@ ufw_safe_reset() {
 menu_ufw() {
     while true; do
         print_title "UFW 防火墙管理"
+        
+        # 显示 UFW 状态
+        if command_exists ufw; then
+            local ufw_status=$(ufw status 2>/dev/null | head -n 1 || echo "未运行")
+            echo -e "${C_CYAN}当前状态:${C_RESET} $ufw_status"
+            echo ""
+        else
+            echo -e "${C_YELLOW}UFW 未安装${C_RESET}"
+            echo ""
+        fi
+        
         echo "1. 安装并启用 UFW"
         echo "2. 查看本机监听端口"
         echo "3. 添加放行端口"
         echo "4. 查看当前规则"
         echo "5. 删除规则"
+        echo "6. 禁用 UFW"
         echo "7. 重置默认规则 (安全模式)"
         echo "0. 返回主菜单"
         echo ""
         read -r -p "请选择: " c
+        
         case $c in
             1) ufw_setup ;;
             2) check_port_usage ;;
-            3) ufw_add ;;
-            4) ufw status numbered; pause ;;
-            5) ufw_del ;;
+            3) 
+                if ! command_exists ufw; then
+                    print_error "UFW 未安装，请先选择选项 1 安装。"
+                    pause
+                else
+                    ufw_add
+                fi
+                ;;
+            4) 
+                if ! command_exists ufw; then
+                    print_error "UFW 未安装，请先选择选项 1 安装。"
+                    pause
+                else
+                    print_title "当前防火墙规则"
+                    ufw status numbered
+                    pause
+                fi
+                ;;
+            5) 
+                if ! command_exists ufw; then
+                    print_error "UFW 未安装，请先选择选项 1 安装。"
+                    pause
+                else
+                    ufw_del
+                fi
+                ;;
+            6)
+                if ! command_exists ufw; then
+                    print_error "UFW 未安装。"
+                    pause
+                elif confirm "确认禁用 UFW？"; then
+                    echo "y" | ufw disable
+                    print_success "UFW 已禁用。"
+                    log_action "UFW disabled"
+                    pause
+                fi
+                ;;
             7) ufw_safe_reset ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
     done
 }
+
+ufw_add() {
+    if ! command_exists ufw; then
+        print_error "UFW 未安装。"
+        pause; return
+    fi
+    
+    read -r -p "请输入要放行的端口 (空格隔开): " ports
+    [[ -z "$ports" ]] && return
+    
+    for port in $ports; do
+        if validate_port "$port"; then
+            ufw allow "$port/tcp" comment "Manual-Add-$port" >/dev/null
+            print_success "端口 $port/tcp 已放行。"
+            log_action "UFW allowed port $port"
+        else
+            print_error "端口 $port 无效。"
+        fi
+    done
+    pause
+}
+
 
 # ==============================================================================
 # 4. Fail2ban 模块
@@ -2386,35 +2439,38 @@ show_main_menu() {
     echo "  1. 系统更新与软件包"
     echo "  2. 防火墙管理 (UFW)"
     echo "  3. SSH 安全配置"
-    echo "  4. 系统优化工具"
+    echo "  4. Fail2ban 入侵防御"  # ← 新增
+    echo "  5. 系统优化工具"
     echo ""
     echo -e "${C_YELLOW}[网络服务]${C_RESET}"
-    echo "  5. 网络工具 (DNS/代理/测速)"
-    echo "  6. Web 服务 (SSL + Nginx)"
-    echo "  7. Docker 管理"
+    echo "  6. 网络工具 (DNS/代理/测速)"
+    echo "  7. Web 服务 (SSL + Nginx)"
+    echo "  8. Docker 管理"
     echo ""
     echo -e "${C_YELLOW}[其他功能]${C_RESET}"
-    echo "  8. 查看操作日志"
-    echo "  9. 备份/恢复配置"
+    echo "  9. 查看操作日志"
+    echo "  10. 备份/恢复配置"
     echo "  0. 退出脚本"
     echo ""
     draw_line
 }
 
+
 main_menu() {
     while true; do
         show_main_menu
-        read -r -p "请输入选项 [0-9]: " choice
+        read -r -p "请输入选项 [0-10]: " choice
         
         case $choice in
             1) menu_update ;;
             2) menu_firewall ;;
             3) menu_ssh ;;
-            4) menu_opt ;;
-            5) menu_net ;;
-            6) menu_web ;;
-            7) menu_docker ;;
-            8)
+            4) menu_f2b ;;
+            5) menu_opt ;;
+            6) menu_net ;;
+            7) menu_web ;;
+            8) menu_docker ;;
+            9)
                 print_title "操作日志"
                 if [[ -f "$LOG_FILE" ]]; then
                     tail -n 100 "$LOG_FILE"
@@ -2423,69 +2479,203 @@ main_menu() {
                 fi
                 pause
                 ;;
-            9)
+            10)  # 备份/恢复配置
                 print_title "备份/恢复"
                 echo "1. 备份配置"
                 echo "2. 恢复配置"
                 echo "3. 查看备份列表"
+                echo "4. 删除旧备份"
                 echo "0. 返回"
                 read -r -p "选择: " bc
                 
                 case $bc in
                     1)
+                        # 完整备份功能
                         local backup_name="backup-$(date +%Y%m%d-%H%M%S).tar.gz"
                         local backup_path="${BACKUP_DIR}/${backup_name}"
                         
                         print_info "正在备份配置..."
-                        tar -czf "$backup_path" \
-                            -C / \
-                            etc/ssh/sshd_config \
-                            etc/ufw \
-                            etc/nginx 2>/dev/null \
-                            "$CONFIG_DIR" 2>/dev/null \
-                            root/.ssh 2>/dev/null \
-                            || true
+                        
+                        local temp_backup_dir=$(mktemp -d)
+                        
+                        print_info "备份系统配置..."
+                        mkdir -p "$temp_backup_dir/etc"
+                        
+                        [[ -f /etc/ssh/sshd_config ]] && cp -p /etc/ssh/sshd_config "$temp_backup_dir/etc/" 2>/dev/null || true
+                        [[ -d /etc/ufw ]] && cp -rp /etc/ufw "$temp_backup_dir/etc/" 2>/dev/null || true
+                        
+                        if [[ -f /etc/fail2ban/jail.local ]]; then
+                            mkdir -p "$temp_backup_dir/etc/fail2ban"
+                            cp -p /etc/fail2ban/jail.local "$temp_backup_dir/etc/fail2ban/" 2>/dev/null || true
+                        fi
+                        
+                        [[ -d /etc/nginx ]] && cp -rp /etc/nginx "$temp_backup_dir/etc/" 2>/dev/null || true
+                        [[ -f "$APT_PROXY_CONF" ]] && cp -p "$APT_PROXY_CONF" "$temp_backup_dir/etc/" 2>/dev/null || true
+                        [[ -f "$ENV_PROXY_CONF" ]] && cp -p "$ENV_PROXY_CONF" "$temp_backup_dir/etc/" 2>/dev/null || true
+                        [[ -f "$ETC_ENVIRONMENT" ]] && cp -p "$ETC_ENVIRONMENT" "$temp_backup_dir/etc/" 2>/dev/null || true
+                        [[ -f "$SQUID_CONF" ]] && cp -p "$SQUID_CONF" "$temp_backup_dir/etc/" 2>/dev/null || true
+                        
+                        if [[ -d "$DOCKER_PROXY_DIR" ]]; then
+                            mkdir -p "$temp_backup_dir/etc/systemd/system/docker.service.d"
+                            cp -rp "$DOCKER_PROXY_DIR"/* "$temp_backup_dir/etc/systemd/system/docker.service.d/" 2>/dev/null || true
+                        fi
+                        
+                        print_info "备份用户数据..."
+                        mkdir -p "$temp_backup_dir/root"
+                        
+                        [[ -d /root/.ssh ]] && cp -rp /root/.ssh "$temp_backup_dir/root/" 2>/dev/null || true
+                        [[ -d "$CONFIG_DIR" ]] && cp -rp "$CONFIG_DIR" "$temp_backup_dir/root/" 2>/dev/null || true
+                        [[ -d "$CERT_PATH_PREFIX" ]] && cp -rp "$CERT_PATH_PREFIX" "$temp_backup_dir/root/" 2>/dev/null || true
+                        
+                        cp -p /root/.cloudflare-*.ini "$temp_backup_dir/root/" 2>/dev/null || true
+                        cp -p /root/cert-renew-hook-*.sh "$temp_backup_dir/root/" 2>/dev/null || true
+                        crontab -l > "$temp_backup_dir/root/crontab.txt" 2>/dev/null || true
+                        [[ -f "$LOG_FILE" ]] && cp -p "$LOG_FILE" "$temp_backup_dir/root/" 2>/dev/null || true
+                        
+                        cat > "$temp_backup_dir/BACKUP_INFO.txt" <<INFOEOF
+备份时间: $(date '+%Y-%m-%d %H:%M:%S')
+脚本版本: $VERSION
+主机名: $(hostname)
+系统: $(get_os_info)
+内核: $(uname -r)
+SSH 端口: $CURRENT_SSH_PORT
+
+备份内容:
+- SSH 配置与密钥
+- UFW 防火墙规则
+- Fail2ban 配置
+- Nginx 配置
+- 系统代理配置
+- Squid 配置
+- Docker 代理配置
+- SSL 证书与域名配置
+- Cloudflare API 凭证
+- Crontab 定时任务
+- 脚本操作日志
+INFOEOF
+                        
+                        print_info "正在压缩备份文件..."
+                        tar -czf "$backup_path" -C "$temp_backup_dir" . 2>/dev/null
+                        rm -rf "$temp_backup_dir"
                         
                         if [[ -f "$backup_path" ]]; then
-                            print_success "备份完成: $backup_path"
+                            local backup_size=$(du -h "$backup_path" | cut -f1)
+                            print_success "备份完成: $backup_path ($backup_size)"
                             log_action "Configuration backed up: $backup_name"
+                            
+                            echo ""
+                            echo -e "${C_CYAN}备份内容摘要:${C_RESET}"
+                            tar -tzf "$backup_path" | head -n 20
+                            echo "..."
+                            echo ""
+                            echo -e "${C_YELLOW}提示: 建议将备份文件下载到本地保存${C_RESET}"
                         else
                             print_error "备份失败。"
                         fi
                         pause
                         ;;
+                        
                     2)
+                        # 恢复配置
                         shopt -s nullglob
                         local backups=("${BACKUP_DIR}"/backup-*.tar.gz)
                         shopt -u nullglob
                         
                         if [[ ${#backups[@]} -eq 0 ]]; then
                             print_warn "没有可用备份。"
-                            pause; continue
+                            pause
+                            continue
                         fi
                         
                         echo "可用备份:"
                         local i=1
                         for bak in "${backups[@]}"; do
-                            echo "$i. $(basename "$bak")"
+                            local size=$(du -h "$bak" | cut -f1)
+                            local date=$(stat -c %y "$bak" | cut -d' ' -f1,2 | cut -d'.' -f1)
+                            echo "$i. $(basename "$bak") - $size - $date"
                             ((i++))
                         done
+                        echo ""
                         
-                        read -r -p "选择备份序号: " idx
+                        read -r -p "选择备份序号 (0 取消): " idx
+                        if [[ "$idx" == "0" || -z "$idx" ]]; then
+                            continue
+                        fi
+                        
                         if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le ${#backups[@]} ]; then
                             local selected="${backups[$((idx-1))]}"
+                            
+                            print_title "备份详情"
+                            tar -xzf "$selected" -O BACKUP_INFO.txt 2>/dev/null || print_warn "无法读取备份信息"
+                            
+                            echo ""
                             if confirm "确认恢复 $(basename "$selected")？"; then
                                 print_info "正在恢复..."
-                                tar -xzf "$selected" -C / 2>/dev/null || true
-                                print_success "恢复完成，建议重启服务。"
-                                log_action "Configuration restored from: $(basename "$selected")"
+                                
+                                local pre_restore_backup="${BACKUP_DIR}/pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+                                print_info "创建恢复前备份: $pre_restore_backup"
+                                tar -czf "$pre_restore_backup" \
+                                    -C / \
+                                    etc/ssh/sshd_config \
+                                    etc/ufw \
+                                    etc/nginx 2>/dev/null \
+                                    "$CONFIG_DIR" 2>/dev/null \
+                                    root/.ssh 2>/dev/null \
+                                    2>/dev/null || true
+                                
+                                if tar -xzf "$selected" -C / 2>/dev/null; then
+                                    print_success "恢复完成。"
+                                    log_action "Configuration restored from: $(basename "$selected")"
+                                    
+                                    echo ""
+                                    print_warn "重要提示:"
+                                    echo "1. SSH 配置已恢复，请确认端口正确"
+                                    echo "2. 防火墙规则已恢复，请检查是否需要调整"
+                                    echo "3. 建议重启相关服务: SSH, Nginx, UFW"
+                                    echo ""
+                                    
+                                    if confirm "是否立即重启相关服务？"; then
+                                        print_info "重启服务中..."
+                                        
+                                        if is_systemd; then
+                                            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+                                            print_success "SSH 服务已重启"
+                                        fi
+                                        
+                                        if command_exists nginx; then
+                                            if is_systemd; then
+                                                systemctl restart nginx 2>/dev/null || true
+                                            else
+                                                nginx -s reload 2>/dev/null || true
+                                            fi
+                                            print_success "Nginx 已重启"
+                                        fi
+                                        
+                                        if command_exists ufw; then
+                                            ufw reload 2>/dev/null || true
+                                            print_success "UFW 已重载"
+                                        fi
+                                        
+                                        if command_exists fail2ban-client && is_systemd; then
+                                            systemctl restart fail2ban 2>/dev/null || true
+                                            print_success "Fail2ban 已重启"
+                                        fi
+                                    fi
+                                else
+                                    print_error "恢复失败！"
+                                    print_info "正在回滚..."
+                                    tar -xzf "$pre_restore_backup" -C / 2>/dev/null || true
+                                    print_warn "已回滚到恢复前状态"
+                                fi
                             fi
                         else
                             print_error "无效序号。"
                         fi
                         pause
                         ;;
+                        
                     3)
+                        # 查看备份列表
                         print_title "备份列表"
                         shopt -s nullglob
                         local backups=("${BACKUP_DIR}"/backup-*.tar.gz)
@@ -2494,14 +2684,101 @@ main_menu() {
                         if [[ ${#backups[@]} -eq 0 ]]; then
                             print_warn "没有备份文件。"
                         else
+                            echo -e "${C_CYAN}文件名${C_RESET} | ${C_CYAN}大小${C_RESET} | ${C_CYAN}创建时间${C_RESET}"
+                            draw_line
                             for bak in "${backups[@]}"; do
                                 local size=$(du -h "$bak" | cut -f1)
                                 local date=$(stat -c %y "$bak" | cut -d' ' -f1,2 | cut -d'.' -f1)
-                                echo "$(basename "$bak") - $size - $date"
+                                printf "%-40s | %-8s | %s\n" "$(basename "$bak")" "$size" "$date"
                             done
+                            echo ""
+                            echo "总计: ${#backups[@]} 个备份文件"
+                            echo "备份目录: $BACKUP_DIR"
                         fi
                         pause
                         ;;
+                        
+                    4)
+                        # 删除旧备份
+                        print_title "清理旧备份"
+                        shopt -s nullglob
+                        local backups=("${BACKUP_DIR}"/backup-*.tar.gz)
+                        shopt -u nullglob
+                        
+                        if [[ ${#backups[@]} -eq 0 ]]; then
+                            print_warn "没有备份文件。"
+                            pause
+                            continue
+                        fi
+                        
+                        echo "当前有 ${#backups[@]} 个备份文件"
+                        echo ""
+                        echo "1. 删除 7 天前的备份"
+                        echo "2. 删除 30 天前的备份"
+                        echo "3. 只保留最新 5 个备份"
+                        echo "4. 手动选择删除"
+                        echo "0. 取消"
+                        echo ""
+                        read -r -p "请选择: " clean_opt
+                        
+                        case $clean_opt in
+                            1)
+                                local count=0
+                                for bak in "${backups[@]}"; do
+                                    if [[ $(find "$bak" -mtime +7 2>/dev/null) ]]; then
+                                        rm -f "$bak"
+                                        ((count++))
+                                    fi
+                                done
+                                print_success "已删除 $count 个 7 天前的备份"
+                                log_action "Cleaned up $count old backups (7 days)"
+                                ;;
+                            2)
+                                local count=0
+                                for bak in "${backups[@]}"; do
+                                    if [[ $(find "$bak" -mtime +30 2>/dev/null) ]]; then
+                                        rm -f "$bak"
+                                        ((count++))
+                                    fi
+                                done
+                                print_success "已删除 $count 个 30 天前的备份"
+                                log_action "Cleaned up $count old backups (30 days)"
+                                ;;
+                            3)
+                                local sorted_backups=($(ls -t "${BACKUP_DIR}"/backup-*.tar.gz 2>/dev/null))
+                                local count=0
+                                for ((i=5; i<${#sorted_backups[@]}; i++)); do
+                                    rm -f "${sorted_backups[$i]}"
+                                    ((count++))
+                                done
+                                print_success "已删除 $count 个旧备份，保留最新 5 个"
+                                log_action "Kept only 5 latest backups"
+                                ;;
+                            4)
+                                local i=1
+                                for bak in "${backups[@]}"; do
+                                    local size=$(du -h "$bak" | cut -f1)
+                                    local date=$(stat -c %y "$bak" | cut -d' ' -f1,2 | cut -d'.' -f1)
+                                    echo "$i. $(basename "$bak") - $size - $date"
+                                    ((i++))
+                                done
+                                echo ""
+                                read -r -p "输入要删除的序号 (空格隔开): " nums
+                                
+                                for num in $nums; do
+                                    if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le ${#backups[@]} ]; then
+                                        local target="${backups[$((num-1))]}"
+                                        rm -f "$target"
+                                        print_success "已删除: $(basename "$target")"
+                                    fi
+                                done
+                                ;;
+                            0) ;;
+                            *) print_error "无效选项" ;;
+                        esac
+                        pause
+                        ;;
+                        
                     0|q) ;;
                     *) print_error "无效选项"; pause ;;
                 esac
@@ -2524,22 +2801,10 @@ main_menu() {
 # ==============================================================================
 
 main() {
-    # Root 权限检查
     check_root
-    
-    # 初始化
     init_script
-    
-    # 信号处理
     trap 'handle_interrupt' SIGINT SIGTERM
-    
-    # 启动主菜单
     main_menu
 }
 
-
-# 执行主函数
 main "$@"
-
-
-
