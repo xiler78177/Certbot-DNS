@@ -72,6 +72,48 @@ set -o errtrace
 
 # 终端修复 - 增强版
 fix_terminal() {
+
+# ============================================
+# IP定位函数
+# ============================================
+get_ip_location() {
+    local ip="$1"
+    local timeout=3
+    
+    # 跳过内网IP
+    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.) ]]; then
+        echo "本地网络"
+        return
+    fi
+    
+    # 跳过IPv6本地地址
+    if [[ "$ip" =~ ^(fe80:|::1|fc00:|fd00:) ]]; then
+        echo "本地网络"
+        return
+    fi
+    
+    # 尝试 ip-api.com
+    local result=$(timeout $timeout curl -s "http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,country,regionName,city,isp" 2>/dev/null)
+    
+    if [[ -n "$result" ]] && echo "$result" | grep -q '"status":"success"'; then
+        local country=$(echo "$result" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
+        local region=$(echo "$result" | grep -o '"regionName":"[^"]*"' | cut -d'"' -f4)
+        local city=$(echo "$result" | grep -o '"city":"[^"]*"' | cut -d'"' -f4)
+        local isp=$(echo "$result" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
+        
+        local location=""
+        [[ -n "$country" ]] && location="$country"
+        [[ -n "$region" && "$region" != "$country" ]] && location="${location} ${region}"
+        [[ -n "$city" && "$city" != "$region" ]] && location="${location} ${city}"
+        [[ -n "$isp" ]] && location="${location} (${isp})"
+        
+        echo "${location:-未知}"
+        return
+    fi
+    
+    echo "查询失败"
+}
+
     # 检查是否为交互式终端
     [[ -t 0 ]] || return 0
     
@@ -379,51 +421,51 @@ init_environment() {
 # ==============================================================================
 
 menu_update() {
-    fix_terminal
-    while true; do
-        print_title "系统更新与软件包管理"
-        echo "1. 更新软件源"
-        echo "2. 升级所有软件包"
-        echo "3. 完整升级 (dist-upgrade)"
-        echo "4. 重装基础依赖"
-        echo "5. 查看系统信息"
-        echo "0. 返回"
-        echo ""
-        read -e -r -p "请选择: " c
-        
-        case $c in
-            1)
-                print_info "正在更新软件源..."
-                apt-get update -y
-                print_success "更新完成。"
-                log_action "APT sources updated"
-                pause
-                ;;
-            2)
-                print_info "正在升级软件包..."
-                apt-get upgrade -y
-                print_success "升级完成。"
-                log_action "System packages upgraded"
-                pause
-                ;;
-            3)
-                if confirm "执行完整升级 (可能更新内核)？"; then
-                    apt-get dist-upgrade -y
-                    print_success "完整升级完成。"
-                    log_action "System dist-upgraded"
-                fi
-                pause
-                ;;
-            4) reinstall_deps ;;
-            5) sys_info ;;
-            0|q) break ;;
-            *) print_error "无效选项" ;;
-        esac
+    print_title "基础依赖安装"
+    
+    print_info "正在检查并安装基础依赖..."
+    echo ""
+    
+    # 更新软件源
+    print_info "1/2 更新软件源..."
+    if apt-get update -y >/dev/null 2>&1; then
+        print_success "软件源更新完成"
+    else
+        print_warn "软件源更新失败，但继续安装"
+    fi
+    
+    echo ""
+    
+    # 安装基础依赖
+    print_info "2/2 安装基础依赖包..."
+    local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban nginx iproute2 net-tools procps"
+    local installed=0
+    local failed=0
+    
+    for pkg in $deps; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            echo "  ✓ $pkg (已安装)"
+        else
+            echo -n "  → 正在安装 $pkg ... "
+            if apt-get install -y "$pkg" >/dev/null 2>&1; then
+                echo -e "${C_GREEN}成功${C_RESET}"
+                ((installed++))
+            else
+                echo -e "${C_RED}失败${C_RESET}"
+                ((failed++))
+            fi
+        fi
     done
-}
-
-menu_firewall() {
-    menu_ufw
+    
+    echo ""
+    echo "================================================================================"
+    print_success "基础依赖安装完成"
+    echo "  已安装: $installed 个"
+    [[ $failed -gt 0 ]] && echo "  失败: $failed 个"
+    echo "================================================================================"
+    
+    log_action "Basic dependencies installed/checked"
+    pause
 }
 
 # ==============================================================================
@@ -1015,7 +1057,6 @@ opt_cleanup() {
 opt_hostname() {
     print_title "修改主机名"
     echo "当前: $(hostname)"
-    read -e -r -p "新主机名: " new_name
     [[ -z "$new_name" ]] && return
     
     if [[ ! "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
@@ -1220,375 +1261,6 @@ net_iperf3() {
     pause
 }
 
-net_proxy() {
-    print_title "配置系统级代理 (客户端)"
-    print_guide "针对 IPv6-only VPS 无法访问 GitHub/Docker 的最佳方案。"
-    echo ""
-    
-    if ip route get 1.1.1.1 >/dev/null 2>&1; then
-        print_info "检测结果: 本机具备 IPv4 出口，可能不需要此功能。"
-    else
-        print_warn "检测结果: 本机无 IPv4 出口，强烈建议配置代理。"
-    fi
-    echo ""
-    
-    echo "1. 开启/修改 系统代理"
-    echo "2. 关闭/清理 系统代理"
-    echo "3. 查看状态与测试"
-    echo "0. 返回"
-    echo ""
-    read -e -r -p "请选择: " choice
-    
-    case $choice in
-        1)
-            local proxy_url=""
-            while [[ -z "$proxy_url" ]]; do
-                read -e -r -p "输入代理地址 (格式: IP:Port 或 http://IP:Port): " proxy_url
-                
-                # 自动补全 http:// 前缀
-                if [[ ! "$proxy_url" =~ ^https?:// ]]; then
-                    proxy_url="http://${proxy_url}"
-                    print_info "已自动补全为: $proxy_url"
-                fi
-                
-                # 验证格式
-                if [[ ! "$proxy_url" =~ ^https?://(\[?[a-zA-Z0-9:.-]+\]?):([0-9]+)$ ]]; then
-                    print_warn "地址格式错误，请重试"
-                    print_info "示例: 192.168.1.1:3128 或 http://192.168.1.1:3128"
-                    proxy_url=""
-                fi
-            done
-            
-            print_info "正在写入配置..."
-            
-            # ... 其余代码保持不变
-
-            
-            local apt_conf="Acquire::http::Proxy \"$proxy_url\";
-Acquire::https::Proxy \"$proxy_url\";"
-            write_file_atomic "$APT_PROXY_CONF" "$apt_conf"
-            
-            local env_conf="export http_proxy=\"$proxy_url\"
-export https_proxy=\"$proxy_url\"
-export ftp_proxy=\"$proxy_url\"
-export HTTP_PROXY=\"$proxy_url\"
-export HTTPS_PROXY=\"$proxy_url\"
-export FTP_PROXY=\"$proxy_url\"
-export no_proxy=\"localhost,127.0.0.1,::1\"
-export NO_PROXY=\"localhost,127.0.0.1,::1\""
-            write_file_atomic "$ENV_PROXY_CONF" "$env_conf"
-            
-            if [[ -f "$ETC_ENVIRONMENT" ]]; then
-                [[ ! -f "${ETC_ENVIRONMENT}.bak.proxy" ]] && cp "$ETC_ENVIRONMENT" "${ETC_ENVIRONMENT}.bak.proxy"
-            else
-                touch "$ETC_ENVIRONMENT"
-            fi
-            
-            local env_tmp=$(mktemp)
-            grep -v -E -i "^(http_proxy|https_proxy|ftp_proxy|no_proxy)=" "$ETC_ENVIRONMENT" > "$env_tmp" || true
-            
-            cat >> "$env_tmp" <<EOF
-http_proxy="$proxy_url"
-https_proxy="$proxy_url"
-ftp_proxy="$proxy_url"
-HTTP_PROXY="$proxy_url"
-HTTPS_PROXY="$proxy_url"
-FTP_PROXY="$proxy_url"
-no_proxy="localhost,127.0.0.1,::1"
-NO_PROXY="localhost,127.0.0.1,::1"
-EOF
-            
-            local env_content=$(cat "$env_tmp")
-            write_file_atomic "$ETC_ENVIRONMENT" "$env_content"
-            rm -f "$env_tmp"
-            
-            if command_exists docker && is_systemd && systemctl status docker >/dev/null 2>&1; then
-                mkdir -p "$DOCKER_PROXY_DIR"
-                local docker_conf="[Service]
-Environment=\"HTTP_PROXY=$proxy_url\"
-Environment=\"HTTPS_PROXY=$proxy_url\"
-Environment=\"NO_PROXY=localhost,127.0.0.1,::1\"
-Environment=\"http_proxy=$proxy_url\"
-Environment=\"https_proxy=$proxy_url\"
-Environment=\"no_proxy=localhost,127.0.0.1,::1\""
-                write_file_atomic "$DOCKER_PROXY_CONF" "$docker_conf"
-                systemctl daemon-reload || true
-                systemctl restart docker || true
-                print_success "Docker 代理配置已生效。"
-            fi
-            
-            export http_proxy="$proxy_url"
-            export https_proxy="$proxy_url"
-            export ftp_proxy="$proxy_url"
-            export HTTP_PROXY="$proxy_url"
-            export HTTPS_PROXY="$proxy_url"
-            export FTP_PROXY="$proxy_url"
-            export no_proxy="localhost,127.0.0.1,::1"
-            export NO_PROXY="localhost,127.0.0.1,::1"
-            
-            print_success "代理配置完成。"
-            log_action "System proxy configured: $proxy_url"
-            pause
-            ;;
-            
-        2)
-            print_info "正在清理代理配置..."
-            rm -f "$APT_PROXY_CONF" "$ENV_PROXY_CONF" "$DOCKER_PROXY_CONF"
-            
-            if [[ -f "$ETC_ENVIRONMENT" ]]; then
-                local env_tmp=$(mktemp)
-                grep -v -E -i "^(http_proxy|https_proxy|ftp_proxy|no_proxy)=" "$ETC_ENVIRONMENT" > "$env_tmp" || true
-                local env_content=$(cat "$env_tmp")
-                write_file_atomic "$ETC_ENVIRONMENT" "$env_content"
-                rm -f "$env_tmp"
-            fi
-            
-            unset http_proxy https_proxy ftp_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY no_proxy NO_PROXY
-            
-            if command_exists docker && is_systemd && systemctl status docker >/dev/null 2>&1; then
-                systemctl daemon-reload || true
-                systemctl restart docker || true
-            fi
-            
-            print_success "代理配置已清除。"
-            log_action "System proxy removed"
-            pause
-            ;;
-        3)
-            print_title "系统代理状态"
-            echo -e "${C_CYAN}[当前会话]${C_RESET}"
-            echo "http_proxy=${http_proxy:-未设置}"
-            echo "https_proxy=${https_proxy:-未设置}"
-            echo "no_proxy=${no_proxy:-未设置}"
-            
-            echo -e "\n${C_CYAN}[配置文件]${C_RESET}"
-            [[ -f "$APT_PROXY_CONF" ]] && echo "APT: 已配置" || echo "APT: 未配置"
-            [[ -f "$ENV_PROXY_CONF" ]] && echo "Shell: 已配置" || echo "Shell: 未配置"
-            grep -i -q "http_proxy=" "$ETC_ENVIRONMENT" 2>/dev/null && echo "Systemd: 已配置" || echo "Systemd: 未配置"
-            [[ -f "$DOCKER_PROXY_CONF" ]] && echo "Docker: 已配置" || echo "Docker: 未配置"
-            
-            echo -e "\n${C_CYAN}[连接测试]${C_RESET}"
-            
-            # 测试 1: 直连测试
-            print_info "测试 1: 直连 Google (不使用代理)..."
-            if curl -I -s --connect-timeout 5 https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
-                print_success "直连成功 (本机有 IPv4/IPv6 出口)"
-            else
-                print_warn "直连失败 (需要代理)"
-            fi
-            
-            # 测试 2: 代理测试
-            if [[ -n "$http_proxy" ]]; then
-                print_info "测试 2: 通过代理连接 Google..."
-                if curl -I -s --connect-timeout 5 -x "$http_proxy" https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
-                    print_success "代理连接成功！"
-                else
-                    print_error "代理连接失败，请检查:"
-                    echo "  1. 代理服务端是否正常运行"
-                    echo "  2. 防火墙是否放行客户端 IP"
-                    echo "  3. 代理地址和端口是否正确"
-                    echo ""
-                    echo "调试命令:"
-                    echo "  curl -v -x \"$http_proxy\" https://www.google.com"
-                fi
-            else
-                print_warn "未配置代理，跳过代理测试"
-            fi
-            
-            pause
-            ;;
-
-        0|q) return ;;
-        *) print_error "无效选项"; pause ;;
-    esac
-}
-
-net_setup_squid() {
-    print_title "搭建 Squid 代理服务端"
-    install_package "squid"
-    
-    # 端口配置
-    local port="3128"
-    read -e -r -p "请输入监听端口 [$port]: " p
-    [[ -n "$p" ]] && port="$p"
-    
-    if ! validate_port "$port"; then
-        print_error "端口无效，使用默认 3128"
-        port=3128
-    fi
-    
-    # 客户端 IP 配置
-    local client_ip=""
-    while [[ -z "$client_ip" ]]; do
-        read -e -r -p "请输入允许连接的客户端 IP 地址 (支持 CIDR): " client_ip
-        if [[ -z "$client_ip" ]]; then
-            print_warn "必须输入 IP 地址！"
-        fi
-    done
-    
-    # 自动补全 CIDR
-    if [[ "$client_ip" != */* ]]; then
-        if [[ "$client_ip" == *:* ]]; then
-            client_ip="${client_ip}/128"
-            print_info "已自动补全为: $client_ip"
-        else
-            client_ip="${client_ip}/32"
-            print_info "已自动补全为: $client_ip"
-        fi
-    fi
-    
-    # 配置 Squid
-    print_info "正在配置 Squid..."
-    
-    local squid_conf_content="# Squid Proxy Configuration
-# Generated by $SCRIPT_NAME $VERSION
-
-# Port (Listen on all interfaces)
-http_port $port
-
-# Optimization
-shutdown_lifetime 1 seconds
-forwarded_for off
-via off
-dns_v4_first on
-
-# ACL Definitions
-acl allowed_client src $client_ip
-acl localnet src 127.0.0.1/32 ::1/128
-
-# Access Control
-http_access allow allowed_client
-http_access allow localnet
-http_access deny all"
-    
-    write_file_atomic "$SQUID_CONF" "$squid_conf_content"
-    
-    # 配置防火墙
-    if command_exists ufw && ufw status | grep -q "Status: active"; then
-        # 提取纯 IP（去除 CIDR）
-        local client_ip_only="${client_ip%/*}"
-        if ufw allow from "$client_ip_only" to any port "$port" proto tcp comment "Squid-Proxy" >/dev/null 2>&1; then
-            print_success "UFW 规则已更新。"
-        else
-            print_warn "UFW 规则添加失败，请手动配置。"
-        fi
-    fi
-    
-    # 重启服务
-    if is_systemd; then
-        systemctl enable squid >/dev/null 2>&1 || true
-        systemctl restart squid 2>/dev/null || systemctl restart squid3 2>/dev/null || true
-        sleep 2
-    elif command_exists service; then
-        service squid restart || service squid3 restart || true
-        sleep 2
-    fi
-    
-    # 服务端自测
-    print_info "正在进行服务端自测 (Self-Test)..."
-    local self_test_passed=0
-    
-    if curl -I -s -x "http://127.0.0.1:$port" --connect-timeout 5 https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
-        self_test_passed=1
-    elif curl -I -s -x "http://[::1]:$port" --connect-timeout 5 https://www.google.com 2>/dev/null | grep -q "HTTP/"; then
-        self_test_passed=1
-    fi
-    
-    if [[ $self_test_passed -eq 1 ]]; then
-        print_success "自测通过！Squid 服务正常运行。"
-    else
-        print_warn "自测失败！请检查:"
-        echo "  1. Squid 服务是否正常启动: systemctl status squid"
-        echo "  2. 防火墙是否正确配置"
-        echo "  3. 查看日志: tail -f /var/log/squid/access.log"
-        pause
-        return
-    fi
-    
-    # 获取服务端公网 IP
-    print_info "正在获取服务端公网 IP..."
-    local server_ipv4=$(safe_curl -4 https://api.ipify.org 2>/dev/null || echo "")
-    local server_ipv6=$(get_public_ipv6)
-    
-    # 输出配置信息
-    echo ""
-    echo -e "${C_CYAN}╔════════════════════════════════════════════════════════════════╗${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}Squid 代理服务端配置完成！${C_RESET}                                  ${C_CYAN}║${C_RESET}"
-    echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}服务端信息:${C_RESET}                                                  ${C_CYAN}║${C_RESET}"
-    
-    if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
-        printf "${C_CYAN}║${C_RESET}    IPv4: %-52s ${C_CYAN}║${C_RESET}\n" "$server_ipv4"
-    fi
-    
-    if [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
-        printf "${C_CYAN}║${C_RESET}    IPv6: %-52s ${C_CYAN}║${C_RESET}\n" "$server_ipv6"
-    fi
-    
-    printf "${C_CYAN}║${C_RESET}    端口: %-52s ${C_CYAN}║${C_RESET}\n" "$port"
-    printf "${C_CYAN}║${C_RESET}    允许客户端: %-45s ${C_CYAN}║${C_RESET}\n" "$client_ip"
-    
-    echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}客户端配置命令 (复制到客户端执行):${C_RESET}                        ${C_CYAN}║${C_RESET}"
-    echo -e "${C_CYAN}╠════════════════════════════════════════════════════════════════╣${C_RESET}"
-    
-# 生成客户端配置命令
-local proxy_url=""
-local proxy_url_alt=""
-# 优先使用 IPv6（如果客户端 IP 是 IPv6）
-if [[ "$client_ip" == *:* ]]; then
-    # 客户端是 IPv6，优先推荐 IPv6 代理
-    if [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
-        proxy_url="http://[${server_ipv6}]:${port}"
-        if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
-            proxy_url_alt="http://${server_ipv4}:${port}"
-        fi
-    elif [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
-        proxy_url="http://${server_ipv4}:${port}"
-    fi
-else
-    # 客户端是 IPv4，优先推荐 IPv4 代理
-    if [[ -n "$server_ipv4" && "$server_ipv4" != "未检测到" ]]; then
-        proxy_url="http://${server_ipv4}:${port}"
-        if [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
-            proxy_url_alt="http://[${server_ipv6}]:${port}"
-        fi
-    elif [[ -n "$server_ipv6" && "$server_ipv6" != "未检测到" ]]; then
-        proxy_url="http://[${server_ipv6}]:${port}"
-    fi
-fi
-if [[ -z "$proxy_url" ]]; then
-    proxy_url="http://YOUR_SERVER_IP:${port}"
-fi
-echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 推荐配置（根据客户端 IP 类型自动选择）${C_RESET}                ${C_CYAN}║${C_RESET}"
-echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
-echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export https_proxy=\"$proxy_url\"${C_RESET}"
-printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
-if [[ -n "$proxy_url_alt" ]]; then
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}# 备用配置（如果上面的不工作）${C_RESET}                          ${C_CYAN}║${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url_alt\"${C_RESET}"
-    printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
-fi
-    
-    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 方法 1: 临时设置 (当前会话有效)${C_RESET}                          ${C_CYAN}║${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
-    printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
-    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 方法 2: 永久设置 (写入配置文件)${C_RESET}                          ${C_CYAN}║${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}cat >> ~/.bashrc << 'EOF'${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export http_proxy=\"$proxy_url\"${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export https_proxy=\"$proxy_url\"${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}export no_proxy=\"localhost,127.0.0.1,::1\"${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}EOF${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}source ~/.bashrc${C_RESET}"
-    printf "${C_CYAN}║${C_RESET}  %-62s ${C_CYAN}║${C_RESET}\n" ""
-    echo -e "${C_CYAN}║${C_RESET}  ${C_GREEN}# 测试代理连接${C_RESET}                                              ${C_CYAN}║${C_RESET}"
-    echo -e "${C_CYAN}║${C_RESET}  ${C_YELLOW}curl -I -x \"$proxy_url\" https://www.google.com${C_RESET}"
-    
-    echo -e "${C_CYAN}╚════════════════════════════════════════════════════════════════╝${C_RESET}"
-    
-    log_action "Squid proxy configured on port $port for $client_ip"
-    pause
-}
 
 
 net_dns() {
@@ -1628,14 +1300,9 @@ menu_net() {
     fix_terminal
     while true; do
         print_title "网络管理工具"
-        echo -e "${C_CYAN}--- 通用功能 ---${C_RESET}"
         echo "1. DNS 配置"
         echo "2. IPv4/IPv6 优先级"
         echo "3. iPerf3 测速"
-        echo -e "\n${C_CYAN}--- 客户端功能 (Only-IPv6 机器用) ---${C_RESET}"
-        echo "4. 配置系统级代理 (连接服务端)"
-        echo -e "\n${C_CYAN}--- 服务端功能 (双栈机器用) ---${C_RESET}"
-        echo "5. 搭建 Squid 代理服务端"
         echo ""
         echo "0. 返回"
         echo ""
@@ -1657,8 +1324,6 @@ menu_net() {
                 log_action "IP priority changed"
                 pause ;;
             3) net_iperf3 ;;
-            4) net_proxy ;;
-            5) net_setup_squid ;;
             0|q) break ;;
             *) print_error "无效" ;;
         esac
@@ -2790,18 +2455,158 @@ menu_docker() {
 
 show_main_menu() {
     fix_terminal
+    # ========== 系统信息常驻显示 ==========
+    clear
+    echo "================================================================================"
+    echo -e "${C_CYAN}                        server-manage ${VERSION}${C_RESET}"
+    echo "================================================================================"
+    echo "╔════════════════════════════════════════════════════════════════════════════╗"
+    echo "║                            系统信息总览                                    ║"
+    echo "╚════════════════════════════════════════════════════════════════════════════╝"
+    
+    # 系统基础
+    echo -e "${C_YELLOW}【系统基础】${C_RESET}"
+    echo "  主机名      : $(hostname)"
+    echo "  操作系统    : $(get_os_info)"
+    echo "  内核版本    : $(uname -r)"
+    echo "  系统架构    : $(uname -m)"
+    local uptime_info=$(uptime -p 2>/dev/null | sed 's/up //' || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')
+    echo "  运行时间    : ${uptime_info}"
+    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    echo "  系统负载    : ${load_avg} (CPU核心: $(nproc))"
+    
+    # CPU 信息
+    echo ""
+    echo -e "${C_YELLOW}【CPU 信息】${C_RESET}"
+    local cpu_model=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
+    local cpu_cores=$(nproc)
+    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+    echo "  型号        : ${cpu_model}"
+    echo "  核心数      : ${cpu_cores}"
+    echo "  当前占用    : ${cpu_usage}%"
+    
+    # 内存信息
+    echo ""
+    echo -e "${C_YELLOW}【内存信息】${C_RESET}"
+    local mem_total=$(free -h | awk '/^Mem:/ {print $2}')
+    local mem_used=$(free -h | awk '/^Mem:/ {print $3}')
+    local mem_percent=$(free | awk '/^Mem:/ {printf "%.1f", $3/$2*100}')
+    local mem_avail=$(free -h | awk '/^Mem:/ {print $7}')
+    local swap_total=$(free -h | awk '/^Swap:/ {print $2}')
+    local swap_used=$(free -h | awk '/^Swap:/ {print $3}')
+    echo "  总内存      : ${mem_total}"
+    echo "  已使用      : ${mem_used} (${mem_percent}%)"
+    echo "  可用        : ${mem_avail}"
+    echo "  Swap总量    : ${swap_total}"
+    echo "  Swap已用    : ${swap_used}"
+    
+    # 磁盘信息
+    echo ""
+    echo -e "${C_YELLOW}【磁盘信息】${C_RESET}"
+    local disk_used=$(df -h / | awk 'NR==2 {print $3}')
+    local disk_total=$(df -h / | awk 'NR==2 {print $2}')
+    local disk_percent=$(df -h / | awk 'NR==2 {print $5}')
+    local disk_avail=$(df -h / | awk 'NR==2 {print $4}')
+    local inode_percent=$(df -i / | awk 'NR==2 {print $5}')
+    echo "  根分区(/)   : ${disk_used} / ${disk_total} (已用 ${disk_percent})"
+    echo "  可用空间    : ${disk_avail}"
+    echo "  Inode使用   : ${inode_percent}"
+    
+    # 网络信息
+    echo ""
+    echo -e "${C_YELLOW}【网络信息】${C_RESET}"
+    local main_if=$(ip route | grep default | awk '{print $5}' | head -1)
+    local local_ipv4=$(ip -4 addr show ${main_if} 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
+    local public_ipv4=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "获取失败")
+    local local_ipv6=$(ip -6 addr show ${main_if} 2>/dev/null | grep "inet6.*scope global" | awk '{print $2}' | cut -d/ -f1 | head -1 || echo "未配置")
+    local public_ipv6=$(curl -s --max-time 3 -6 https://api64.ipify.org 2>/dev/null || echo "未配置")
+    local mac_addr=$(ip link show ${main_if} 2>/dev/null | grep link/ether | awk '{print $2}')
+    local gateway=$(ip route | grep default | awk '{print $3}' | head -1)
+    echo "  主网卡      : ${main_if:-未检测到}"
+    echo "  内网IPv4    : ${local_ipv4:-未配置}"
+    echo "  公网IPv4    : ${public_ipv4}"
+    echo "  内网IPv6    : ${local_ipv6}"
+    echo "  公网IPv6    : ${public_ipv6}"
+    echo "  MAC地址     : ${mac_addr:-未检测到}"
+    echo "  默认网关    : ${gateway:-未配置}"
+    
+    # DNS 配置
+    echo ""
+    echo -e "${C_YELLOW}【DNS 配置】${C_RESET}"
+    local dns_servers=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ', ' | sed 's/,$//')
+    local dns_search=$(grep "^search" /etc/resolv.conf 2>/dev/null | cut -d' ' -f2-)
+    local dns_test=$(dig +short google.com @8.8.8.8 2>/dev/null | head -1 | grep -q "^[0-9]" && echo "正常 (google.com → $(dig +short google.com 2>/dev/null | head -1))" || echo "失败")
+    echo "  DNS服务器   : ${dns_servers:-未配置}"
+    echo "  搜索域      : ${dns_search:-未配置}"
+    echo "  DNS解析测试 : ${dns_test}"
+    
+    # 网络连接
+    echo ""
+    echo -e "${C_YELLOW}【网络连接】${C_RESET}"
+    local net_conn=$(ss -tn state established 2>/dev/null | grep -v "^State" | wc -l)
+    local listen_ports=$(ss -tuln 2>/dev/null | grep LISTEN | wc -l)
+    echo "  已建立连接  : ${net_conn}"
+    echo "  监听端口数  : ${listen_ports}"
+    
+    # 安全状态
+    echo ""
+    echo -e "${C_YELLOW}【安全状态】${C_RESET}"
+    local ssh_port=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
+    local ufw_status=$(command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && echo "已启用" || echo "未启用")
+    local f2b_status=$(systemctl is-active fail2ban &>/dev/null && echo "运行中 (已封禁: $(fail2ban-client status 2>/dev/null | grep "Banned" | awk '{sum+=$NF} END {print sum+0}') IP)" || echo "未运行")
+    echo "  SSH端口     : ${ssh_port}"
+    echo "  UFW防火墙   : ${ufw_status}"
+    echo "  Fail2Ban    : ${f2b_status}"
+    
+    # 服务状态
+    echo ""
+    echo -e "${C_YELLOW}【服务状态】${C_RESET}"
+    local nginx_status=$(systemctl is-active nginx &>/dev/null && echo "运行中" || echo "未运行")
+    echo "  Nginx       : ${nginx_status}"
+    
+    # 登录信息
+    echo ""
+    echo -e "${C_YELLOW}【登录信息】${C_RESET}"
+    # 获取登录信息
+    local last_login_info="无记录"
+    if command -v last >/dev/null 2>&1; then
+        local raw_output=$(last -n 10 -a -w 2>/dev/null)
+        local valid_line=$(echo "$raw_output" | grep -E "^[a-zA-Z]" | grep -v "wtmp begins" | grep -v "^reboot" | head -1)
+        
+        if [[ -n "$valid_line" ]]; then
+            local login_user=$(echo "$valid_line" | awk '{print $1}')
+            local login_ip=$(echo "$valid_line" | awk '{print $NF}')
+            local login_time=$(echo "$valid_line" | awk '{print $4, $5, $6, $7}' | sed 's/still.*//' | sed 's/ - .*//' | xargs)
+            
+            if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
+                if [[ "$login_ip" == *:* ]]; then
+                    local display_ip=$(echo "$login_ip" | cut -d: -f1-4)"::"
+                    local location=$(get_ip_location "$login_ip")
+                    last_login_info="${login_user} 从 ${display_ip} (${location}) 于 ${login_time}"
+                else
+                    last_login_info="${login_user} 从 ${login_ip} 于 ${login_time}"
+                    local location=$(get_ip_location "$login_ip")
+                fi
+            else
+                last_login_info="${login_user} 于 ${login_time}"
+            fi
+        fi
+    fi
+    
+    local current_users=$(who | wc -l)
+    echo "  最近登录    : ${last_login_info:-无记录}"
+    echo "  当前用户数  : ${current_users}"
+    
+    echo ""
+    echo "================================================================================"
+    # ========== 系统信息显示结束 ==========
+    
     print_title "$SCRIPT_NAME v$VERSION"
     
-    echo -e "${C_CYAN}=== 系统信息 ===${C_RESET}"
-    echo "主机名: $(hostname)"
-    echo "系统: $(get_os_info)"
-    echo "内核: $(uname -r)"
     
     local uptime_info=$(uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')
-    echo "运行时间: $uptime_info"
     
     local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-    echo "负载: $load_avg"
     
     local mem_info=$(free -m | awk '/^Mem:/ {
         used=$3; total=$2
@@ -2814,11 +2619,10 @@ show_main_menu() {
     }')
     
     local disk_info=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
-    echo "磁盘: $disk_info"
     
     echo ""
     echo -e "${C_CYAN}=== 功能菜单 ===${C_RESET}"
-    echo "1.  系统更新与软件包管理"
+    echo "1.  基础依赖安装"
     echo "2.  UFW 防火墙管理"
     echo "3.  Fail2ban 入侵防御"
     echo "4.  SSH 安全配置"
@@ -2827,55 +2631,9 @@ show_main_menu() {
     echo "7.  Web 服务 (SSL + Nginx)"
     echo "8.  Docker 管理"
     echo "9.  查看操作日志"
-    echo "10. 关于脚本"
     echo ""
     echo "0.  退出脚本"
     echo ""
-}
-
-show_about() {
-    print_title "关于 $SCRIPT_NAME"
-    cat << 'EOF'
-┌─────────────────────────────────────────────────────────────┐
-│  VPS 一键管理脚本                                           │
-│  Version: 1.0.0                                             │
-│  Author: Claude (Anthropic)                                 │
-│  License: MIT                                               │
-├─────────────────────────────────────────────────────────────┤
-│  功能特性:                                                  │
-│  • 系统更新与软件包管理                                     │
-│  • UFW 防火墙智能配置                                       │
-│  • Fail2ban 入侵防御                                        │
-│  • SSH 安全加固 (端口/密钥/禁用Root)                        │
-│  • 系统优化 (BBR/Swap/时区/清理)                            │
-│  • 网络工具 (DNS/系统代理/Squid/iPerf3)                     │
-│  • Web 服务 (Cloudflare DNS + SSL + Nginx 反代)            │
-│  • Docker 完整管理                                          │
-│  • 原子化文件写入 (防止配置损坏)                            │
-│  • 详细操作日志记录                                         │
-├─────────────────────────────────────────────────────────────┤
-│  适用场景:                                                  │
-│  • IPv6-only VPS 配置代理访问 GitHub/Docker Hub            │
-│  • 双栈 VPS 搭建 Squid 代理服务端                           │
-│  • 自动化 SSL 证书申请与续签                                │
-│  • 3x-ui 面板证书自动部署                                   │
-│  • 生产环境服务器安全加固                                   │
-├─────────────────────────────────────────────────────────────┤
-│  使用建议:                                                  │
-│  1. 首次使用建议先执行 "系统更新"                           │
-│  2. 修改 SSH 端口后请先测试新端口连接                       │
-│  3. 配置防火墙前确保 SSH 端口已放行                         │
-│  4. 重要操作前脚本会自动备份配置文件                        │
-│  5. 所有操作均记录在 /var/log/vps-manager.log              │
-├─────────────────────────────────────────────────────────────┤
-│  技术支持:                                                  │
-│  • 问题反馈: 请提供操作日志和系统信息                       │
-│  • 日志路径: /var/log/vps-manager.log                      │
-│  • 配置目录: /root/.vps-manager/                            │
-└─────────────────────────────────────────────────────────────┘
-EOF
-    echo ""
-    pause
 }
 
 main() {
@@ -2906,7 +2664,6 @@ main() {
                 fi
                 pause
                 ;;
-            10) show_about ;;
             0|q|Q)
                 echo ""
                 print_success "感谢使用 $SCRIPT_NAME！"
