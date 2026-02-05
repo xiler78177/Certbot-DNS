@@ -114,6 +114,164 @@ get_ip_location() {
     echo "查询失败"
 }
 
+show_compact_sysinfo() {
+    local hostname=$(hostname)
+    local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
+    local kernel=$(uname -r)
+    local arch=$(uname -m)
+    
+    local cpu_model=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
+    local cpu_cores=$(nproc)
+    local cpu_freq=$(awk '/MHz/ {printf "%.1f GHz", $4/1000; exit}' /proc/cpuinfo 2>/dev/null || echo "N/A")
+    
+    local cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){u1=u; t1=t;} else printf "%.0f%%", (($2+$4-u1) * 100 / (t-t1))}' \
+        <(grep 'cpu ' /proc/stat) <(sleep 0.5; grep 'cpu ' /proc/stat) 2>/dev/null || echo "0%")
+    
+    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+    
+    local tcp_conn=$(ss -tn state established 2>/dev/null | grep -v "^State" | wc -l)
+    local udp_conn=$(ss -un 2>/dev/null | grep -v "^State" | wc -l)
+    
+    local mem_used=$(free -m | awk '/^Mem:/ {print $3}')
+    local mem_total=$(free -m | awk '/^Mem:/ {print $2}')
+    local mem_percent=$(awk "BEGIN {printf \"%.2f\", ($mem_used/$mem_total)*100}")
+    
+    local swap_used=$(free -m | awk '/^Swap:/ {print $3}')
+    local swap_total=$(free -m | awk '/^Swap:/ {print $2}')
+    local swap_percent=0
+    [[ $swap_total -gt 0 ]] && swap_percent=$(awk "BEGIN {printf \"%.0f\", ($swap_used/$swap_total)*100}")
+    
+    local disk_used=$(df -h / | awk 'NR==2 {print $3}')
+    local disk_total=$(df -h / | awk 'NR==2 {print $2}')
+    local disk_percent=$(df -h / | awk 'NR==2 {print $5}')
+    
+    local main_if=$(ip route | grep default | awk '{print $5}' | head -1)
+    [[ -z "$main_if" ]] && main_if=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -1)
+    
+    local rx_total="0.00G" tx_total="0.00G"
+    if [[ -n "$main_if" && -f "/proc/net/dev" ]]; then
+        local dev_stats=$(grep "$main_if:" /proc/net/dev | awk '{print $2, $10}')
+        if [[ -n "$dev_stats" ]]; then
+            rx_total=$(echo "$dev_stats" | awk '{printf "%.2fG", $1/1024/1024/1024}')
+            tx_total=$(echo "$dev_stats" | awk '{printf "%.2fG", $2/1024/1024/1024}')
+        fi
+    fi
+    
+    local tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    local qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    
+    local public_ipv4=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "N/A")
+    local public_ipv6=$(curl -s --max-time 3 -6 https://api64.ipify.org 2>/dev/null || echo "未配置")
+    
+    local ipinfo_json=$(curl -s --max-time 3 https://ipinfo.io/json 2>/dev/null || echo "{}")
+    local isp=$(echo "$ipinfo_json" | jq -r '.org // "N/A"' 2>/dev/null || echo "N/A")
+    local location=$(echo "$ipinfo_json" | jq -r '"\(.country) \(.city)"' 2>/dev/null | xargs || echo "N/A")
+    
+    local dns_servers=$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null | xargs)
+    
+    local timezone="UTC"
+    command -v timedatectl >/dev/null 2>&1 && timezone=$(timedatectl | grep "Time zone" | awk '{print $3}' || echo "UTC")
+    local current_time=$(date "+%Y-%m-%d %I:%M %p")
+    
+    local runtime=$(awk -F. '{
+        run_days=int($1 / 86400)
+        run_hours=int(($1 % 86400) / 3600)
+        run_minutes=int(($1 % 3600) / 60)
+        if (run_days > 0) printf("%d天 ", run_days)
+        if (run_hours > 0) printf("%d时 ", run_hours)
+        printf("%d分", run_minutes)
+    }' /proc/uptime)
+    
+    local last_login_info="无记录"
+    if command -v last >/dev/null 2>&1; then
+        local raw_output=$(last -n 10 -a -w 2>/dev/null)
+        local valid_line=$(echo "$raw_output" | grep -E "^[a-zA-Z]" | grep -v "wtmp begins" | grep -v "^reboot" | head -1)
+        
+        if [[ -n "$valid_line" ]]; then
+            local login_user=$(echo "$valid_line" | awk '{print $1}')
+            local login_ip=$(echo "$valid_line" | awk '{print $NF}')
+            local login_time=$(echo "$valid_line" | awk '{print $4, $5, $6, $7}' | sed 's/still.*//' | sed 's/ - .*//' | xargs)
+            
+            if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
+                if [[ "$login_ip" == *:* ]]; then
+                    local display_ip=$(echo "$login_ip" | cut -d: -f1-4)"::"
+                    local ip_location=$(get_ip_location "$login_ip")
+                    last_login_info="${login_user} 从 ${display_ip} (${ip_location}) 于 ${login_time}"
+                else
+                    local ip_location=$(get_ip_location "$login_ip")
+                    last_login_info="${login_user} 从 ${login_ip} (${ip_location}) 于 ${login_time}"
+                fi
+            else
+                last_login_info="${login_user} 于 ${login_time}"
+            fi
+        fi
+    fi
+    
+    local current_users=$(who | wc -l)
+    
+    local ssh_port=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
+    local ufw_status="未安装"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_status=$(ufw status 2>/dev/null | grep -q "Status: active" && echo "已启用" || echo "未启用")
+    fi
+    
+    local f2b_status="未安装"
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        if systemctl is-active fail2ban &>/dev/null; then
+            local banned_count=$(fail2ban-client status 2>/dev/null | grep "Banned" | awk '{sum+=$NF} END {print sum+0}')
+            f2b_status="运行中 (已封禁: ${banned_count} IP)"
+        else
+            f2b_status="未运行"
+        fi
+    fi
+    
+    local nginx_status="未安装"
+    if command -v nginx >/dev/null 2>&1; then
+        nginx_status=$(systemctl is-active nginx &>/dev/null && echo "运行中" || echo "未运行")
+    fi
+    
+    echo -e "${C_CYAN}系统信息查询${C_RESET}"
+    echo "-------------"
+    printf "%-16s %s\n" "主机名:" "$hostname"
+    printf "%-16s %s\n" "系统版本:" "$os_info"
+    printf "%-16s %s\n" "Linux版本:" "$kernel"
+    echo "-------------"
+    printf "%-16s %s\n" "CPU架构:" "$arch"
+    printf "%-16s %s\n" "CPU型号:" "$cpu_model"
+    printf "%-16s %s\n" "CPU核心数:" "$cpu_cores"
+    printf "%-16s %s\n" "CPU频率:" "$cpu_freq"
+    echo "-------------"
+    printf "%-16s %s\n" "CPU占用:" "$cpu_usage"
+    printf "%-16s %s\n" "系统负载:" "$load_avg"
+    printf "%-16s %s|%s\n" "TCP|UDP连接数:" "$tcp_conn" "$udp_conn"
+    printf "%-16s %s/%sM (%.2f%%)\n" "物理内存:" "$mem_used" "$mem_total" "$mem_percent"
+    printf "%-16s %sM/%sM (%s%%)\n" "虚拟内存:" "$swap_used" "$swap_total" "$swap_percent"
+    printf "%-16s %s/%s (%s)\n" "硬盘占用:" "$disk_used" "$disk_total" "$disk_percent"
+    echo "-------------"
+    printf "%-16s %s\n" "总接收:" "$rx_total"
+    printf "%-16s %s\n" "总发送:" "$tx_total"
+    echo "-------------"
+    printf "%-16s %s %s\n" "网络算法:" "$tcp_cc" "$qdisc"
+    echo "-------------"
+    printf "%-16s %s\n" "运营商:" "$isp"
+    printf "%-16s %s\n" "IPv4地址:" "$public_ipv4"
+    printf "%-16s %s\n" "IPv6地址:" "$public_ipv6"
+    printf "%-16s %s\n" "DNS地址:" "$dns_servers"
+    printf "%-16s %s\n" "地理位置:" "$location"
+    printf "%-16s %s %s\n" "系统时间:" "$timezone" "$current_time"
+    echo "-------------"
+    printf "%-16s %s\n" "运行时长:" "$runtime"
+    echo "-------------"
+    printf "%-16s %s\n" "最近登录:" "$last_login_info"
+    printf "%-16s %s\n" "当前用户数:" "$current_users"
+    echo "-------------"
+    printf "%-16s %s\n" "SSH端口:" "$ssh_port"
+    printf "%-16s %s\n" "UFW防火墙:" "$ufw_status"
+    printf "%-16s %s\n" "Fail2Ban:" "$f2b_status"
+    printf "%-16s %s\n" "Nginx状态:" "$nginx_status"
+}
+
+
     # 检查是否为交互式终端
     [[ -t 0 ]] || return 0
     
@@ -506,6 +664,71 @@ install_package() {
     return 0
 }
 
+
+
+# ==================== 基础依赖安装 ====================
+install_dependencies() {
+    print_title "基础依赖安装"
+    echo ""
+    print_info "正在检查并安装基础依赖..."
+    echo ""
+    
+    print_info "1/2 更新软件源..."
+    if apt-get update -qq 2>/dev/null; then
+        print_success "软件源更新完成"
+    else
+        print_error "软件源更新失败"
+        pause
+        return 1
+    fi
+    echo ""
+    
+    print_info "2/2 安装基础依赖包..."
+    local packages=("curl" "wget" "jq" "unzip" "openssl" "ca-certificates" "ufw" "fail2ban" "net-tools" "dnsutils")
+    local failed_packages=()
+    local installed_count=0
+    local already_installed=0
+    
+    for pkg in "${packages[@]}"; do
+        if dpkg -l | grep -q "^ii  $pkg "; then
+            echo "  ✓ $pkg (已安装)"
+            ((already_installed++))
+        else
+            echo -n "  → 正在安装 $pkg ... "
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1; then
+                echo "成功"
+                ((installed_count++))
+            else
+                echo "失败"
+                failed_packages+=("$pkg")
+            fi
+        fi
+    done
+    
+    echo ""
+    draw_line
+    if [ ${#failed_packages[@]} -eq 0 ]; then
+        print_success "基础依赖安装完成"
+        if [ $installed_count -gt 0 ]; then
+            echo "  新安装: $installed_count 个"
+        fi
+        if [ $already_installed -gt 0 ]; then
+            echo "  已存在: $already_installed 个"
+        fi
+        log_action "基础依赖安装" "成功 - 新装:$installed_count 已有:$already_installed"
+    else
+        print_warn "部分软件包安装失败"
+        echo "  成功: $installed_count 个"
+        echo "  失败: ${#failed_packages[@]} 个 (${failed_packages[*]})"
+        log_action "基础依赖安装" "部分失败 - 成功:$installed_count 失败:${failed_packages[*]}"
+    fi
+    draw_line
+    echo ""
+    
+    pause
+}
+
+
 auto_deps() {
     local deps="curl wget jq unzip openssl ca-certificates iproute2 net-tools procps"
     for p in $deps; do
@@ -565,103 +788,9 @@ get_public_ipv6() {
 
 sys_info() {
     print_title "系统状态查询"
-    
-    # 网络信息
-    local ip4=$(safe_curl https://api.ipify.org || echo "N/A")
-    local ip6=$(get_public_ipv6)  # 这里不会再触发错误
-    
-    local ipinfo_json=$(safe_curl https://ipinfo.io/json || echo "{}")
-    local country=$(echo "$ipinfo_json" | jq -r '.country // "N/A"' 2>/dev/null || echo "N/A")
-    local city=$(echo "$ipinfo_json" | jq -r '.city // "N/A"' 2>/dev/null || echo "N/A")
-    local isp=$(echo "$ipinfo_json" | jq -r '.org // "N/A"' 2>/dev/null || echo "N/A")
-
-    # 网卡统计
-    local net_dev=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n 1 || true)
-    [[ -z "$net_dev" ]] && net_dev=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -n 1 || true)
-
-    local rx_total="0" tx_total="0"
-    if [[ -n "$net_dev" && -f "/proc/net/dev" ]]; then
-        local dev_stats=$(grep "$net_dev:" /proc/net/dev | awk '{print $2, $10}')
-        if [[ -n "$dev_stats" ]]; then
-            rx_total=$(echo "$dev_stats" | awk '{printf "%.2fGB", $1/1024/1024/1024}')
-            tx_total=$(echo "$dev_stats" | awk '{printf "%.2fGB", $2/1024/1024/1024}')
-        fi
-    fi
-
-    # CPU 信息
-    local cpu_model=$(lscpu | awk -F': +' '/Model name:/ {print $2; exit}' || echo "Unknown")
-    local cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){u1=u; t1=t;} else printf "%.1f%%", (($2+$4-u1) * 100 / (t-t1))}' <(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat) || echo "0%")
-    local cpu_cores=$(nproc || echo "1")
-    local cpu_freq=$(awk '/MHz/ {printf "%.1f GHz", $4/1000; exit}' /proc/cpuinfo || echo "N/A")
-    local cpu_arch=$(uname -m)
-    
-    # 内存信息
-    local mem_line=$(free -m | grep Mem)
-    local mem_total=$(echo "$mem_line" | awk '{print $2}')
-    local mem_used=$(echo "$mem_line" | awk '{print $3}')
-    local mem_pct=0
-    [[ "$mem_total" -gt 0 ]] && mem_pct=$(( mem_used * 100 / mem_total ))
-    local mem_info="${mem_used}MB / ${mem_total}MB (${mem_pct}%)"
-    
-    local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dM/%dM (%d%%)", used, total, percentage}' || echo "N/A")
-    local disk_info=$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}' || echo "N/A")
-    
-    # 系统信息
-    local load=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}' || echo "N/A")
-    local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf || echo "N/A")
-    local hostname=$(uname -n)
-    local kernel_version=$(uname -r)
-    local congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
-    local queue_algorithm=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
-    local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"' || echo "Linux")
-    local current_time=$(date "+%Y-%m-%d %I:%M %p")
-    local runtime=$(awk -F. '{run_days=int($1 / 86400);run_hours=int(($1 % 86400) / 3600);run_minutes=int(($1 % 3600) / 60); if (run_days > 0) printf("%d天 ", run_days); if (run_hours > 0) printf("%d时 ", run_hours); printf("%d分\n", run_minutes)}' /proc/uptime || echo "N/A")
-    
-    local timezone="UTC"
-    command_exists timedatectl && timezone=$(timedatectl | grep "Time zone" | awk '{print $3}' || echo "UTC")
-
-    # 实时网速
-    print_info "正在测试实时网速 (采样 1 秒)..."
-    local rx1=0 tx1=0 rx2=0 tx2=0
-    if [[ -n "$net_dev" && -d "/sys/class/net/$net_dev" ]]; then
-        rx1=$(cat "/sys/class/net/$net_dev/statistics/rx_bytes")
-        tx1=$(cat "/sys/class/net/$net_dev/statistics/tx_bytes")
-        sleep 1
-        rx2=$(cat "/sys/class/net/$net_dev/statistics/rx_bytes")
-        tx2=$(cat "/sys/class/net/$net_dev/statistics/tx_bytes")
-    fi
-    local rx_speed=$(( (rx2 - rx1) / 1024 ))
-    local tx_speed=$(( (tx2 - tx1) / 1024 ))
-
-    # 输出
     echo ""
-    echo -e "${C_CYAN}--- 系统基础信息 ---${C_RESET}"
-    printf "${C_GRAY}%-12s${C_RESET} : ${C_YELLOW}%s${C_RESET}\n" "主机名" "$hostname"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "系统版本" "$os_info"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "内核版本" "$kernel_version"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "系统架构" "$cpu_arch"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "运行时长" "$runtime"
-    printf "${C_GRAY}%-12s${C_RESET} : %s %s\n" "当前时间" "$timezone" "$current_time"
-    
-    echo -e "\n${C_CYAN}--- 硬件资源状态 ---${C_RESET}"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "CPU 型号" "$cpu_model"
-    printf "${C_GRAY}%-12s${C_RESET} : %s 核心 / %s\n" "CPU 核心" "$cpu_cores" "$cpu_freq"
-    printf "${C_GRAY}%-12s${C_RESET} : ${C_YELLOW}%s${C_RESET}\n" "CPU 占用" "$cpu_usage"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "系统负载" "$load"
-    printf "${C_GRAY}%-12s${C_RESET} : ${C_YELLOW}%s${C_RESET}\n" "物理内存" "$mem_info"
-    printf "${C_GRAY}%-12s${C_RESET} : ${C_YELLOW}%s${C_RESET}\n" "虚拟内存" "$swap_info"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "硬盘占用" "$disk_info"
-    
-    echo -e "\n${C_CYAN}--- 网络连接状态 ---${C_RESET}"
-    printf "${C_GRAY}%-12s${C_RESET} : 下行 ${C_GREEN}%s KB/s${C_RESET} / 上行 ${C_BLUE}%s KB/s${C_RESET}\n" "实时网速" "$rx_speed" "$tx_speed"
-    printf "${C_GRAY}%-12s${C_RESET} : 总收 ${C_GREEN}%s${C_RESET} / 总发 ${C_BLUE}%s${C_RESET}\n" "累计流量" "$rx_total" "$tx_total"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "TCP 算法" "$congestion_algorithm $queue_algorithm"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "ISP 服务商" "$isp"
-    printf "${C_GRAY}%-12s${C_RESET} : %s %s\n" "地理位置" "$country" "$city"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "IPv4 地址" "$ip4"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "IPv6 地址" "$ip6"
-    printf "${C_GRAY}%-12s${C_RESET} : %s\n" "DNS 地址" "$dns_addresses"
-    
+    show_compact_sysinfo
+    echo ""
     pause
 }
 
@@ -2460,144 +2589,7 @@ show_main_menu() {
     echo "================================================================================"
     echo -e "${C_CYAN}                        server-manage ${VERSION}${C_RESET}"
     echo "================================================================================"
-    echo "╔════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                            系统信息总览                                    ║"
-    echo "╚════════════════════════════════════════════════════════════════════════════╝"
-    
-    # 系统基础
-    echo -e "${C_YELLOW}【系统基础】${C_RESET}"
-    echo "  主机名      : $(hostname)"
-    echo "  操作系统    : $(get_os_info)"
-    echo "  内核版本    : $(uname -r)"
-    echo "  系统架构    : $(uname -m)"
-    local uptime_info=$(uptime -p 2>/dev/null | sed 's/up //' || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')
-    echo "  运行时间    : ${uptime_info}"
-    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-    echo "  系统负载    : ${load_avg} (CPU核心: $(nproc))"
-    
-    # CPU 信息
-    echo ""
-    echo -e "${C_YELLOW}【CPU 信息】${C_RESET}"
-    local cpu_model=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
-    local cpu_cores=$(nproc)
-    local cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-    echo "  型号        : ${cpu_model}"
-    echo "  核心数      : ${cpu_cores}"
-    echo "  当前占用    : ${cpu_usage}%"
-    
-    # 内存信息
-    echo ""
-    echo -e "${C_YELLOW}【内存信息】${C_RESET}"
-    local mem_total=$(free -h | awk '/^Mem:/ {print $2}')
-    local mem_used=$(free -h | awk '/^Mem:/ {print $3}')
-    local mem_percent=$(free | awk '/^Mem:/ {printf "%.1f", $3/$2*100}')
-    local mem_avail=$(free -h | awk '/^Mem:/ {print $7}')
-    local swap_total=$(free -h | awk '/^Swap:/ {print $2}')
-    local swap_used=$(free -h | awk '/^Swap:/ {print $3}')
-    echo "  总内存      : ${mem_total}"
-    echo "  已使用      : ${mem_used} (${mem_percent}%)"
-    echo "  可用        : ${mem_avail}"
-    echo "  Swap总量    : ${swap_total}"
-    echo "  Swap已用    : ${swap_used}"
-    
-    # 磁盘信息
-    echo ""
-    echo -e "${C_YELLOW}【磁盘信息】${C_RESET}"
-    local disk_used=$(df -h / | awk 'NR==2 {print $3}')
-    local disk_total=$(df -h / | awk 'NR==2 {print $2}')
-    local disk_percent=$(df -h / | awk 'NR==2 {print $5}')
-    local disk_avail=$(df -h / | awk 'NR==2 {print $4}')
-    local inode_percent=$(df -i / | awk 'NR==2 {print $5}')
-    echo "  根分区(/)   : ${disk_used} / ${disk_total} (已用 ${disk_percent})"
-    echo "  可用空间    : ${disk_avail}"
-    echo "  Inode使用   : ${inode_percent}"
-    
-    # 网络信息
-    echo ""
-    echo -e "${C_YELLOW}【网络信息】${C_RESET}"
-    local main_if=$(ip route | grep default | awk '{print $5}' | head -1)
-    local local_ipv4=$(ip -4 addr show ${main_if} 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -1)
-    local public_ipv4=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "获取失败")
-    local local_ipv6=$(ip -6 addr show ${main_if} 2>/dev/null | grep "inet6.*scope global" | awk '{print $2}' | cut -d/ -f1 | head -1 || echo "未配置")
-    local public_ipv6=$(curl -s --max-time 3 -6 https://api64.ipify.org 2>/dev/null || echo "未配置")
-    local mac_addr=$(ip link show ${main_if} 2>/dev/null | grep link/ether | awk '{print $2}')
-    local gateway=$(ip route | grep default | awk '{print $3}' | head -1)
-    echo "  主网卡      : ${main_if:-未检测到}"
-    echo "  内网IPv4    : ${local_ipv4:-未配置}"
-    echo "  公网IPv4    : ${public_ipv4}"
-    echo "  内网IPv6    : ${local_ipv6}"
-    echo "  公网IPv6    : ${public_ipv6}"
-    echo "  MAC地址     : ${mac_addr:-未检测到}"
-    echo "  默认网关    : ${gateway:-未配置}"
-    
-    # DNS 配置
-    echo ""
-    echo -e "${C_YELLOW}【DNS 配置】${C_RESET}"
-    local dns_servers=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ', ' | sed 's/,$//')
-    local dns_search=$(grep "^search" /etc/resolv.conf 2>/dev/null | cut -d' ' -f2-)
-    local dns_test=$(dig +short google.com @8.8.8.8 2>/dev/null | head -1 | grep -q "^[0-9]" && echo "正常 (google.com → $(dig +short google.com 2>/dev/null | head -1))" || echo "失败")
-    echo "  DNS服务器   : ${dns_servers:-未配置}"
-    echo "  搜索域      : ${dns_search:-未配置}"
-    echo "  DNS解析测试 : ${dns_test}"
-    
-    # 网络连接
-    echo ""
-    echo -e "${C_YELLOW}【网络连接】${C_RESET}"
-    local net_conn=$(ss -tn state established 2>/dev/null | grep -v "^State" | wc -l)
-    local listen_ports=$(ss -tuln 2>/dev/null | grep LISTEN | wc -l)
-    echo "  已建立连接  : ${net_conn}"
-    echo "  监听端口数  : ${listen_ports}"
-    
-    # 安全状态
-    echo ""
-    echo -e "${C_YELLOW}【安全状态】${C_RESET}"
-    local ssh_port=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-    local ufw_status=$(command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && echo "已启用" || echo "未启用")
-    local f2b_status=$(systemctl is-active fail2ban &>/dev/null && echo "运行中 (已封禁: $(fail2ban-client status 2>/dev/null | grep "Banned" | awk '{sum+=$NF} END {print sum+0}') IP)" || echo "未运行")
-    echo "  SSH端口     : ${ssh_port}"
-    echo "  UFW防火墙   : ${ufw_status}"
-    echo "  Fail2Ban    : ${f2b_status}"
-    
-    # 服务状态
-    echo ""
-    echo -e "${C_YELLOW}【服务状态】${C_RESET}"
-    local nginx_status=$(systemctl is-active nginx &>/dev/null && echo "运行中" || echo "未运行")
-    echo "  Nginx       : ${nginx_status}"
-    
-    # 登录信息
-    echo ""
-    echo -e "${C_YELLOW}【登录信息】${C_RESET}"
-    # 获取登录信息
-    local last_login_info="无记录"
-    if command -v last >/dev/null 2>&1; then
-        local raw_output=$(last -n 10 -a -w 2>/dev/null)
-        local valid_line=$(echo "$raw_output" | grep -E "^[a-zA-Z]" | grep -v "wtmp begins" | grep -v "^reboot" | head -1)
-        
-        if [[ -n "$valid_line" ]]; then
-            local login_user=$(echo "$valid_line" | awk '{print $1}')
-            local login_ip=$(echo "$valid_line" | awk '{print $NF}')
-            local login_time=$(echo "$valid_line" | awk '{print $4, $5, $6, $7}' | sed 's/still.*//' | sed 's/ - .*//' | xargs)
-            
-            if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
-                if [[ "$login_ip" == *:* ]]; then
-                    local display_ip=$(echo "$login_ip" | cut -d: -f1-4)"::"
-                    local location=$(get_ip_location "$login_ip")
-                    last_login_info="${login_user} 从 ${display_ip} (${location}) 于 ${login_time}"
-                else
-                    last_login_info="${login_user} 从 ${login_ip} 于 ${login_time}"
-                    local location=$(get_ip_location "$login_ip")
-                fi
-            else
-                last_login_info="${login_user} 于 ${login_time}"
-            fi
-        fi
-    fi
-    
-    local current_users=$(who | wc -l)
-    echo "  最近登录    : ${last_login_info:-无记录}"
-    echo "  当前用户数  : ${current_users}"
-    
-    echo ""
+    show_compact_sysinfo
     echo "================================================================================"
     # ========== 系统信息显示结束 ==========
     
