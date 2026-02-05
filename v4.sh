@@ -756,33 +756,42 @@ reinstall_deps() {
 get_public_ipv6() {
     local ipv6=""
     
-    # 方法 1: api64.ipify.org (强制 IPv6)
-    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null || true)
+    # 临时禁用错误追踪
+    set +e
+    
+    # 方法 1: api64.ipify.org
+    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
     if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
+        set -e
         echo "$ipv6"
         return 0
     fi
     
     # 方法 2: ifconfig.co
-    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://ifconfig.co 2>/dev/null || true)
+    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://ifconfig.co 2>/dev/null)
     if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
+        set -e
         echo "$ipv6"
         return 0
     fi
     
     # 方法 3: 本地接口
     if command -v ip >/dev/null 2>&1; then
-        ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+' | grep -v '^fe80:' | head -n1 || true)
+        ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+' | grep -v '^fe80:' | head -n1)
         if [[ -n "$ipv6" ]]; then
+            set -e
             echo "$ipv6"
             return 0
         fi
     fi
     
-    # 所有方法都失败，返回提示信息（不触发错误）
+    # 恢复错误追踪
+    set -e
+    
     echo "未检测到"
-    return 0  # 改为返回 0，避免触发 ERR trap
+    return 0
 }
+
 
 
 
@@ -1186,6 +1195,7 @@ opt_cleanup() {
 opt_hostname() {
     print_title "修改主机名"
     echo "当前: $(hostname)"
+    read -e -r -p "请输入新主机名: " new_name
     [[ -z "$new_name" ]] && return
     
     if [[ ! "$new_name" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
@@ -2034,6 +2044,7 @@ server {
             else
                 print_error "Nginx 配置测试失败！"
                 rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
+                rm -f "$NGINX_CONF_PATH"
                 pause; return
             fi
             
