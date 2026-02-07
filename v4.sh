@@ -245,7 +245,7 @@ show_compact_sysinfo() {
         if [[ -n "$valid_line" ]]; then
             local login_user=$(echo "$valid_line" | awk '{print $1}')
             local login_ip=$(echo "$valid_line" | awk '{print $NF}')
-            local login_time=$(echo "$valid_line" | awk '{print $4, $5, $6, $7}' | sed 's/still.*//' | sed 's/ - .*//' | xargs)
+            local login_time=$(echo "$valid_line" | awk '{print $4, $5, $6, $7}' | sed 's/still.*//' | xargs)
             
             if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
                 if [[ "$login_ip" == *:* ]]; then
@@ -443,6 +443,27 @@ show_dual_column_sysinfo() {
     # 服务状态行
     printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}]\n" \
         "$ufw_st" "$f2b_st" "$nginx_st" "$docker_st"
+    
+        # 上次登录信息
+    local last_login="无记录"
+    if command -v last >/dev/null 2>&1; then
+        local login_line=$(last -n 10 -a -w 2>/dev/null | grep -E "^[a-zA-Z]" | grep -v -E "wtmp begins|^reboot" | head -1)
+        if [[ -n "$login_line" ]]; then
+            local login_user=$(echo "$login_line" | awk '{print $1}')
+            local login_ip=$(echo "$login_line" | awk '{print $NF}')
+            local login_time=$(echo "$login_line" | awk '{print $4, $5, $6}')
+            
+            if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
+                local ip_loc=$(get_ip_location "$login_ip")
+                last_login="${login_user}@${login_ip} (${ip_loc}) ${login_time}"
+            else
+                last_login="${login_user} ${login_time}"
+            fi
+        fi
+    fi
+    
+    printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+    printf " ${C_CYAN}%-8s${C_RESET}%s\n" "登录:" "${last_login:0:65}"
 }
 # ============================================
 # 终端修复函数
