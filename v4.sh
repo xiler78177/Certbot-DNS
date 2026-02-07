@@ -642,6 +642,9 @@ cleanup_temp_files() {
 
 handle_error() {
     local exit_code=$?
+    # 忽略 curl 错误: 7=连接失败, 28=超时 (IPv6不通时常见)
+    [[ $exit_code -eq 7 || $exit_code -eq 28 ]] && return 0
+    
     cleanup_temp_files
     print_error "脚本异常退出 (Code: $exit_code)"
     log_action "Script crashed with exit code $exit_code" "ERROR"
