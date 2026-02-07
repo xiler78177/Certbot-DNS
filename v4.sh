@@ -398,7 +398,7 @@ show_dual_column_sysinfo() {
     [[ -z "$ssh_port" ]] && ssh_port="22"
     
     # 服务状态 (简化符号)
-    local ufw_st="○"; command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active" && ufw_st="●"
+    local ufw_st="○"; command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && ufw_st="●"
     local f2b_st="○"; systemctl is-active fail2ban &>/dev/null && f2b_st="●"
     local nginx_st="○"; systemctl is-active nginx &>/dev/null && nginx_st="●"
     local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
