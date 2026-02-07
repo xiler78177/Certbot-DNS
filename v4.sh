@@ -2059,17 +2059,13 @@ web_cf_dns_update() {
     }
 
     print_info "正在探测本机公网 IP..."
-    local ipv4=$(get_public_ip "4")
-    local ipv6=$(get_public_ip "6")
-    
-    if [[ -z "$ipv4" && -z "$ipv6" ]]; then
-        print_error "无法获取本机 IP，请检查网络。"
-        pause; return
-    fi
-    
+    local ipv4 ipv6
+    ipv4=$(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null) || ipv4=""
+    ipv6=$(curl -6 -s --max-time 5 ifconfig.me 2>/dev/null) || ipv6=""
+
     echo "----------------------------------------"
-    [[ -n "$ipv4" ]] && echo -e "IPv4: ${C_GREEN}$ipv4${C_RESET}"
-    [[ -n "$ipv6" ]] && echo -e "IPv6: ${C_GREEN}$ipv6${C_RESET}"
+    echo "IPv4: ${ipv4:-[✗] 未检测到}"
+    echo "IPv6: ${ipv6:-[✗] 未检测到}"
     echo "----------------------------------------"
     
     echo "1. 仅解析 IPv4 (A)"
