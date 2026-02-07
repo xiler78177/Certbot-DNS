@@ -2123,12 +2123,18 @@ web_cf_dns_update() {
         pause; return
     fi
     
+    # 询问是否开启 CDN 代理
+    echo ""
+    read -e -r -p "是否开启 Cloudflare 代理 (小云朵)? [y/N]: " proxy_choice
+    local proxied="false"
+    [[ "${proxy_choice,,}" == "y" ]] && proxied="true"
+    
     update_record() {
         local type=$1
         local ip=$2
         [[ -z "$ip" ]] && return
         
-        print_info "处理 $type 记录 -> $ip"
+        print_info "处理 $type 记录 -> $ip (代理: $proxied)"
         local records=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?type=$type&name=$DOMAIN" \
             -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
         
@@ -2139,7 +2145,7 @@ web_cf_dns_update() {
         if [[ "$record_id" != "null" && -n "$record_id" ]]; then
             local resp=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records/$record_id" \
                 -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-                --data "{\"type\":\"$type\",\"name\":\"$DOMAIN\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":false}")
+                --data "{\"type\":\"$type\",\"name\":\"$DOMAIN\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
             if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
                 print_success "更新成功"
             else
@@ -2148,7 +2154,7 @@ web_cf_dns_update() {
         else
             local resp=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records" \
                 -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-                --data "{\"type\":\"$type\",\"name\":\"$DOMAIN\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":false}")
+                --data "{\"type\":\"$type\",\"name\":\"$DOMAIN\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
             if [[ "$(echo "$resp" | jq -r '.success')" == "true" ]]; then
                 print_success "创建成功"
             else
