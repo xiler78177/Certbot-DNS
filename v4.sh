@@ -1921,11 +1921,17 @@ net_iperf3() {
 
 net_dns() {
     print_title "DNS 配置"
-    echo "当前 DNS:"
-    cat /etc/resolv.conf
+    
+    echo -e "${C_CYAN}当前 DNS:${C_RESET}"
+    if is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        resolvectl status 2>/dev/null | grep -E "DNS Servers|DNS Server" | head -5 || cat /etc/resolv.conf
+    else
+        cat /etc/resolv.conf
+    fi
+    
     echo -e "\n${C_YELLOW}输入新 DNS IP (空格隔开)，输入 0 取消${C_RESET}"
     read -e -r -p "DNS: " dns
-    if [[ -z "$dns" || "$dns" == "0" ]]; then return; fi
+    [[ -z "$dns" || "$dns" == "0" ]] && return
     
     for ip in $dns; do
         if ! validate_ip "$ip"; then
@@ -1934,17 +1940,17 @@ net_dns() {
         fi
     done
     
-    local res_conf="/etc/systemd/resolved.conf"
     if is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-        if ! grep -q "^[[:space:]]*\[Resolve\]" "$res_conf"; then
-            echo "" >> "$res_conf"
-            echo "[Resolve]" >> "$res_conf"
-        fi
-        sed -i '/^[[:space:]]*DNS=/d' "$res_conf"
-        sed -i "0,/^[[:space:]]*\[Resolve\]/s/^[[:space:]]*\[Resolve\]/&\nDNS=$dns/" "$res_conf"
-        systemctl restart systemd-resolved 2>/dev/null || true
+        local res_conf="/etc/systemd/resolved.conf"
+        grep -q '^\[Resolve\]' "$res_conf" || echo -e "\n[Resolve]" >> "$res_conf"
+        sed -i '/^DNS=/d' "$res_conf"
+        sed -i '/^\[Resolve\]/a DNS='"$dns" "$res_conf"
+        systemctl restart systemd-resolved
     else
-        echo "nameserver $dns" > /etc/resolv.conf
+        > /etc/resolv.conf
+        for ip in $dns; do
+            echo "nameserver $ip" >> /etc/resolv.conf
+        done
     fi
     
     print_success "DNS 已修改。"
