@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 # ==============================================================================
@@ -19,6 +20,8 @@ readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
+readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
+readonly CACHE_TTL=300  # 缓存有效期(秒)
 
 # 错误码
 readonly E_SUCCESS=0
@@ -35,6 +38,8 @@ readonly C_YELLOW='\033[1;33m'
 readonly C_BLUE='\033[0;34m'
 readonly C_CYAN='\033[0;36m'
 readonly C_GRAY='\033[0;90m'
+readonly C_DIM='\033[2m'
+
 
 # --- 配置变量 ---
 CF_API_TOKEN=""
@@ -62,16 +67,63 @@ DEPLOY_HOOK_SCRIPT=""
 NGINX_CONF_PATH=""
 CURRENT_SSH_PORT=""
 APT_UPDATED=0
+# 缓存变量
+CACHED_IPV4=""
+CACHED_IPV6=""
+CACHED_ISP=""
+CACHED_LOCATION=""
+CACHE_TIMESTAMP=0
 
 # ==============================================================================
 # 0. 核心工具库
 # ==============================================================================
 
 set -o errtrace
+# ============================================
+# 缓存管理
+# ============================================
+load_cache() {
+    if [[ -f "$CACHE_FILE" ]]; then
+        local cache_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)))
+        if [[ $cache_age -lt $CACHE_TTL ]]; then
+            source "$CACHE_FILE" 2>/dev/null || return 1
+            return 0
+        fi
+    fi
+    return 1
+}
 
+save_cache() {
+    mkdir -p "$CACHE_DIR"
+    cat > "$CACHE_FILE" << EOF
+CACHED_IPV4="$CACHED_IPV4"
+CACHED_IPV6="$CACHED_IPV6"
+CACHED_ISP="$CACHED_ISP"
+CACHED_LOCATION="$CACHED_LOCATION"
+CACHE_TIMESTAMP=$(date +%s)
+EOF
+    chmod 600 "$CACHE_FILE"
+}
 
-# 终端修复 - 增强版
-fix_terminal() {
+refresh_network_cache() {
+    # 获取 IPv4
+    CACHED_IPV4=$(curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+    
+    # 获取 IPv6
+    CACHED_IPV6=$(curl -6 -s --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null)
+    [[ -z "$CACHED_IPV6" || ! "$CACHED_IPV6" =~ : ]] && CACHED_IPV6="未配置"
+    
+    # 获取 ISP 和位置
+    local ipinfo=$(curl -s --connect-timeout 3 --max-time 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
+    CACHED_ISP=$(echo "$ipinfo" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    [[ -z "$CACHED_ISP" ]] && CACHED_ISP="N/A"
+    
+    local country=$(echo "$ipinfo" | grep -o '"country"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    local city=$(echo "$ipinfo" | grep -o '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    CACHED_LOCATION="${country:-N/A} ${city:-}"
+    
+    save_cache
+}
 
 # ============================================
 # IP定位函数
@@ -114,6 +166,9 @@ get_ip_location() {
     echo "查询失败"
 }
 
+# ============================================
+# 系统信息显示函数
+# ============================================
 show_compact_sysinfo() {
     local hostname=$(hostname)
     local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
@@ -271,7 +326,128 @@ show_compact_sysinfo() {
     printf "%-16s %s\n" "Nginx状态:" "$nginx_status"
 }
 
-
+# ============================================
+# 双栏系统信息显示
+# ============================================
+show_dual_column_sysinfo() {
+    # 尝试加载缓存
+    load_cache || refresh_network_cache
+    
+    # ===== 收集系统信息 =====
+    local hostname=$(hostname)
+    local os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -c 35)
+    local kernel=$(uname -r | head -c 20)
+    local arch=$(uname -m)
+    
+    local cpu_model=$(grep "model name" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs | head -c 25)
+    local cpu_cores=$(nproc 2>/dev/null || echo "1")
+    local cpu_freq=$(awk '/MHz/ {printf "%.1fGHz", $4/1000; exit}' /proc/cpuinfo 2>/dev/null || echo "N/A")
+    
+    # CPU 使用率 (快速采样)
+    local cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){u1=u;t1=t}else{if(t-t1>0)printf "%.0f%%",(u-u1)*100/(t-t1);else print "0%"}}' \
+        <(grep 'cpu ' /proc/stat) <(sleep 0.3; grep 'cpu ' /proc/stat) 2>/dev/null || echo "0%")
+    
+    local load_avg=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg 2>/dev/null)
+    
+    # 连接数
+    local tcp_conn=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
+    local udp_conn=$(ss -un 2>/dev/null | tail -n +2 | wc -l)
+    
+    # 内存
+    local mem_info=$(free -m | awk '/^Mem:/ {printf "%d/%dM %.0f%%", $3, $2, $3/$2*100}')
+    local swap_info=$(free -m | awk '/^Swap:/ {if($2>0) printf "%d/%dM %.0f%%", $3, $2, $3/$2*100; else print "未启用"}')
+    
+    # 磁盘
+    local disk_info=$(df -h / | awk 'NR==2 {printf "%s/%s %s", $3, $2, $5}')
+    
+    # 网络流量
+    local main_if=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+    local rx_total="0B" tx_total="0B"
+    if [[ -n "$main_if" ]]; then
+        local stats=$(awk -v iface="$main_if:" '$1==iface {print $2,$10}' /proc/net/dev 2>/dev/null)
+        if [[ -n "$stats" ]]; then
+            rx_total=$(echo "$stats" | awk '{
+                if($1>=1073741824) printf "%.2fG",$1/1073741824
+                else if($1>=1048576) printf "%.0fM",$1/1048576
+                else if($1>=1024) printf "%.0fK",$1/1024
+                else printf "%dB",$1
+            }')
+            tx_total=$(echo "$stats" | awk '{
+                if($2>=1073741824) printf "%.2fG",$2/1073741824
+                else if($2>=1048576) printf "%.0fM",$2/1048576
+                else if($2>=1024) printf "%.0fK",$2/1024
+                else printf "%dB",$2
+            }')
+        fi
+    fi
+    
+    # 网络算法
+    local tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
+    local qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
+    
+    # 运行时间
+    local uptime_str=$(awk '{d=int($1/86400);h=int($1%86400/3600);m=int($1%3600/60);
+        if(d>0)printf "%d天%d时%d分",d,h,m;else if(h>0)printf "%d时%d分",h,m;else printf "%d分",m}' /proc/uptime)
+    
+    # 时间
+    local sys_time=$(date "+%m-%d %H:%M")
+    local timezone=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' || echo "UTC")
+    
+    # SSH 端口
+    local ssh_port=$(grep -E "^Port\s" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    [[ -z "$ssh_port" ]] && ssh_port="22"
+    
+    # 服务状态 (简化符号)
+    local ufw_st="○"; command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active" && ufw_st="●"
+    local f2b_st="○"; systemctl is-active fail2ban &>/dev/null && f2b_st="●"
+    local nginx_st="○"; systemctl is-active nginx &>/dev/null && nginx_st="●"
+    local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
+    
+    # ===== 双栏输出 =====
+    local W=76  # 总宽度
+    local LW=37 # 左栏宽度
+    local RW=37 # 右栏宽度
+    
+    # 主机信息
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "主机:" "$hostname" "IPv4:" "$CACHED_IPV4"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "系统:" "${os_info:0:17}" "IPv6:" "${CACHED_IPV6:0:20}"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "内核:" "$kernel" "运营商:" "${CACHED_ISP:0:18}"
+    
+    printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+    
+    # CPU 和内存
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "CPU:" "${cpu_model:0:17}" "内存:" "$mem_info"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "核心:" "${cpu_cores}核 @ $cpu_freq" "交换:" "$swap_info"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "负载:" "$load_avg" "硬盘:" "$disk_info"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "占用:" "$cpu_usage 连接:${tcp_conn}t/${udp_conn}u" "流量:" "↓${rx_total} ↑${tx_total}"
+    
+    printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+    
+    # 网络和时间
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "算法:" "$tcp_cc + $qdisc" "位置:" "${CACHED_LOCATION:0:18}"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "运行:" "$uptime_str" "时区:" "$timezone"
+    printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
+        "SSH:" "端口 $ssh_port" "时间:" "$sys_time"
+    
+    printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+    
+    # 服务状态行
+    printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}]\n" \
+        "$ufw_st" "$f2b_st" "$nginx_st" "$docker_st"
+}
+# ============================================
+# 终端修复函数
+# ============================================
+fix_terminal() {
     # 检查是否为交互式终端
     [[ -t 0 ]] || return 0
     
@@ -300,6 +476,7 @@ show_compact_sysinfo() {
 
 # 在脚本开始时调用
 fix_terminal
+
 
 # 获取终端宽度
 get_term_width() {
@@ -584,6 +761,17 @@ menu_update() {
     print_info "正在检查并安装基础依赖..."
     echo ""
     
+    # 记录安装前的状态
+    local ufw_was_active=0
+    local f2b_was_active=0
+    
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_was_active=1
+    fi
+    if systemctl is-active fail2ban &>/dev/null; then
+        f2b_was_active=1
+    fi
+    
     # 更新软件源
     print_info "1/2 更新软件源..."
     if apt-get update -y >/dev/null 2>&1; then
@@ -599,18 +787,20 @@ menu_update() {
     local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban nginx iproute2 net-tools procps"
     local installed=0
     local failed=0
+    local new_packages=""
     
     for pkg in $deps; do
         if dpkg -s "$pkg" &>/dev/null; then
             echo "  ✓ $pkg (已安装)"
         else
             echo -n "  → 正在安装 $pkg ... "
-            if apt-get install -y "$pkg" >/dev/null 2>&1; then
+            if (DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >/dev/null 2>&1); then
                 echo -e "${C_GREEN}成功${C_RESET}"
-                ((installed++))
+                ((installed++)) || true
+                new_packages="$new_packages $pkg"
             else
                 echo -e "${C_RED}失败${C_RESET}"
-                ((failed++))
+                ((failed++)) || true
             fi
         fi
     done
@@ -618,8 +808,25 @@ menu_update() {
     echo ""
     echo "================================================================================"
     print_success "基础依赖安装完成"
-    echo "  已安装: $installed 个"
-    [[ $failed -gt 0 ]] && echo "  失败: $failed 个"
+    echo "  新安装: $installed 个"
+    [[ $failed -gt 0 ]] && echo -e "  ${C_RED}失败: $failed 个${C_RESET}"
+    
+    # 显示新安装服务的配置提示
+    if [[ "$new_packages" == *"ufw"* ]] || [[ "$new_packages" == *"fail2ban"* ]]; then
+        echo ""
+        echo -e "${C_YELLOW}提示:${C_RESET} 检测到新安装的安全服务"
+        [[ "$new_packages" == *"ufw"* ]] && echo "  - UFW 防火墙: 请通过菜单 [2] 配置后启用"
+        [[ "$new_packages" == *"fail2ban"* ]] && echo "  - Fail2ban: 请通过菜单 [3] 配置后启用"
+    fi
+    
+    # 恢复之前的服务状态（如果之前是运行的）
+    if [[ $ufw_was_active -eq 1 ]]; then
+        ufw --force enable >/dev/null 2>&1 || true
+    fi
+    if [[ $f2b_was_active -eq 1 ]]; then
+        systemctl start fail2ban >/dev/null 2>&1 || true
+    fi
+    
     echo "================================================================================"
     
     log_action "Basic dependencies installed/checked"
@@ -1001,28 +1208,269 @@ f2b_setup() {
         backend="systemd"
     fi
 
+    # SSH 端口
     read -e -r -p "监控 SSH 端口 [$CURRENT_SSH_PORT]: " port
     port=${port:-$CURRENT_SSH_PORT}
+    if ! validate_port "$port"; then
+        print_error "端口无效，使用默认值 $CURRENT_SSH_PORT"
+        port=$CURRENT_SSH_PORT
+    fi
     
+    # 最大重试次数
+    read -e -r -p "最大重试次数 (登录失败几次后封禁) [5]: " maxretry
+    maxretry=${maxretry:-5}
+    if ! [[ "$maxretry" =~ ^[0-9]+$ ]] || [ "$maxretry" -lt 1 ]; then
+        print_warn "无效输入，使用默认值 5"
+        maxretry=5
+    fi
+    
+    # 封禁时间
+    echo ""
+    echo "封禁时间选项:"
+    echo "  1) 10分钟 (10m)"
+    echo "  2) 30分钟 (30m)"
+    echo "  3) 1小时 (1h)"
+    echo "  4) 6小时 (6h)"
+    echo "  5) 24小时 (24h)"
+    echo "  6) 永久封禁 (-1)"
+    echo "  7) 自定义"
+    read -e -r -p "选择封禁时间 [1]: " bantime_choice
+    
+    local bantime="10m"
+    case $bantime_choice in
+        1|"") bantime="10m" ;;
+        2) bantime="30m" ;;
+        3) bantime="1h" ;;
+        4) bantime="6h" ;;
+        5) bantime="24h" ;;
+        6) bantime="-1" ;;
+        7)
+            read -e -r -p "输入封禁时间 (如 10m, 1h, 24h, -1表示永久): " custom_bantime
+            if [[ "$custom_bantime" =~ ^-?[0-9]+[smhd]?$ ]] || [[ "$custom_bantime" == "-1" ]]; then
+                bantime="$custom_bantime"
+            else
+                print_warn "格式无效，使用默认值 10m"
+                bantime="10m"
+            fi
+            ;;
+        *) 
+            print_warn "无效选择，使用默认值 10m"
+            bantime="10m"
+            ;;
+    esac
+    
+    # 检测时间窗口
+    echo ""
+    echo "检测时间窗口 (在此时间内达到最大重试次数则封禁):"
+    echo "  1) 10分钟 (10m) - 默认"
+    echo "  2) 30分钟 (30m)"
+    echo "  3) 1小时 (1h)"
+    echo "  4) 自定义"
+    read -e -r -p "选择检测窗口 [1]: " findtime_choice
+    
+    local findtime="10m"
+    case $findtime_choice in
+        1|"") findtime="10m" ;;
+        2) findtime="30m" ;;
+        3) findtime="1h" ;;
+        4)
+            read -e -r -p "输入检测窗口 (如 10m, 1h): " custom_findtime
+            if [[ "$custom_findtime" =~ ^[0-9]+[smhd]?$ ]]; then
+                findtime="$custom_findtime"
+            else
+                print_warn "格式无效，使用默认值 10m"
+                findtime="10m"
+            fi
+            ;;
+        *) findtime="10m" ;;
+    esac
+    
+    # 显示配置摘要
+    echo ""
+    draw_line
+    echo -e "${C_CYAN}配置摘要:${C_RESET}"
+    echo "  SSH 端口:     $port"
+    echo "  最大重试:     $maxretry 次"
+    echo "  检测窗口:     $findtime"
+    echo "  封禁时间:     $bantime"
+    [[ "$bantime" == "-1" ]] && echo -e "  ${C_RED}警告: 永久封禁需要手动解封！${C_RESET}"
+    draw_line
+    
+    if ! confirm "确认应用此配置?"; then
+        print_warn "已取消配置。"
+        pause
+        return
+    fi
+
     local conf_content="[DEFAULT]
-bantime = 10m
+# 封禁时间
+bantime = $bantime
+# 检测时间窗口
+findtime = $findtime
+# 封禁动作 (使用 UFW)
 banaction = ufw
+
 [sshd]
 enabled = true
 port = $port
-maxretry = 5
-bantime = 10m
-backend = $backend"
+# 最大重试次数
+maxretry = $maxretry
+# 后端检测方式
+backend = $backend
+# 日志路径 (auto 自动检测)
+logpath = %(sshd_log)s"
 
     write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
-    print_success "配置已写入。"
+    print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL"
     
     if is_systemd; then
         systemctl enable fail2ban >/dev/null || true
-        systemctl restart fail2ban || print_warn "Fail2ban 启动失败 (非致命)。"
-        print_success "Fail2ban 配置已更新。"
-        log_action "Fail2ban configured for port $port"
+        if systemctl restart fail2ban; then
+            print_success "Fail2ban 已启动。"
+        else
+            print_error "Fail2ban 启动失败！"
+            echo "请检查日志: journalctl -u fail2ban -n 20"
+        fi
+        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime"
     fi
+    pause
+}
+
+f2b_status() {
+    print_title "Fail2ban 状态"
+    
+    if ! command_exists fail2ban-client; then
+        print_error "Fail2ban 未安装。"
+        pause
+        return
+    fi
+    
+    echo -e "${C_CYAN}[服务状态]${C_RESET}"
+    if is_systemd; then
+        systemctl status fail2ban --no-pager -l 2>/dev/null | head -n 5 || echo "服务未运行"
+    fi
+    
+    echo ""
+    echo -e "${C_CYAN}[SSHD Jail 状态]${C_RESET}"
+    fail2ban-client status sshd 2>/dev/null || echo "SSHD jail 未启用"
+    
+    echo ""
+    echo -e "${C_CYAN}[当前封禁的 IP]${C_RESET}"
+    local banned=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2 | xargs)
+    if [[ -n "$banned" && "$banned" != "0" ]]; then
+        echo "$banned" | tr ' ' '\n' | while read ip; do
+            [[ -n "$ip" ]] && echo "  - $ip"
+        done
+    else
+        echo "  (无)"
+    fi
+    
+    pause
+}
+
+f2b_unban() {
+    print_title "解封 IP 地址"
+    
+    if ! command_exists fail2ban-client; then
+        print_error "Fail2ban 未安装。"
+        pause
+        return
+    fi
+    
+    echo -e "${C_CYAN}当前封禁的 IP:${C_RESET}"
+    local banned=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2 | xargs)
+    
+    if [[ -z "$banned" ]] || [[ "$banned" == "0" ]]; then
+        print_warn "当前没有被封禁的 IP。"
+        pause
+        return
+    fi
+    
+    echo "$banned" | tr ' ' '\n' | nl -w2 -s'. '
+    echo ""
+    echo "输入选项:"
+    echo "  - 输入 IP 地址解封单个"
+    echo "  - 输入 'all' 解封所有"
+    echo "  - 输入 '0' 取消"
+    
+    read -e -r -p "请输入: " input
+    
+    if [[ "$input" == "0" || -z "$input" ]]; then
+        return
+    elif [[ "$input" == "all" ]]; then
+        if confirm "确认解封所有 IP?"; then
+            for ip in $banned; do
+                fail2ban-client set sshd unbanip "$ip" 2>/dev/null && \
+                    print_success "已解封: $ip" || \
+                    print_error "解封失败: $ip"
+            done
+            log_action "Fail2ban: unbanned all IPs"
+        fi
+    else
+        if fail2ban-client set sshd unbanip "$input" 2>/dev/null; then
+            print_success "已解封: $input"
+            log_action "Fail2ban: unbanned $input"
+        else
+            print_error "解封失败，请检查 IP 是否正确。"
+        fi
+    fi
+    
+    pause
+}
+
+f2b_view_config() {
+    print_title "当前 Fail2ban 配置"
+    
+    if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+        echo -e "${C_CYAN}配置文件: $FAIL2BAN_JAIL_LOCAL${C_RESET}"
+        draw_line
+        cat "$FAIL2BAN_JAIL_LOCAL"
+        draw_line
+    else
+        print_warn "配置文件不存在，使用系统默认配置。"
+        echo ""
+        echo "默认配置位置: /etc/fail2ban/jail.conf"
+    fi
+    
+    pause
+}
+
+f2b_logs() {
+    print_title "Fail2ban 日志"
+    
+    echo "1. 查看最近 50 条日志"
+    echo "2. 实时跟踪日志 (Ctrl+C 退出)"
+    echo "3. 查看封禁历史"
+    echo "0. 返回"
+    read -e -r -p "选择: " c
+    
+    case $c in
+        1)
+            if [[ -f /var/log/fail2ban.log ]]; then
+                tail -n 50 /var/log/fail2ban.log
+            else
+                journalctl -u fail2ban -n 50 --no-pager 2>/dev/null || echo "日志不可用"
+            fi
+            ;;
+        2)
+            print_info "按 Ctrl+C 退出..."
+            if [[ -f /var/log/fail2ban.log ]]; then
+                tail -f /var/log/fail2ban.log
+            else
+                journalctl -u fail2ban -f 2>/dev/null || echo "日志不可用"
+            fi
+            ;;
+        3)
+            echo -e "${C_CYAN}最近的封禁记录:${C_RESET}"
+            if [[ -f /var/log/fail2ban.log ]]; then
+                grep -E "Ban|Unban" /var/log/fail2ban.log | tail -n 30
+            else
+                journalctl -u fail2ban --no-pager 2>/dev/null | grep -E "Ban|Unban" | tail -n 30
+            fi
+            ;;
+        0|"") return ;;
+    esac
+    
     pause
 }
 
@@ -1030,26 +1478,56 @@ menu_f2b() {
     fix_terminal
     while true; do
         print_title "Fail2ban 入侵防御"
-        echo "1. 安装/重置配置"
-        echo "2. 查看状态/日志"
+        
+        # 显示当前状态
+        if command_exists fail2ban-client; then
+            if systemctl is-active fail2ban &>/dev/null; then
+                local banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
+                echo -e "${C_GREEN}状态: 运行中${C_RESET} | 当前封禁: ${banned_count:-0} 个 IP"
+            else
+                echo -e "${C_YELLOW}状态: 已安装但未运行${C_RESET}"
+            fi
+        else
+            echo -e "${C_RED}状态: 未安装${C_RESET}"
+        fi
+        echo ""
+        
+        echo "1. 安装/重新配置 Fail2ban"
+        echo "2. 查看状态和封禁列表"
+        echo "3. 解封 IP 地址"
+        echo "4. 查看当前配置"
+        echo "5. 查看日志"
+        echo "6. 启动/停止服务"
         echo "0. 返回主菜单"
         echo ""
         read -e -r -p "请选择: " c
+        
         case $c in
             1) f2b_setup ;;
-            2) 
-                if command_exists fail2ban-client; then
-                    fail2ban-client status sshd 2>/dev/null || echo "未运行"
-                else
-                    echo "Fail2ban 未安装。"
+            2) f2b_status ;;
+            3) f2b_unban ;;
+            4) f2b_view_config ;;
+            5) f2b_logs ;;
+            6)
+                if ! command_exists fail2ban-client; then
+                    print_error "Fail2ban 未安装。"
+                    pause
+                    continue
                 fi
-                pause ;;
+                echo "1. 启动  2. 停止  3. 重启"
+                read -e -r -p "选择: " sc
+                case $sc in
+                    1) systemctl start fail2ban && print_success "已启动" || print_error "启动失败" ;;
+                    2) systemctl stop fail2ban && print_success "已停止" || print_error "停止失败" ;;
+                    3) systemctl restart fail2ban && print_success "已重启" || print_error "重启失败" ;;
+                esac
+                pause
+                ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
     done
 }
-
 # ==============================================================================
 # 6. SSH 安全模块
 # ==============================================================================
@@ -1090,90 +1568,6 @@ ssh_change_port() {
     fi
     pause
 }
-
-ssh_keys() {
-    print_title "SSH 密钥管理"
-    echo "1. 导入公钥"
-    echo "2. 禁用密码登录"
-    read -e -r -p "选择: " c
-    
-    if [[ "$c" == "1" ]]; then
-        read -e -r -p "用户名: " user
-        if ! id "$user" >/dev/null 2>&1; then 
-            print_error "用户不存在"
-            pause; return
-        fi
-        
-        read -e -r -p "粘贴公钥: " key
-        [[ -z "$key" ]] && return
-        
-        local dir="/home/$user/.ssh"
-        [[ "$user" == "root" ]] && dir="/root/.ssh"
-        
-        mkdir -p "$dir"
-        echo "$key" >> "$dir/authorized_keys"
-        chmod 700 "$dir"
-        chmod 600 "$dir/authorized_keys"
-        chown -R "$user:$user" "$dir"
-        print_success "公钥已添加。"
-        log_action "SSH key added for user $user"
-        
-    elif [[ "$c" == "2" ]]; then
-        if confirm "确认已测试密钥登录成功？"; then
-            sed -i -E "s|^\s*#?\s*PasswordAuthentication\s+.*|PasswordAuthentication no|" "$SSHD_CONFIG"
-            if is_systemd; then
-                systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-            fi
-            print_success "密码登录已禁用。"
-            log_action "SSH password authentication disabled"
-        fi
-    fi
-    pause
-}
-
-menu_ssh() {
-    fix_terminal
-    while true; do
-        print_title "SSH 安全管理 (当前端口: $CURRENT_SSH_PORT)"
-        echo "1. 修改 SSH 端口"
-        echo "2. 创建 Sudo 用户"
-        echo "3. 禁用 Root 远程登录"
-        echo "4. 密钥/密码设置"
-        echo "5. 修改用户密码"
-        echo "0. 返回主菜单"
-        echo ""
-        read -e -r -p "请选择: " c
-        case $c in
-            1) ssh_change_port ;;
-            2) 
-                read -e -r -p "新用户名: " u
-                if [[ -n "$u" ]]; then
-                    adduser "$u" && usermod -aG sudo "$u" && \
-                    print_success "用户创建成功。" && \
-                    log_action "Created sudo user: $u"
-                fi
-                pause ;;
-            3)
-                if confirm "禁用 Root 登录？"; then
-                    sed -i -E "s|^\s*#?\s*PermitRootLogin\s+.*|PermitRootLogin no|" "$SSHD_CONFIG"
-                    is_systemd && (systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true)
-                    print_success "Root 登录已禁用。"
-                    log_action "SSH root login disabled"
-                fi
-                pause ;;
-            4) ssh_keys ;;
-            5) 
-                read -e -r -p "用户名 [root]: " u
-                u=${u:-root}
-                passwd "$u"
-                pause ;;
-            0|q) break ;;
-            *) print_error "无效选项" ;;
-        esac
-        refresh_ssh_port
-    done
-}
-
 # ==============================================================================
 # 7. 系统优化模块
 # ==============================================================================
@@ -1181,9 +1575,9 @@ menu_ssh() {
 opt_cleanup() {
     print_title "系统清理"
     print_info "正在清理..."
-    apt-get autoremove -y >/dev/null 2>&1
-    apt-get autoclean -y >/dev/null 2>&1
-    apt-get clean >/dev/null 2>&1
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    apt-get autoclean -y >/dev/null 2>&1 || true
+    apt-get clean >/dev/null 2>&1 || true
     
     journalctl --vacuum-time=7d >/dev/null 2>&1 || true
     
@@ -1334,6 +1728,89 @@ menu_opt() {
     done
 }
 
+ssh_keys() {
+    print_title "SSH 密钥管理"
+    echo "1. 导入公钥"
+    echo "2. 禁用密码登录"
+    read -e -r -p "选择: " c
+    
+    if [[ "$c" == "1" ]]; then
+        read -e -r -p "用户名: " user
+        if ! id "$user" >/dev/null 2>&1; then 
+            print_error "用户不存在"
+            pause; return
+        fi
+        
+        read -e -r -p "粘贴公钥: " key
+        [[ -z "$key" ]] && return
+        
+        local dir="/home/$user/.ssh"
+        [[ "$user" == "root" ]] && dir="/root/.ssh"
+        
+        mkdir -p "$dir"
+        echo "$key" >> "$dir/authorized_keys"
+        chmod 700 "$dir"
+        chmod 600 "$dir/authorized_keys"
+        chown -R "$user:$user" "$dir"
+        print_success "公钥已添加。"
+        log_action "SSH key added for user $user"
+        
+    elif [[ "$c" == "2" ]]; then
+        if confirm "确认已测试密钥登录成功？"; then
+            sed -i -E "s|^\s*#?\s*PasswordAuthentication\s+.*|PasswordAuthentication no|" "$SSHD_CONFIG"
+            if is_systemd; then
+                systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+            fi
+            print_success "密码登录已禁用。"
+            log_action "SSH password authentication disabled"
+        fi
+    fi
+    pause
+}
+
+menu_ssh() {
+    fix_terminal
+    while true; do
+        print_title "SSH 安全管理 (当前端口: $CURRENT_SSH_PORT)"
+        echo "1. 修改 SSH 端口"
+        echo "2. 创建 Sudo 用户"
+        echo "3. 禁用 Root 远程登录"
+        echo "4. 密钥/密码设置"
+        echo "5. 修改用户密码"
+        echo "0. 返回主菜单"
+        echo ""
+        read -e -r -p "请选择: " c
+        case $c in
+            1) ssh_change_port ;;
+            2) 
+                read -e -r -p "新用户名: " u
+                if [[ -n "$u" ]]; then
+                    adduser "$u" && usermod -aG sudo "$u" && \
+                    print_success "用户创建成功。" && \
+                    log_action "Created sudo user: $u"
+                fi
+                pause ;;
+            3)
+                if confirm "禁用 Root 登录？"; then
+                    sed -i -E "s|^\s*#?\s*PermitRootLogin\s+.*|PermitRootLogin no|" "$SSHD_CONFIG"
+                    is_systemd && (systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true)
+                    print_success "Root 登录已禁用。"
+                    log_action "SSH root login disabled"
+                fi
+                pause ;;
+            4) ssh_keys ;;
+            5) 
+                read -e -r -p "用户名 [root]: " u
+                u=${u:-root}
+                passwd "$u"
+                pause ;;
+            0|q) break ;;
+            *) print_error "无效选项" ;;
+        esac
+        refresh_ssh_port
+    done
+}
+
 # ==============================================================================
 # 8. 网络工具模块
 # ==============================================================================
@@ -1365,37 +1842,53 @@ net_iperf3() {
     echo -e "\n${C_BLUE}=== 客户端测速命令 ===${C_RESET}"
     [[ -n "$ip4" ]] && echo -e "IPv4 Upload: ${C_YELLOW}iperf3 -c $ip4 -p $port${C_RESET}"
     [[ -n "$ip4" ]] && echo -e "IPv4 Download: ${C_YELLOW}iperf3 -c $ip4 -p $port -R${C_RESET}"
-    [[ -n "$ip6" ]] && echo -e "IPv6 Upload: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port${C_RESET}"
-    [[ -n "$ip6" ]] && echo -e "IPv6 Download: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port -R${C_RESET}"
+    [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Upload: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port${C_RESET}"
+    [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Download: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port -R${C_RESET}"
     echo -e "${C_RED}按 Ctrl+C 停止测试...${C_RESET}"
     
-    cleanup_local() {
-        print_info "停止服务..."
+    # 启动 iperf3 服务器
+    iperf3 -s -p "$port" &
+    local iperf_pid=$!
+    
+    # 标记是否已清理
+    local cleaned=0
+    
+    # 清理函数
+    cleanup_iperf() {
+        [[ $cleaned -eq 1 ]] && return
+        cleaned=1
+        
+        echo ""
+        print_info "正在停止 iPerf3 服务..."
+        
+        # 杀死 iperf3 进程
+        if [[ -n "$iperf_pid" ]] && kill -0 "$iperf_pid" 2>/dev/null; then
+            kill "$iperf_pid" 2>/dev/null || true
+            wait "$iperf_pid" 2>/dev/null || true
+        fi
+        
+        # 清理可能残留的 iperf3 进程
+        pkill -f "iperf3 -s -p $port" 2>/dev/null || true
+        
+        # 移除防火墙规则
         if [[ $ufw_opened -eq 1 ]]; then
             ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
             print_info "防火墙规则已移除。"
         fi
+        
+        print_success "iPerf3 服务已停止。"
     }
     
-    local interrupted=0
-    handle_local_int() {
-        interrupted=1
-    }
-    trap 'handle_local_int' SIGINT
+    # 设置中断处理
+    trap 'cleanup_iperf; trap - SIGINT SIGTERM; return 0' SIGINT SIGTERM
     
-    iperf3 -s -p "$port" &
-    local iperf_pid=$!
-    
+    # 等待 iperf3 进程
     wait $iperf_pid 2>/dev/null || true
     
-    trap 'handle_interrupt' SIGINT
+    # 恢复默认中断处理
+    trap 'handle_interrupt' SIGINT SIGTERM
     
-    if [[ $interrupted -eq 1 ]]; then
-        echo ""
-        print_warn "测速已取消。"
-    fi
-    
-    cleanup_local
+    cleanup_iperf
     log_action "iPerf3 test completed on port $port"
     pause
 }
@@ -2468,8 +2961,6 @@ docker_images_manage() {
                 else
                     print_warn "没有镜像可删除。"
                 fi
-                print_success "所有镜像已删除。"
-                log_action "Docker all images removed"
             fi
             ;;
         0|q) return ;;
@@ -2510,8 +3001,6 @@ docker_containers_manage() {
                 else
                     print_warn "没有运行中的容器。"
                 fi
-                print_success "所有容器已停止。"
-                log_action "Docker all containers stopped"
             fi
             ;;
         4)
@@ -2524,8 +3013,6 @@ docker_containers_manage() {
                 else
                     print_warn "没有容器可删除。"
                 fi
-                print_success "所有容器已删除。"
-                log_action "Docker all containers removed"
             fi
             ;;
         5)
@@ -2595,47 +3082,28 @@ menu_docker() {
 
 show_main_menu() {
     fix_terminal
-    # ========== 系统信息常驻显示 ==========
     clear
-    echo "================================================================================"
-    echo -e "${C_CYAN}                        server-manage ${VERSION}${C_RESET}"
-    echo "================================================================================"
-    show_compact_sysinfo
-    echo "================================================================================"
-    # ========== 系统信息显示结束 ==========
     
-    print_title "$SCRIPT_NAME v$VERSION"
+    # ========== 标题 ==========
+    local W=76
+    printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
+    printf "${C_CYAN}%*s${C_RESET}\n" $(((${#SCRIPT_NAME}+10+W)/2)) "$SCRIPT_NAME $VERSION"
+    printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
     
+    # ========== 双栏系统信息 ==========
+    show_dual_column_sysinfo
     
-    local uptime_info=$(uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')
+    printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
     
-    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-    
-    local mem_info=$(free -m | awk '/^Mem:/ {
-        used=$3; total=$2
-        if (total > 0) {
-            pct = (used/total)*100
-            printf "%dM / %dM (%.1f%%)", used, total, pct
-        } else {
-            print "N/A"
-        }
-    }')
-    
-    local disk_info=$(df -h / | awk 'NR==2 {printf "%s / %s (%s)", $3, $2, $5}')
-    
+    # ========== 功能菜单 ==========
     echo ""
-    echo -e "${C_CYAN}=== 功能菜单 ===${C_RESET}"
-    echo "1.  基础依赖安装"
-    echo "2.  UFW 防火墙管理"
-    echo "3.  Fail2ban 入侵防御"
-    echo "4.  SSH 安全配置"
-    echo "5.  系统优化 (BBR/Swap/清理)"
-    echo "6.  网络工具 (DNS/代理/测速)"
-    echo "7.  Web 服务 (SSL + Nginx)"
-    echo "8.  Docker 管理"
-    echo "9.  查看操作日志"
+    echo -e " ${C_CYAN}功能菜单${C_RESET}"
     echo ""
-    echo "0.  退出脚本"
+    printf " %-38s %-38s\n" "1. 基础依赖安装" "6. 网络工具 (DNS/测速)"
+    printf " %-38s %-38s\n" "2. UFW 防火墙管理" "7. Web 服务 (SSL+Nginx)"
+    printf " %-38s %-38s\n" "3. Fail2ban 入侵防御" "8. Docker 管理"
+    printf " %-38s %-38s\n" "4. SSH 安全配置" "9. 查看操作日志"
+    printf " %-38s %-38s\n" "5. 系统优化 (BBR/Swap)" "0. 退出脚本"
     echo ""
 }
 
@@ -2647,7 +3115,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-10]: " choice
+        read -e -r -p "请选择功能 [0-9]: " choice
         
         case $choice in
             1) menu_update ;;
