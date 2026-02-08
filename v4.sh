@@ -1259,7 +1259,15 @@ ufw_setup() {
 
 ufw_del() {
     command_exists ufw || { print_error "UFW 未安装。"; pause; return; }
-    ufw status numbered
+    
+    print_title "删除 UFW 规则"
+    echo -e "${C_CYAN}当前规则 (已过滤 Fail2ban 自动规则):${C_RESET}"
+    echo ""
+    
+    # 显示过滤后的规则（排除 REJECT 规则）
+    ufw status numbered | grep -v "REJECT" 
+    
+    echo ""
     read -e -r -p "输入要删除的规则编号 (空格隔开): " nums
     [[ -z "$nums" ]] && return
     
