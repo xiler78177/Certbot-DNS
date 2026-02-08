@@ -1264,23 +1264,33 @@ ufw_del() {
     echo -e "${C_CYAN}当前放行的端口 (已过滤 Fail2ban 规则):${C_RESET}"
     echo ""
     
-    # 提取并显示 ALLOW 规则的端口
-    ufw status | grep -E "ALLOW" | grep -v "REJECT" | awk '{print $1}' | sort -u | nl -w2 -s'. '
+    # 显示 ALLOW 规则（端口/协议）
+    ufw status | grep "ALLOW" | awk '{print $1}' | sort -t'/' -k1,1n -u
     
     echo ""
-    echo -e "${C_YELLOW}提示: 输入端口号删除 (如 80 或 443)，支持空格分隔多个${C_RESET}"
-    read -e -r -p "要删除的端口: " ports
-    [[ -z "$ports" ]] && return
+    echo -e "${C_YELLOW}格式: 端口 或 端口/协议 (如 80, 443/tcp, 53/udp)${C_RESET}"
+    echo -e "${C_YELLOW}多个用空格分隔，不指定协议则同时删除 tcp 和 udp${C_RESET}"
+    read -e -r -p "要删除的规则: " rules
+    [[ -z "$rules" ]] && return
     
-    for port in $ports; do
-        if [[ "$port" =~ ^[0-9]+$ ]]; then
-            ufw delete allow "$port/tcp" 2>/dev/null && print_success "已删除: $port/tcp" || print_warn "$port/tcp 规则不存在"
-            ufw delete allow "$port/udp" 2>/dev/null || true
+    for rule in $rules; do
+        if [[ "$rule" =~ ^([0-9]+)(/tcp|/udp)?$ ]]; then
+            local port="${BASH_REMATCH[1]}"
+            local proto="${BASH_REMATCH[2]}"
+            
+            if [[ -n "$proto" ]]; then
+                # 指定了协议
+                ufw delete allow "${port}${proto}" 2>/dev/null && print_success "已删除: ${port}${proto}" || print_warn "${port}${proto} 不存在"
+            else
+                # 未指定协议，删除 tcp 和 udp
+                ufw delete allow "${port}/tcp" 2>/dev/null && print_success "已删除: ${port}/tcp" || print_warn "${port}/tcp 不存在"
+                ufw delete allow "${port}/udp" 2>/dev/null && print_success "已删除: ${port}/udp" || true
+            fi
         else
-            print_error "无效端口: $port"
+            print_error "无效格式: $rule"
         fi
     done
-    log_action "UFW rules deleted: $ports"
+    log_action "UFW rules deleted: $rules"
     pause
 }
 
@@ -1301,21 +1311,39 @@ ufw_safe_reset() {
 }
 
 ufw_add() {
-    if ! command_exists ufw; then
-        print_error "UFW 未安装。"
-        pause; return
-    fi
+    command_exists ufw || { print_error "UFW 未安装。"; pause; return; }
     
-    read -e -r -p "请输入要放行的端口 (空格隔开): " ports
-    [[ -z "$ports" ]] && return
+    echo -e "${C_YELLOW}格式: 端口 或 端口/协议 (如 80, 443/tcp, 53/udp)${C_RESET}"
+    echo -e "${C_YELLOW}多个用空格分隔，不指定协议则同时放行 tcp 和 udp${C_RESET}"
+    read -e -r -p "要放行的规则: " rules
+    [[ -z "$rules" ]] && return
     
-    for port in $ports; do
-        if validate_port "$port"; then
-            ufw allow "$port/tcp" comment "Manual-Add-$port" >/dev/null
-            print_success "端口 $port/tcp 已放行。"
-            log_action "UFW allowed port $port"
+    for rule in $rules; do
+        if [[ "$rule" =~ ^([0-9]+)(/tcp|/udp)?$ ]]; then
+            local port="${BASH_REMATCH[1]}"
+            local proto="${BASH_REMATCH[2]}"
+            
+            if validate_port "$port"; then
+                if [[ -n "$proto" ]]; then
+                    # 指定了协议
+                    ufw allow "${port}${proto}" comment "Manual-Add" >/dev/null && \
+                        print_success "已放行: ${port}${proto}" || \
+                        print_error "添加失败: ${port}${proto}"
+                else
+                    # 未指定协议，同时添加 tcp 和 udp
+                    ufw allow "${port}/tcp" comment "Manual-Add" >/dev/null && \
+                        print_success "已放行: ${port}/tcp" || \
+                        print_error "添加失败: ${port}/tcp"
+                    ufw allow "${port}/udp" comment "Manual-Add" >/dev/null && \
+                        print_success "已放行: ${port}/udp" || \
+                        print_error "添加失败: ${port}/udp"
+                fi
+                log_action "UFW allowed ${port}${proto:-/tcp+udp}"
+            else
+                print_error "端口无效: $port"
+            fi
         else
-            print_error "端口 $port 无效。"
+            print_error "无效格式: $rule"
         fi
     done
     pause
