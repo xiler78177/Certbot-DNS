@@ -2702,7 +2702,7 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
 
         # ========== 在这里插入 DDNS 配置 ==========
-        if [[ -n "$CF_API_TOKEN" ]]; then
+        if [[ -n "$CF_API_TOKEN" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
             local zone_id="" current="$DOMAIN"
             while [[ "$current" == *"."* && -z "$zone_id" ]]; do
                 zone_id=$(curl -s "https://api.cloudflare.com/client/v4/zones?name=$current" \
