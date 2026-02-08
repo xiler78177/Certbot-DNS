@@ -75,6 +75,169 @@ CACHED_LOCATION=""
 CACHE_TIMESTAMP=0
 
 # ==============================================================================
+# DDNS 核心函数 (添加到脚本开头的函数区域)
+# ==============================================================================
+
+DDNS_CONFIG_DIR="/etc/ddns"
+DDNS_LOG="/var/log/ddns.log"
+
+ddns_create_script() {
+    mkdir -p "$DDNS_CONFIG_DIR"
+    cat > /usr/local/bin/ddns-update.sh << 'EOF'
+#!/bin/bash
+DDNS_CONFIG_DIR="/etc/ddns"
+DDNS_LOG="/var/log/ddns.log"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
+
+get_ip() {
+    [[ "$1" == "4" ]] && { curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null; } || \
+    { curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null; }
+}
+
+update_cf() {
+    local domain=$1 rt=$2 ip=$3 token=$4 zone=$5 proxied=$6
+    local resp=$(curl -s "https://api.cloudflare.com/client/v4/zones/$zone/dns_records?type=$rt&name=$domain" \
+        -H "Authorization: Bearer $token" -H "Content-Type: application/json")
+    local rid=$(echo "$resp" | jq -r '.result[0].id // empty')
+    local dns_ip=$(echo "$resp" | jq -r '.result[0].content // empty')
+    [[ "$ip" == "$dns_ip" ]] && return 0
+    
+    local method="POST" url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records"
+    [[ -n "$rid" ]] && { method="PUT"; url="$url/$rid"; }
+    
+    resp=$(curl -s -X $method "$url" -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+        --data "{\"type\":\"$rt\",\"name\":\"$domain\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":$proxied}")
+    [[ "$(echo "$resp" | jq -r '.success')" == "true" ]] && { log "[$domain] $rt: $dns_ip -> $ip"; return 0; }
+    return 1
+}
+
+for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+    [[ -f "$conf" ]] || continue
+    source "$conf"
+    [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
+    [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
+done
+EOF
+    chmod +x /usr/local/bin/ddns-update.sh
+}
+
+ddns_setup() {
+    local domain=$1 token=$2 zone_id=$3 ipv4=$4 ipv6=$5 proxied=$6
+    
+    echo ""
+    echo -e "${C_CYAN}[DDNS 动态解析配置]${C_RESET}"
+    if ! confirm "是否启用 DDNS 自动更新 (IP 变化时自动更新 DNS)?"; then
+        return 0
+    fi
+    
+    read -e -r -p "检测间隔(分钟) [5]: " interval
+    interval=${interval:-5}
+    [[ ! "$interval" =~ ^[0-9]+$ || "$interval" -lt 1 ]] && interval=5
+    
+    mkdir -p "$DDNS_CONFIG_DIR"
+    cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
+DDNS_DOMAIN="$domain"
+DDNS_TOKEN="$token"
+DDNS_ZONE_ID="$zone_id"
+DDNS_IPV4="$ipv4"
+DDNS_IPV6="$ipv6"
+DDNS_PROXIED="$proxied"
+DDNS_INTERVAL="$interval"
+EOF
+    chmod 600 "$DDNS_CONFIG_DIR/${domain}.conf"
+    
+    ddns_create_script
+    
+    # 更新 crontab，使用最小间隔
+    local min_interval=$interval
+    for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        source "$conf"
+        [[ "$DDNS_INTERVAL" -lt "$min_interval" ]] && min_interval=$DDNS_INTERVAL
+    done
+    
+    local cron_tmp=$(mktemp)
+    crontab -l 2>/dev/null | grep -v "ddns-update.sh" > "$cron_tmp" || true
+    echo "*/$min_interval * * * * /usr/local/bin/ddns-update.sh >/dev/null 2>&1" >> "$cron_tmp"
+    crontab "$cron_tmp"; rm -f "$cron_tmp"
+    
+    print_success "DDNS 已启用 (每 ${interval} 分钟检测)"
+    log_action "DDNS enabled: $domain interval=${interval}m"
+    return 0
+}
+
+# ==============================================================================
+# 修改 web_cf_dns_update 函数 - 整合 DDNS
+# ==============================================================================
+
+
+
+
+# ==============================================================================
+# 添加 DDNS 管理函数
+# ==============================================================================
+ddns_list() {
+    print_title "DDNS 配置列表"
+    [[ ! -d "$DDNS_CONFIG_DIR" || -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && { print_warn "暂无 DDNS 配置"; pause; return; }
+    
+    printf "${C_CYAN}%-30s %-6s %-6s %-8s %s${C_RESET}\n" "域名" "IPv4" "IPv6" "代理" "间隔"
+    draw_line
+    for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        source "$conf"
+        printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
+            "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
+            "$([[ "$DDNS_IPV6" == "true" ]] && echo "✓" || echo "-")" \
+            "$([[ "$DDNS_PROXIED" == "true" ]] && echo "开启" || echo "关闭")" \
+            "${DDNS_INTERVAL}分钟"
+    done
+    
+    echo ""
+    local ip4=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
+    local ip6=$(curl -6 -s --max-time 3 ifconfig.me 2>/dev/null)
+    echo -e "${C_CYAN}当前IP:${C_RESET} IPv4=${ip4:-N/A} IPv6=${ip6:-N/A}"
+    pause
+}
+ddns_delete() {
+    print_title "删除 DDNS 配置"
+    [[ ! -d "$DDNS_CONFIG_DIR" || -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && { print_warn "暂无配置"; pause; return; }
+    
+    local i=1 domains=() files=()
+    for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+        [[ -f "$conf" ]] || continue
+        source "$conf"; domains+=("$DDNS_DOMAIN"); files+=("$conf")
+        echo "$i. $DDNS_DOMAIN"; ((i++))
+    done
+    echo "0. 返回"
+    
+    read -e -r -p "选择: " idx
+    [[ "$idx" == "0" || -z "$idx" ]] && return
+    [[ "$idx" =~ ^[0-9]+$ && "$idx" -le ${#domains[@]} ]] || { print_error "无效"; pause; return; }
+    
+    confirm "删除 ${domains[$((idx-1))]} 的 DDNS?" && {
+        rm -f "${files[$((idx-1))]}"
+        [[ -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && {
+            crontab -l 2>/dev/null | grep -v "ddns-update.sh" | crontab - 2>/dev/null || true
+            rm -f /usr/local/bin/ddns-update.sh
+        }
+        print_success "已删除"; log_action "DDNS deleted: ${domains[$((idx-1))]}"
+    }
+    pause
+}
+ddns_force_update() {
+    if [[ -x /usr/local/bin/ddns-update.sh ]]; then
+        print_info "正在更新..."
+        /usr/local/bin/ddns-update.sh
+        print_success "更新完成"
+        echo ""
+        tail -n 10 "$DDNS_LOG" 2>/dev/null || echo "暂无日志"
+    else
+        print_warn "DDNS 未配置"
+    fi
+    pause
+}
+
+# ==============================================================================
 # 0. 核心工具库
 # ==============================================================================
 
@@ -2177,6 +2340,12 @@ web_cf_dns_update() {
     
     print_success "DNS 配置完成。"
     log_action "Cloudflare DNS updated for $DOMAIN"
+
+    # DDNS 配置
+    local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
+    local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
+    ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
+
     sleep 2
 }
 
@@ -2666,6 +2835,24 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         fi
         
         write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
+
+        # ========== 在这里插入 DDNS 配置 ==========
+        if [[ -n "$CF_API_TOKEN" ]]; then
+            local zone_id="" current="$DOMAIN"
+            while [[ "$current" == *"."* && -z "$zone_id" ]]; do
+                zone_id=$(curl -s "https://api.cloudflare.com/client/v4/zones?name=$current" \
+                    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" | jq -r '.result[0].id // empty')
+                current="${current#*.}"
+            done
+            
+            if [[ -n "$zone_id" ]]; then
+                local ddns_ipv4="false" ddns_ipv6="false"
+                [[ -n "$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)" ]] && ddns_ipv4="true"
+                [[ -n "$(curl -6 -s --max-time 3 ifconfig.me 2>/dev/null)" ]] && ddns_ipv6="true"
+                ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "false"
+            fi
+        fi
+        # ========== DDNS 配置结束 ==========
         
         echo ""
         draw_line
@@ -2710,16 +2897,29 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
 menu_web() {
     fix_terminal
     while true; do
-        print_title "Web 服务管理 (SSL + Nginx)"
+        print_title "Web 服务管理 (SSL + Nginx + DDNS)"
+        
+        # 状态显示
+        local cert_count=$(ls -1 "$CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
+        local ddns_count=$(ls -1 "$DDNS_CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
+        echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET}"
+        [[ $ddns_count -gt 0 ]] && crontab -l 2>/dev/null | grep -q "ddns-update.sh" && echo -e "DDNS状态: ${C_GREEN}运行中${C_RESET}"
+        echo ""
+        
         echo -e "${C_CYAN}--- 域名管理 ---${C_RESET}"
-        echo "1. 添加域名 (申请证书 + 配置反代)"
+        echo "1. 添加域名 (申请证书 + 配置反代 + DDNS)"
         echo "2. 查看已配置域名详情"
         echo "3. 删除域名配置"
         echo ""
-        echo -e "${C_CYAN}--- 独立功能 ---${C_RESET}"
-        echo "4. 仅配置 Cloudflare DNS 解析"
-        echo "5. 手动续签所有证书"
-        echo "6. 查看续签日志"
+        echo -e "${C_CYAN}--- DNS & DDNS ---${C_RESET}"
+        echo "4. Cloudflare DNS 解析 (支持 DDNS)"
+        echo "5. 查看 DDNS 配置"
+        echo "6. 删除 DDNS 配置"
+        echo "7. 立即更新 DDNS"
+        echo ""
+        echo -e "${C_CYAN}--- 证书维护 ---${C_RESET}"
+        echo "8. 手动续签所有证书"
+        echo "9. 查看日志 (证书/DDNS)"
         echo ""
         echo "0. 返回主菜单"
         echo ""
@@ -2729,47 +2929,26 @@ menu_web() {
             1) web_add_domain ;;
             2) web_view_config ;;
             3) web_delete_domain ;;
-            4) 
-                web_env_check || { pause; continue; }
-                web_cf_dns_update
-                ;;
-            5)
+            4) web_env_check && web_cf_dns_update || pause ;;
+            5) ddns_list ;;
+            6) ddns_delete ;;
+            7) ddns_force_update ;;
+            8)
                 print_title "手动续签证书"
-                if ! command_exists certbot; then
-                    print_error "Certbot 未安装。"
-                    pause; continue
-                fi
-                
-                print_info "正在执行续签..."
-                if certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log; then
-                    print_success "续签完成。"
-                    
-                    shopt -s nullglob
-                    local hooks=(/root/cert-renew-hook-*.sh)
-                    shopt -u nullglob
-                    
-                    if [[ ${#hooks[@]} -gt 0 ]]; then
-                        print_info "正在执行部署 Hook..."
-                        for hook in "${hooks[@]}"; do
-                            if [[ -x "$hook" ]]; then
-                                echo "执行: $hook"
-                                bash "$hook" 2>&1 | tee -a /var/log/cert-renew.log
-                            fi
-                        done
-                    fi
-                else
-                    print_error "续签失败，请查看日志。"
-                fi
-                log_action "Manual certificate renewal executed"
+                command_exists certbot || { print_error "Certbot 未安装"; pause; continue; }
+                print_info "正在续签..."
+                certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log
+                shopt -s nullglob; for hook in /root/cert-renew-hook-*.sh; do [[ -x "$hook" ]] && bash "$hook"; done; shopt -u nullglob
+                log_action "Manual cert renewal"
                 pause
                 ;;
-            6)
-                print_title "续签日志"
-                if [[ -f /var/log/cert-renew.log ]]; then
-                    tail -n 50 /var/log/cert-renew.log
-                else
-                    print_warn "日志文件不存在。"
-                fi
+            9)
+                echo "1. 证书续签日志  2. DDNS 更新日志"
+                read -e -r -p "选择: " lc
+                case $lc in
+                    1) [[ -f /var/log/cert-renew.log ]] && tail -n 50 /var/log/cert-renew.log || print_warn "无日志" ;;
+                    2) [[ -f "$DDNS_LOG" ]] && tail -n 50 "$DDNS_LOG" || print_warn "无日志" ;;
+                esac
                 pause
                 ;;
             0|q) break ;;
