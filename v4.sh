@@ -1261,20 +1261,26 @@ ufw_del() {
     command_exists ufw || { print_error "UFW 未安装。"; pause; return; }
     
     print_title "删除 UFW 规则"
-    echo -e "${C_CYAN}当前规则 (已过滤 Fail2ban 自动规则):${C_RESET}"
+    echo -e "${C_CYAN}当前放行的端口 (已过滤 Fail2ban 规则):${C_RESET}"
     echo ""
     
-    # 显示过滤后的规则（排除 REJECT 规则）
-    ufw status numbered | grep -v "REJECT" 
+    # 提取并显示 ALLOW 规则的端口
+    ufw status | grep -E "ALLOW" | grep -v "REJECT" | awk '{print $1}' | sort -u | nl -w2 -s'. '
     
     echo ""
-    read -e -r -p "输入要删除的规则编号 (空格隔开): " nums
-    [[ -z "$nums" ]] && return
+    echo -e "${C_YELLOW}提示: 输入端口号删除 (如 80 或 443)，支持空格分隔多个${C_RESET}"
+    read -e -r -p "要删除的端口: " ports
+    [[ -z "$ports" ]] && return
     
-    for num in $(echo "$nums" | tr ' ' '\n' | sort -nr); do
-        echo "y" | ufw delete "$num" >/dev/null 2>&1
-        print_success "规则 $num 已删除。"
+    for port in $ports; do
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            ufw delete allow "$port/tcp" 2>/dev/null && print_success "已删除: $port/tcp" || print_warn "$port/tcp 规则不存在"
+            ufw delete allow "$port/udp" 2>/dev/null || true
+        else
+            print_error "无效端口: $port"
+        fi
     done
+    log_action "UFW rules deleted: $ports"
     pause
 }
 
