@@ -241,7 +241,6 @@ ddns_force_update() {
 # 0. 核心工具库
 # ==============================================================================
 
-set -o errtrace
 # ============================================
 # 缓存管理
 # ============================================
@@ -667,39 +666,6 @@ get_term_width() {
     tput cols 2>/dev/null || echo 80
 }
 
-# 输入辅助函数
-safe_read() {
-    local prompt="$1"
-    local var_name="$2"
-    local options="$3"  # 可选参数：-s (密码), -n (单字符)
-    
-    # 确保终端状态正常
-    stty sane 2>/dev/null || true
-    
-    local input=""
-    if [[ "$options" == "-s" ]]; then
-        # 密码输入
-        read -e -r -s -p "$prompt" input
-        echo ""
-    elif [[ "$options" == "-n" ]]; then
-        # 单字符输入
-        read -n 1 -s -r -p "$prompt" input
-        echo ""
-    else
-        # 普通输入
-        read -e -r -p "$prompt" input
-    fi
-    
-    # 清理输入（移除控制字符）
-    input=$(echo "$input" | tr -d '\000-\037' | tr -d '\177')
-    
-    # 返回结果
-    if [[ -n "$var_name" ]]; then
-        eval "$var_name=\"\$input\""
-    else
-        echo "$input"
-    fi
-}
 
 # 画分隔线
 draw_line() {
@@ -721,15 +687,7 @@ print_title() {
     echo -e "${C_RESET}"
 }
 
-# Banner 显示
-print_banner() {
-    local width=$(get_term_width)
-    echo -e "${C_CYAN}"
-    printf "%${width}s\n" | tr " " "="
-    printf "%*s\n" $(((${#SCRIPT_NAME}+$width)/2)) "$SCRIPT_NAME $VERSION"
-    printf "%${width}s\n" | tr " " "="
-    echo -e "${C_RESET}"
-}
+
 
 # 统一输出
 print_info() { echo -e "${C_BLUE}[i]${C_RESET} $1"; }
@@ -755,20 +713,17 @@ pause() {
 
 # 原子写入
 write_file_atomic() {
-    local filepath="$1"
-    local content="$2"
-    local tmpfile
-    
+    local filepath="$1" content="$2" tmpfile
     mkdir -p "$(dirname "$filepath")"
     tmpfile=$(mktemp "$(dirname "$filepath")/.tmp.XXXXXX")
-    
+    trap "rm -f '$tmpfile'" RETURN
     printf "%s\n" "$content" > "$tmpfile"
-    
     if [[ -f "$filepath" ]]; then
         chmod --reference="$filepath" "$tmpfile" 2>/dev/null || true
         chown --reference="$filepath" "$tmpfile" 2>/dev/null || true
     fi
     mv "$tmpfile" "$filepath"
+    trap - RETURN
 }
 
 # 安全 Curl
@@ -776,43 +731,14 @@ safe_curl() {
     curl -s -L --connect-timeout 5 --max-time 10 --retry 3 --retry-delay 2 "$@"
 }
 
-# 进度条
-show_progress() {
-    local duration=$1
-    local msg="${2:-处理中}"
-    local width=40
-    
-    for ((i=0; i<=duration; i++)); do
-        local percent=$((i * 100 / duration))
-        local filled=$((i * width / duration))
-        local empty=$((width - filled))
-        
-        printf "\r${C_BLUE}${msg}${C_RESET} ["
-        printf "%${filled}s" | tr ' ' '='
-        printf "%${empty}s" | tr ' ' ' '
-        printf "] %3d%%" "$percent"
-        
-        sleep 1
-    done
-    echo ""
-}
+
 
 # 错误处理
 cleanup_temp_files() {
-    rm -f /etc/*.tmp.* 2>/dev/null
-    rm -f /tmp/${SCRIPT_NAME}.* 2>/dev/null
+    rm -f /etc/.tmp.* 2>/dev/null
 }
 
-handle_error() {
-    local exit_code=$?
-    # 忽略 curl 错误: 7=连接失败, 28=超时 (IPv6不通时常见)
-    [[ $exit_code -eq 7 || $exit_code -eq 28 ]] && return 0
-    
-    cleanup_temp_files
-    print_error "脚本异常退出 (Code: $exit_code)"
-    log_action "Script crashed with exit code $exit_code" "ERROR"
-    exit $exit_code
-}
+
 
 handle_interrupt() {
     cleanup_temp_files
@@ -821,7 +747,6 @@ handle_interrupt() {
     exit 130
 }
 
-trap 'handle_error' ERR
 trap 'handle_interrupt' SIGINT SIGTERM
 
 # 环境检查
@@ -909,14 +834,7 @@ validate_domain() {
     [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
 }
 
-# 获取系统信息
-get_os_info() {
-    if [[ -f /etc/os-release ]]; then
-        grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"'
-    else
-        echo "Linux $(uname -r)"
-    fi
-}
+
 
 # 脚本初始化
 init_environment() {
@@ -1060,67 +978,7 @@ install_package() {
 
 
 
-# ==================== 基础依赖安装 ====================
-install_dependencies() {
-    print_title "基础依赖安装"
-    echo ""
-    print_info "正在检查并安装基础依赖..."
-    echo ""
-    
-    print_info "1/2 更新软件源..."
-    if apt-get update -qq 2>/dev/null; then
-        print_success "软件源更新完成"
-    else
-        print_error "软件源更新失败"
-        pause
-        return 1
-    fi
-    echo ""
-    
-    print_info "2/2 安装基础依赖包..."
-    local packages=("curl" "wget" "jq" "unzip" "openssl" "ca-certificates" "ufw" "fail2ban" "net-tools" "dnsutils")
-    local failed_packages=()
-    local installed_count=0
-    local already_installed=0
-    
-    for pkg in "${packages[@]}"; do
-        if dpkg -l | grep -q "^ii  $pkg "; then
-            echo "  ✓ $pkg (已安装)"
-            ((already_installed++))
-        else
-            echo -n "  → 正在安装 $pkg ... "
-            if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" >/dev/null 2>&1; then
-                echo "成功"
-                ((installed_count++))
-            else
-                echo "失败"
-                failed_packages+=("$pkg")
-            fi
-        fi
-    done
-    
-    echo ""
-    draw_line
-    if [ ${#failed_packages[@]} -eq 0 ]; then
-        print_success "基础依赖安装完成"
-        if [ $installed_count -gt 0 ]; then
-            echo "  新安装: $installed_count 个"
-        fi
-        if [ $already_installed -gt 0 ]; then
-            echo "  已存在: $already_installed 个"
-        fi
-        log_action "基础依赖安装" "成功 - 新装:$installed_count 已有:$already_installed"
-    else
-        print_warn "部分软件包安装失败"
-        echo "  成功: $installed_count 个"
-        echo "  失败: ${#failed_packages[@]} 个 (${failed_packages[*]})"
-        log_action "基础依赖安装" "部分失败 - 成功:$installed_count 失败:${failed_packages[*]}"
-    fi
-    draw_line
-    echo ""
-    
-    pause
-}
+
 
 
 auto_deps() {
@@ -1130,17 +988,7 @@ auto_deps() {
     done
 }
 
-reinstall_deps() {
-    print_title "重装基础依赖"
-    APT_UPDATED=0
-    update_apt_cache
-    local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban nginx iproute2 net-tools procps"
-    for p in $deps; do 
-        install_package "$p"
-    done
-    print_success "依赖维护完成。"
-    pause
-}
+
 
 # ==============================================================================
 # 3. 系统信息模块
@@ -1150,13 +998,9 @@ reinstall_deps() {
 get_public_ipv6() {
     local ipv6=""
     
-    # 临时禁用错误追踪
-    set +e
-    
     # 方法 1: api64.ipify.org
     ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
     if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
-        set -e
         echo "$ipv6"
         return 0
     fi
@@ -1164,7 +1008,6 @@ get_public_ipv6() {
     # 方法 2: ifconfig.co
     ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://ifconfig.co 2>/dev/null)
     if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
-        set -e
         echo "$ipv6"
         return 0
     fi
@@ -1173,20 +1016,14 @@ get_public_ipv6() {
     if command -v ip >/dev/null 2>&1; then
         ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+' | grep -v '^fe80:' | head -n1)
         if [[ -n "$ipv6" ]]; then
-            set -e
             echo "$ipv6"
             return 0
         fi
     fi
     
-    # 恢复错误追踪
-    set -e
-    
     echo "未检测到"
     return 0
 }
-
-
 
 
 sys_info() {
@@ -1771,7 +1608,8 @@ ssh_change_port() {
         pause; return
     fi
 
-    cp "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.$(date +%s)"
+    local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
+    cp "$SSHD_CONFIG" "$backup_file"
     
     if command_exists ufw && ufw status | grep -q "Status: active"; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
@@ -1787,11 +1625,15 @@ ssh_change_port() {
     if is_systemd; then
         if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
             print_success "SSH 重启成功。请使用新端口 $port 连接。"
+            if command_exists ufw && ufw status | grep -q "Status: active"; then
+                ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
+            fi
             CURRENT_SSH_PORT=$port
             log_action "SSH port changed to $port"
+            rm -f "$backup_file"
         else
             print_error "重启失败！已回滚配置。"
-            mv "${SSHD_CONFIG}.bak."* "$SSHD_CONFIG" 2>/dev/null || true
+            mv "$backup_file" "$SSHD_CONFIG" 2>/dev/null || true
             systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
         fi
     fi
@@ -2109,7 +1951,7 @@ net_iperf3() {
     }
     
     # 设置中断处理
-    trap 'cleanup_iperf; trap - SIGINT SIGTERM; return 0' SIGINT SIGTERM
+    trap 'cleanup_iperf; trap - SIGINT SIGTERM' SIGINT SIGTERM
     
     # 等待 iperf3 进程
     wait $iperf_pid 2>/dev/null || true
@@ -2229,45 +2071,17 @@ web_env_check() {
     chmod 700 "$CONFIG_DIR"
 }
 
+# 传递结果给调用者的全局变量
+_CF_RESULT_DOMAIN=""
+_CF_RESULT_TOKEN=""
+
 web_cf_dns_update() {
+    local DOMAIN="" CF_API_TOKEN=""
+    _CF_RESULT_DOMAIN=""
+    _CF_RESULT_TOKEN=""
     print_title "Cloudflare DNS 智能解析"
     command_exists jq || install_package "jq" "silent"
     
-    get_public_ip() {
-        local type=$1
-        local ip=""
-        
-        validate_ip_format() {
-            local raw=$1
-            local clean=$(echo "$raw" | head -n 1 | tr -d '[:space:]')
-            if [[ "$type" == "4" ]]; then
-                if [[ "$clean" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                    local IFS='.'
-                    local -a octets
-                    read -r -a octets <<< "$clean"
-                    for octet in "${octets[@]}"; do
-                        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
-                        [ "$octet" -le 255 ] || return 1
-                    done
-                    echo "$clean"
-                    return 0
-                fi
-            else
-                if [[ "$clean" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$clean" == *:* ]]; then
-                    echo "$clean"
-                    return 0
-                fi
-            fi
-            return 1
-        }
-        
-        if [[ "$type" == "4" ]]; then
-            ip=$(safe_curl --fail -4 https://api.ipify.org || safe_curl --fail -4 https://ifconfig.co || safe_curl --fail -4 https://api-ipv4.ip.sb/ip || true)
-        else
-            ip=$(safe_curl --fail -6 https://api64.ipify.org || safe_curl --fail -6 https://ifconfig.co || safe_curl --fail -6 https://api-ipv6.ip.sb/ip || true)
-        fi
-        validate_ip_format "$ip"
-    }
 
     print_info "正在探测本机公网 IP..."
     local ipv4 ipv6
@@ -2387,6 +2201,10 @@ web_cf_dns_update() {
     local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
     local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
     ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
+
+    # 传递结果给 web_add_domain
+    _CF_RESULT_DOMAIN="$DOMAIN"
+    _CF_RESULT_TOKEN="$CF_API_TOKEN"
 
     sleep 2
 }
@@ -2632,6 +2450,11 @@ web_add_domain() {
     
     if confirm "是否需要先自动配置 Cloudflare DNS 解析 (A/AAAA)?"; then
         web_cf_dns_update
+        # 继承 DNS 配置中已输入的域名和 Token
+        [[ -n "$_CF_RESULT_DOMAIN" ]] && DOMAIN="$_CF_RESULT_DOMAIN"
+        [[ -n "$_CF_RESULT_TOKEN" ]] && CF_API_TOKEN="$_CF_RESULT_TOKEN"
+        _CF_RESULT_DOMAIN=""
+        _CF_RESULT_TOKEN=""
         echo ""
     fi
     
