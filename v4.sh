@@ -23,7 +23,38 @@ readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
 readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300  # 缓存有效期(秒)
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
+# --- 平台检测 ---
+PLATFORM="debian"  # debian | openwrt
+HAS_SYSTEMD=0
 
+detect_platform() {
+    if [[ -f /etc/openwrt_release ]]; then
+        PLATFORM="openwrt"
+    elif [[ -f /etc/os-release ]]; then
+        local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+        case "$os_id" in
+            ubuntu|debian) PLATFORM="debian" ;;
+            *) command -v opkg &>/dev/null && PLATFORM="openwrt" ;;
+        esac
+    elif command -v opkg &>/dev/null; then
+        PLATFORM="openwrt"
+    fi
+
+    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
+        HAS_SYSTEMD=1
+    fi
+}
+detect_platform
+
+# OpenWrt 不可用功能的拦截提示
+feature_blocked() {
+    echo ""
+    echo -e "${C_YELLOW}[!] 功能不可用: $1${C_RESET}"
+    echo -e "${C_YELLOW}    当前系统: OpenWrt (仅支持 Web/DNS/DDNS/BBR/基础信息)${C_RESET}"
+    echo ""
+    read -n 1 -s -r -p "按任意键继续..."
+    echo ""
+}
 
 # 错误码
 readonly E_SUCCESS=0
@@ -248,7 +279,9 @@ ddns_force_update() {
 # ============================================
 load_cache() {
     if [[ -f "$CACHE_FILE" ]]; then
-        local cache_age=$(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)))
+        local file_mtime
+        file_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+        local cache_age=$(($(date +%s) - file_mtime))
         if [[ $cache_age -lt $CACHE_TTL ]]; then
             source "$CACHE_FILE" 2>/dev/null || return 1
             return 0
@@ -504,7 +537,7 @@ show_dual_column_sysinfo() {
     local arch=$(uname -m)
     
     local cpu_model=$(grep "model name" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs | head -c 25)
-    local cpu_cores=$(nproc 2>/dev/null || echo "1")
+    local cpu_cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")
     local cpu_freq=$(awk '/MHz/ {printf "%.1fGHz", $4/1000; exit}' /proc/cpuinfo 2>/dev/null || echo "N/A")
     
     # CPU 使用率 (快速采样)
@@ -514,12 +547,28 @@ show_dual_column_sysinfo() {
     local load_avg=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg 2>/dev/null)
     
     # 连接数
-    local tcp_conn=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
-    local udp_conn=$(ss -un 2>/dev/null | tail -n +2 | wc -l)
+    local tcp_conn=0 udp_conn=0
+    if command -v ss >/dev/null 2>&1; then
+        tcp_conn=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
+        udp_conn=$(ss -un 2>/dev/null | tail -n +2 | wc -l)
+    elif [[ -f /proc/net/tcp ]]; then
+        tcp_conn=$(awk 'NR>1 && $4=="01"{n++}END{print n+0}' /proc/net/tcp 2>/dev/null)
+        udp_conn=$(awk 'NR>1{n++}END{print n+0}' /proc/net/udp 2>/dev/null)
+    fi
     
     # 内存
-    local mem_info=$(free -m | awk '/^Mem:/ {printf "%d/%dM %.0f%%", $3, $2, $3/$2*100}')
-    local swap_info=$(free -m | awk '/^Swap:/ {if($2>0) printf "%d/%dM %.0f%%", $3, $2, $3/$2*100; else print "未启用"}')
+    local mem_info swap_info
+    if command -v free >/dev/null 2>&1; then
+        mem_info=$(free -m | awk '/^Mem:/ {printf "%d/%dM %.0f%%", $3, $2, ($2>0)?$3/$2*100:0}')
+        swap_info=$(free -m | awk '/^Swap:/ {if($2>0) printf "%d/%dM %.0f%%", $3, $2, $3/$2*100; else print "未启用"}')
+    else
+        # OpenWrt fallback: 从 /proc/meminfo 读取
+        local mt=$(awk '/^MemTotal/{print int($2/1024)}' /proc/meminfo)
+        local mf=$(awk '/^MemAvailable/{print int($2/1024)}' /proc/meminfo)
+        local mu=$((mt - mf))
+        mem_info="${mu}/${mt}M $(( mt>0 ? mu*100/mt : 0 ))%"
+        swap_info="未启用"
+    fi
     
     # 磁盘
     local disk_info=$(df -h / | awk 'NR==2 {printf "%s/%s %s", $3, $2, $5}')
@@ -760,11 +809,20 @@ check_root() {
 }
 
 check_os() {
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        print_warn "检测到 OpenWrt 系统，将以精简模式运行。"
+        print_info "可用功能: 系统信息 / Web服务(DNS+DDNS+证书) / BBR / 主机名 / 时区 / 日志"
+        print_info "不可用: UFW / Fail2ban / Docker / Swap / iPerf3 / SSH完整管理 / apt依赖安装"
+        echo ""
+        sleep 2
+        return 0
+    fi
+
     if [[ ! -f /etc/os-release ]]; then
         print_error "不支持的操作系统。"
         exit $E_GENERAL
     fi
-    
+
     local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
         print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
@@ -840,22 +898,29 @@ validate_domain() {
 
 # 脚本初始化
 init_environment() {
-    # 创建必要目录
     mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
-    
-    # 初始化日志
+
     if [[ ! -f "$LOG_FILE" ]]; then
         touch "$LOG_FILE"
         chmod 600 "$LOG_FILE"
     fi
-    
-    # 刷新 SSH 端口
+
     refresh_ssh_port
-    
-    # 自动安装基础依赖
-    auto_deps
-    
-    log_action "Script initialized" "INFO"
+
+    # OpenWrt 只装最基础的，跳过 apt
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        # 确保 curl jq openssl 可用
+        for p in curl jq openssl-util ca-bundle; do
+            command -v "${p%%-*}" &>/dev/null 2>&1 || {
+                opkg update >/dev/null 2>&1
+                opkg install "$p" >/dev/null 2>&1 || true
+            }
+        done
+    else
+        auto_deps
+    fi
+
+    log_action "Script initialized (platform=$PLATFORM)" "INFO"
 }
 
 # ==============================================================================
@@ -955,6 +1020,24 @@ update_apt_cache() {
 install_package() {
     local pkg="$1"
     local silent="${2:-}"
+        # OpenWrt 走 opkg
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        if command -v "${pkg%%-*}" &>/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
+            [[ "$silent" != "silent" ]] && print_warn "$pkg 已安装，跳过。"
+            return 0
+        fi
+        [[ "$silent" != "silent" ]] && print_info "正在安装 $pkg (opkg)..."
+        opkg update >/dev/null 2>&1
+        if opkg install "$pkg" >/dev/null 2>&1; then
+            [[ "$silent" != "silent" ]] && print_success "$pkg 安装成功。"
+            log_action "Installed package (opkg): $pkg"
+            return 0
+        else
+            print_error "安装 $pkg 失败 (opkg)。"
+            return 1
+        fi
+    fi
+
     
     if dpkg -s "$pkg" &> /dev/null; then
         [[ "$silent" != "silent" ]] && print_warn "$pkg 已安装，跳过。"
@@ -2048,6 +2131,37 @@ menu_net() {
 # ==============================================================================
 
 web_env_check() {
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        # OpenWrt: 用 opkg 安装
+        for pkg in jq curl openssl-util ca-bundle; do
+            command -v "${pkg%%-*}" &>/dev/null || {
+                opkg update >/dev/null 2>&1
+                opkg install "$pkg" >/dev/null 2>&1 || true
+            }
+        done
+        # 检查 certbot（OpenWrt 上可能需要手动安装或用 acme.sh）
+        if ! command_exists certbot; then
+            print_warn "OpenWrt 上 certbot 可能不可用。"
+            print_info "建议使用 opkg install acme acme-dnsapi 或手动安装 certbot。"
+            if ! confirm "是否继续尝试？"; then
+                return 1
+            fi
+        fi
+        # 检查 nginx
+        if ! command_exists nginx; then
+            print_info "安装 nginx..."
+            opkg update >/dev/null 2>&1
+            opkg install nginx-ssl >/dev/null 2>&1 || opkg install nginx >/dev/null 2>&1 || {
+                print_warn "nginx 安装失败，反代功能可能不可用"
+            }
+        fi
+        mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets 2>/dev/null || true
+        mkdir -p "$CONFIG_DIR"
+        chmod 700 "$CONFIG_DIR"
+        return 0
+    fi
+
+    # Debian/Ubuntu 原逻辑
     command_exists jq || install_package "jq"
     command_exists nginx || install_package "nginx"
     is_systemd && (systemctl enable --now nginx >/dev/null 2>&1 || true)
@@ -3167,28 +3281,104 @@ menu_docker() {
 show_main_menu() {
     fix_terminal
     clear
-    
-    # ========== 标题 ==========
+
     local W=76
     printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
-    printf "${C_CYAN}%*s${C_RESET}\n" $(((${#SCRIPT_NAME}+10+W)/2)) "$SCRIPT_NAME $VERSION"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        printf "${C_CYAN}%*s${C_RESET}\n" $(((${#SCRIPT_NAME}+22+W)/2)) "$SCRIPT_NAME $VERSION [OpenWrt]"
+    else
+        printf "${C_CYAN}%*s${C_RESET}\n" $(((${#SCRIPT_NAME}+10+W)/2)) "$SCRIPT_NAME $VERSION"
+    fi
     printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
-    
-    # ========== 双栏系统信息 ==========
+
     show_dual_column_sysinfo
-    
+
     printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
-    
-    # ========== 功能菜单 ==========
+
     echo ""
     echo -e " ${C_CYAN}功能菜单${C_RESET}"
     echo ""
-    printf " %-38s %-38s\n" "1. 基础依赖安装" "6. 网络工具 (DNS/测速)"
-    printf " %-38s %-38s\n" "2. UFW 防火墙管理" "7. Web 服务 (SSL+Nginx)"
-    printf " %-38s %-38s\n" "3. Fail2ban 入侵防御" "8. Docker 管理"
-    printf " %-38s %-38s\n" "4. SSH 安全配置" "9. 查看操作日志"
-    printf " %-38s %-38s\n" "5. 系统优化 (BBR/Swap)" "0. 退出脚本"
+
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        # OpenWrt 精简菜单，不可用项标灰
+        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}1. 基础依赖安装 [不可用]${C_RESET}")" "6. 网络工具 (DNS)"
+        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"    "7. Web 服务 (SSL+Nginx+DDNS)"
+        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}3. Fail2ban [不可用]${C_RESET}")"       "$(echo -e "${C_GRAY}8. Docker [不可用]${C_RESET}")"
+        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}4. SSH 管理 [不可用]${C_RESET}")"       "9. 查看操作日志"
+        printf " %-38s %-38s\n" "5. 系统优化 (BBR/主机名/时区)"                               "0. 退出脚本"
+    else
+        printf " %-38s %-38s\n" "1. 基础依赖安装" "6. 网络工具 (DNS/测速)"
+        printf " %-38s %-38s\n" "2. UFW 防火墙管理" "7. Web 服务 (SSL+Nginx)"
+        printf " %-38s %-38s\n" "3. Fail2ban 入侵防御" "8. Docker 管理"
+        printf " %-38s %-38s\n" "4. SSH 安全配置" "9. 查看操作日志"
+        printf " %-38s %-38s\n" "5. 系统优化 (BBR/Swap)" "0. 退出脚本"
+    fi
     echo ""
+}
+
+# ==============================================================================
+# OpenWrt 精简子菜单
+# ==============================================================================
+
+menu_opt_openwrt() {
+    fix_terminal
+    while true; do
+        print_title "系统优化 (OpenWrt 精简模式)"
+        echo "1. 开启 BBR 加速"
+        echo "2. 修改主机名"
+        echo "3. 修改时区"
+        echo -e "${C_GRAY}4. 虚拟内存 Swap [不可用]${C_RESET}"
+        echo -e "${C_GRAY}5. 系统垃圾清理 [不可用]${C_RESET}"
+        echo "0. 返回"
+        echo ""
+        read -e -r -p "选择: " c
+        case $c in
+            1) opt_bbr ;;
+            2) opt_hostname ;;
+            3)
+                echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
+                read -e -r -p "选择: " t
+                case $t in
+                    1) z="Asia/Shanghai" ;;
+                    2) z="Asia/Hong_Kong" ;;
+                    3) z="Asia/Tokyo" ;;
+                    4) z="America/New_York" ;;
+                    5) z="Europe/London" ;;
+                    6) z="UTC" ;;
+                    *) print_error "无效选择"; pause; continue ;;
+                esac
+                ln -sf /usr/share/zoneinfo/$z /etc/localtime
+                print_success "时区已设为 $z"
+                log_action "Timezone changed to $z"
+                pause
+                ;;
+            4) feature_blocked "虚拟内存 Swap" ;;
+            5) feature_blocked "系统垃圾清理 (apt)" ;;
+            0|q) break ;;
+            *) print_error "无效" ;;
+        esac
+    done
+}
+
+menu_net_openwrt() {
+    fix_terminal
+    while true; do
+        print_title "网络管理工具 (OpenWrt 精简模式)"
+        echo "1. DNS 配置"
+        echo -e "${C_GRAY}2. IPv4/IPv6 优先级 [不可用]${C_RESET}"
+        echo -e "${C_GRAY}3. iPerf3 测速 [不可用]${C_RESET}"
+        echo ""
+        echo "0. 返回"
+        echo ""
+        read -e -r -p "选择: " c
+        case $c in
+            1) net_dns ;;
+            2) feature_blocked "IPv4/IPv6 优先级 (需要 /etc/gai.conf)" ;;
+            3) feature_blocked "iPerf3 测速" ;;
+            0|q) break ;;
+            *) print_error "无效" ;;
+        esac
+    done
 }
 
 main() {
@@ -3201,15 +3391,57 @@ main() {
         show_main_menu
         read -e -r -p "请选择功能 [0-9]: " choice
         
-        case $choice in
-            1) menu_update ;;
-            2) menu_ufw ;;
-            3) menu_f2b ;;
-            4) menu_ssh ;;
-            5) menu_opt ;;
-            6) menu_net ;;
+                case $choice in
+            1)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "基础依赖安装 (apt-get)"
+                else
+                    menu_update
+                fi
+                ;;
+            2)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "UFW 防火墙 (OpenWrt 请用 LuCI 或 fw4)"
+                else
+                    menu_ufw
+                fi
+                ;;
+            3)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "Fail2ban"
+                else
+                    menu_f2b
+                fi
+                ;;
+            4)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "SSH 完整管理 (OpenWrt 请用 LuCI 或编辑 /etc/config/dropbear)"
+                else
+                    menu_ssh
+                fi
+                ;;
+            5)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    menu_opt_openwrt
+                else
+                    menu_opt
+                fi
+                ;;
+            6)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    menu_net_openwrt
+                else
+                    menu_net
+                fi
+                ;;
             7) menu_web ;;
-            8) menu_docker ;;
+            8)
+                if [[ "$PLATFORM" == "openwrt" ]]; then
+                    feature_blocked "Docker 管理"
+                else
+                    menu_docker
+                fi
+                ;;
             9)
                 print_title "操作日志 (最近 50 条)"
                 if [[ -f "$LOG_FILE" ]]; then
