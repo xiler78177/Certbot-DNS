@@ -1,31 +1,14 @@
-
 #!/bin/bash
 
-# ==============================================================================
-# 服务器初始化与管理脚本 (v13.58 - Backup-Free Edition)
-#
-# 核心优化 v13.58:
-# 1. [精简] 移除备份/恢复功能模块
-# 2. [架构] 函数模块化: 按功能域拆分为独立模块
-# 3. [安全] 输入验证增强: 所有用户输入进行严格校验
-# 4. [性能] 智能缓存: 减少重复的系统调用和网络请求
-# 5. [可靠] 原子操作: 关键配置修改支持自动回滚
-# 6. [体验] 进度反馈: 长时间操作显示实时进度
-# 7. [日志] 结构化记录: JSON 格式便于后续分析
-# ==============================================================================
-
-# --- 全局常量配置 ---
 readonly VERSION="v13.58"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
 readonly CACHE_DIR="/var/cache/${SCRIPT_NAME}"
 readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
-readonly CACHE_TTL=300  # 缓存有效期(秒)
+readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
-# --- 平台检测 ---
-PLATFORM="debian"  # debian | openwrt
-HAS_SYSTEMD=0
+PLATFORM="debian"
 
 detect_platform() {
     if [[ -f /etc/openwrt_release ]]; then
@@ -39,14 +22,9 @@ detect_platform() {
     elif command -v opkg &>/dev/null; then
         PLATFORM="openwrt"
     fi
-
-    if command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; then
-        HAS_SYSTEMD=1
-    fi
 }
 detect_platform
 
-# OpenWrt 不可用功能的拦截提示
 feature_blocked() {
     echo ""
     echo -e "${C_YELLOW}[!] 功能不可用: $1${C_RESET}"
@@ -56,14 +34,6 @@ feature_blocked() {
     echo ""
 }
 
-# 错误码
-readonly E_SUCCESS=0
-readonly E_GENERAL=1
-readonly E_PERMISSION=2
-readonly E_NETWORK=3
-readonly E_CONFIG=4
-
-# 颜色
 readonly C_RESET='\033[0m'
 readonly C_RED='\033[0;31m'
 readonly C_GREEN='\033[0;32m'
@@ -73,8 +43,6 @@ readonly C_CYAN='\033[0;36m'
 readonly C_GRAY='\033[0;90m'
 readonly C_DIM='\033[2m'
 
-
-# --- 配置变量 ---
 CF_API_TOKEN=""
 DOMAIN=""
 EMAIL="your@mail.com"
@@ -84,32 +52,21 @@ DEFAULT_SSH_PORT=22
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 FAIL2BAN_JAIL_LOCAL="/etc/fail2ban/jail.local"
-APT_PROXY_CONF="/etc/apt/apt.conf.d/99proxy"
-ENV_PROXY_CONF="/etc/profile.d/proxy.sh"
-ETC_ENVIRONMENT="/etc/environment"
 DOCKER_PROXY_DIR="/etc/systemd/system/docker.service.d"
 DOCKER_PROXY_CONF="${DOCKER_PROXY_DIR}/http-proxy.conf"
-SQUID_CONF="/etc/squid/squid.conf"
 
-# 加载外部配置
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
-# 动态变量
 CLOUDFLARE_CREDENTIALS=""
 DEPLOY_HOOK_SCRIPT=""
 NGINX_CONF_PATH=""
 CURRENT_SSH_PORT=""
 APT_UPDATED=0
-# 缓存变量
+
 CACHED_IPV4=""
 CACHED_IPV6=""
 CACHED_ISP=""
 CACHED_LOCATION=""
-CACHE_TIMESTAMP=0
-
-# ==============================================================================
-# DDNS 核心函数 (添加到脚本开头的函数区域)
-# ==============================================================================
 
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
@@ -181,7 +138,6 @@ EOF
     
     ddns_create_script
     
-    # 更新 crontab，使用最小间隔
     local min_interval=$interval
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
@@ -199,16 +155,6 @@ EOF
     return 0
 }
 
-# ==============================================================================
-# 修改 web_cf_dns_update 函数 - 整合 DDNS
-# ==============================================================================
-
-
-
-
-# ==============================================================================
-# 添加 DDNS 管理函数
-# ==============================================================================
 ddns_list() {
     print_title "DDNS 配置列表"
     [[ ! -d "$DDNS_CONFIG_DIR" || -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && { print_warn "暂无 DDNS 配置"; pause; return; }
@@ -270,13 +216,6 @@ ddns_force_update() {
     pause
 }
 
-# ==============================================================================
-# 0. 核心工具库
-# ==============================================================================
-
-# ============================================
-# 缓存管理
-# ============================================
 load_cache() {
     if [[ -f "$CACHE_FILE" ]]; then
         local file_mtime
@@ -290,27 +229,12 @@ load_cache() {
     return 1
 }
 
-save_cache() {
-    mkdir -p "$CACHE_DIR"
-    cat > "$CACHE_FILE" << EOF
-CACHED_IPV4="$CACHED_IPV4"
-CACHED_IPV6="$CACHED_IPV6"
-CACHED_ISP="$CACHED_ISP"
-CACHED_LOCATION="$CACHED_LOCATION"
-CACHE_TIMESTAMP=$(date +%s)
-EOF
-    chmod 600 "$CACHE_FILE"
-}
-
 refresh_network_cache() {
-    # 获取 IPv4
     CACHED_IPV4=$(curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
-    
-    # 获取 IPv6
+
     CACHED_IPV6=$(curl -6 -s --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null)
     [[ -z "$CACHED_IPV6" || ! "$CACHED_IPV6" =~ : ]] && CACHED_IPV6="未配置"
     
-    # 获取 ISP 和位置
     local ipinfo=$(curl -s --connect-timeout 3 --max-time 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
     CACHED_ISP=$(echo "$ipinfo" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
     [[ -z "$CACHED_ISP" ]] && CACHED_ISP="N/A"
@@ -319,30 +243,23 @@ refresh_network_cache() {
     local city=$(echo "$ipinfo" | grep -o '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
     CACHED_LOCATION="${country:-N/A} ${city:-}"
     
-    save_cache
+    mkdir -p "$CACHE_DIR"
+    cat > "$CACHE_FILE" << EOF
+CACHED_IPV4="$CACHED_IPV4"
+CACHED_IPV6="$CACHED_IPV6"
+CACHED_ISP="$CACHED_ISP"
+CACHED_LOCATION="$CACHED_LOCATION"
+EOF
+    chmod 600 "$CACHE_FILE"
 }
-
-# ============================================
-# IP定位函数
-# ============================================
 get_ip_location() {
     local ip="$1"
-    local timeout=3
-    
-    # 跳过内网IP
-    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.) ]]; then
+    if [[ "$ip" =~ ^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|fe80:|::1|fc00:|fd00:) ]]; then
         echo "本地网络"
         return
     fi
-    
-    # 跳过IPv6本地地址
-    if [[ "$ip" =~ ^(fe80:|::1|fc00:|fd00:) ]]; then
-        echo "本地网络"
-        return
-    fi
-    
-    # 尝试 ip-api.com
-    local result=$(timeout $timeout curl -s "http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,country,regionName,city,isp" 2>/dev/null)
+
+        local result=$(timeout 3 curl -s "http://ip-api.com/json/${ip}?lang=zh-CN&fields=status,country,regionName,city,isp" 2>/dev/null)
     
     if [[ -n "$result" ]] && echo "$result" | grep -q '"status":"success"'; then
         local country=$(echo "$result" | grep -o '"country":"[^"]*"' | cut -d'"' -f4)
@@ -363,174 +280,9 @@ get_ip_location() {
     echo "查询失败"
 }
 
-# ============================================
-# 系统信息显示函数
-# ============================================
-show_compact_sysinfo() {
-    local hostname=$(hostname)
-    local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
-    local kernel=$(uname -r)
-    local arch=$(uname -m)
-    
-    local cpu_model=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
-    local cpu_cores=$(nproc)
-    local cpu_freq=$(awk '/MHz/ {printf "%.1f GHz", $4/1000; exit}' /proc/cpuinfo 2>/dev/null || echo "N/A")
-    
-    local cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){u1=u; t1=t;} else printf "%.0f%%", (($2+$4-u1) * 100 / (t-t1))}' \
-        <(grep 'cpu ' /proc/stat) <(sleep 0.5; grep 'cpu ' /proc/stat) 2>/dev/null || echo "0%")
-    
-    local load_avg=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-    
-    local tcp_conn=$(ss -tn state established 2>/dev/null | grep -v "^State" | wc -l)
-    local udp_conn=$(ss -un 2>/dev/null | grep -v "^State" | wc -l)
-    
-    local mem_used=$(free -m | awk '/^Mem:/ {print $3}')
-    local mem_total=$(free -m | awk '/^Mem:/ {print $2}')
-    local mem_percent=$(awk "BEGIN {printf \"%.2f\", ($mem_used/$mem_total)*100}")
-    
-    local swap_used=$(free -m | awk '/^Swap:/ {print $3}')
-    local swap_total=$(free -m | awk '/^Swap:/ {print $2}')
-    local swap_percent=0
-    [[ $swap_total -gt 0 ]] && swap_percent=$(awk "BEGIN {printf \"%.0f\", ($swap_used/$swap_total)*100}")
-    
-    local disk_used=$(df -h / | awk 'NR==2 {print $3}')
-    local disk_total=$(df -h / | awk 'NR==2 {print $2}')
-    local disk_percent=$(df -h / | awk 'NR==2 {print $5}')
-    
-    local main_if=$(ip route | grep default | awk '{print $5}' | head -1)
-    [[ -z "$main_if" ]] && main_if=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo" | head -1)
-    
-    local rx_total="0.00G" tx_total="0.00G"
-    if [[ -n "$main_if" && -f "/proc/net/dev" ]]; then
-        local dev_stats=$(grep "$main_if:" /proc/net/dev | awk '{print $2, $10}')
-        if [[ -n "$dev_stats" ]]; then
-            rx_total=$(echo "$dev_stats" | awk '{printf "%.2fG", $1/1024/1024/1024}')
-            tx_total=$(echo "$dev_stats" | awk '{printf "%.2fG", $2/1024/1024/1024}')
-        fi
-    fi
-    
-    local tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    local qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-    
-    local public_ipv4=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "N/A")
-    local public_ipv6=$(curl -s --max-time 3 -6 https://api64.ipify.org 2>/dev/null || echo "未配置")
-    
-    local ipinfo_json=$(curl -s --max-time 3 https://ipinfo.io/json 2>/dev/null || echo "{}")
-    local isp=$(echo "$ipinfo_json" | jq -r '.org // "N/A"' 2>/dev/null || echo "N/A")
-    local location=$(echo "$ipinfo_json" | jq -r '"\(.country) \(.city)"' 2>/dev/null | xargs || echo "N/A")
-    
-    local dns_servers=$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null | xargs)
-    
-    local timezone="UTC"
-    command -v timedatectl >/dev/null 2>&1 && timezone=$(timedatectl | grep "Time zone" | awk '{print $3}' || echo "UTC")
-    local current_time=$(date "+%Y-%m-%d %I:%M %p")
-    
-    local runtime=$(awk -F. '{
-        run_days=int($1 / 86400)
-        run_hours=int(($1 % 86400) / 3600)
-        run_minutes=int(($1 % 3600) / 60)
-        if (run_days > 0) printf("%d天 ", run_days)
-        if (run_hours > 0) printf("%d时 ", run_hours)
-        printf("%d分", run_minutes)
-    }' /proc/uptime)
-    
-    local last_login_info="无记录"
-    if command -v last >/dev/null 2>&1; then
-        local raw_output=$(last -n 10 -a -w 2>/dev/null)
-        local valid_line=$(echo "$raw_output" | grep -E "^[a-zA-Z]" | grep -v "wtmp begins" | grep -v "^reboot" | head -1)
-        
-        if [[ -n "$valid_line" ]]; then
-            local login_user=$(echo "$valid_line" | awk '{print $1}')
-            local login_ip=$(echo "$valid_line" | awk '{print $NF}')
-            local login_time=$(echo "$valid_line" | awk '{print $4, $5, $6, $7}' | sed 's/still.*//' | xargs)
-            
-            if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
-                if [[ "$login_ip" == *:* ]]; then
-                    local display_ip=$(echo "$login_ip" | cut -d: -f1-4)"::"
-                    local ip_location=$(get_ip_location "$login_ip")
-                    last_login_info="${login_user} 从 ${display_ip} (${ip_location}) 于 ${login_time}"
-                else
-                    local ip_location=$(get_ip_location "$login_ip")
-                    last_login_info="${login_user} 从 ${login_ip} (${ip_location}) 于 ${login_time}"
-                fi
-            else
-                last_login_info="${login_user} 于 ${login_time}"
-            fi
-        fi
-    fi
-    
-    local current_users=$(who | wc -l)
-    
-    local ssh_port=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || echo "22")
-    local ufw_status="未安装"
-    if command -v ufw >/dev/null 2>&1; then
-        ufw_status=$(ufw status 2>/dev/null | grep -q "Status: active" && echo "已启用" || echo "未启用")
-    fi
-    
-    local f2b_status="未安装"
-    if command -v fail2ban-client >/dev/null 2>&1; then
-        if systemctl is-active fail2ban &>/dev/null; then
-            local banned_count=$(fail2ban-client status 2>/dev/null | grep "Banned" | awk '{sum+=$NF} END {print sum+0}')
-            f2b_status="运行中 (已封禁: ${banned_count} IP)"
-        else
-            f2b_status="未运行"
-        fi
-    fi
-    
-    local nginx_status="未安装"
-    if command -v nginx >/dev/null 2>&1; then
-        nginx_status=$(systemctl is-active nginx &>/dev/null && echo "运行中" || echo "未运行")
-    fi
-    
-    echo -e "${C_CYAN}系统信息查询${C_RESET}"
-    echo "-------------"
-    printf "%-16s %s\n" "主机名:" "$hostname"
-    printf "%-16s %s\n" "系统版本:" "$os_info"
-    printf "%-16s %s\n" "Linux版本:" "$kernel"
-    echo "-------------"
-    printf "%-16s %s\n" "CPU架构:" "$arch"
-    printf "%-16s %s\n" "CPU型号:" "$cpu_model"
-    printf "%-16s %s\n" "CPU核心数:" "$cpu_cores"
-    printf "%-16s %s\n" "CPU频率:" "$cpu_freq"
-    echo "-------------"
-    printf "%-16s %s\n" "CPU占用:" "$cpu_usage"
-    printf "%-16s %s\n" "系统负载:" "$load_avg"
-    printf "%-16s %s|%s\n" "TCP|UDP连接数:" "$tcp_conn" "$udp_conn"
-    printf "%-16s %s/%sM (%.2f%%)\n" "物理内存:" "$mem_used" "$mem_total" "$mem_percent"
-    printf "%-16s %sM/%sM (%s%%)\n" "虚拟内存:" "$swap_used" "$swap_total" "$swap_percent"
-    printf "%-16s %s/%s (%s)\n" "硬盘占用:" "$disk_used" "$disk_total" "$disk_percent"
-    echo "-------------"
-    printf "%-16s %s\n" "总接收:" "$rx_total"
-    printf "%-16s %s\n" "总发送:" "$tx_total"
-    echo "-------------"
-    printf "%-16s %s %s\n" "网络算法:" "$tcp_cc" "$qdisc"
-    echo "-------------"
-    printf "%-16s %s\n" "运营商:" "$isp"
-    printf "%-16s %s\n" "IPv4地址:" "$public_ipv4"
-    printf "%-16s %s\n" "IPv6地址:" "$public_ipv6"
-    printf "%-16s %s\n" "DNS地址:" "$dns_servers"
-    printf "%-16s %s\n" "地理位置:" "$location"
-    printf "%-16s %s %s\n" "系统时间:" "$timezone" "$current_time"
-    echo "-------------"
-    printf "%-16s %s\n" "运行时长:" "$runtime"
-    echo "-------------"
-    printf "%-16s %s\n" "最近登录:" "$last_login_info"
-    printf "%-16s %s\n" "当前用户数:" "$current_users"
-    echo "-------------"
-    printf "%-16s %s\n" "SSH端口:" "$ssh_port"
-    printf "%-16s %s\n" "UFW防火墙:" "$ufw_status"
-    printf "%-16s %s\n" "Fail2Ban:" "$f2b_status"
-    printf "%-16s %s\n" "Nginx状态:" "$nginx_status"
-}
-
-# ============================================
-# 双栏系统信息显示
-# ============================================
 show_dual_column_sysinfo() {
-    # 尝试加载缓存
     load_cache || refresh_network_cache
-    
-    # ===== 收集系统信息 =====
+
     local hostname=$(hostname)
     local os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -c 35)
     local kernel=$(uname -r | head -c 20)
@@ -539,14 +291,12 @@ show_dual_column_sysinfo() {
     local cpu_model=$(grep "model name" /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs | head -c 25)
     local cpu_cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "1")
     local cpu_freq=$(awk '/MHz/ {printf "%.1fGHz", $4/1000; exit}' /proc/cpuinfo 2>/dev/null || echo "N/A")
-    
-    # CPU 使用率 (快速采样)
+
     local cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){u1=u;t1=t}else{if(t-t1>0)printf "%.0f%%",(u-u1)*100/(t-t1);else print "0%"}}' \
         <(grep 'cpu ' /proc/stat) <(sleep 0.3; grep 'cpu ' /proc/stat) 2>/dev/null || echo "0%")
     
     local load_avg=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg 2>/dev/null)
-    
-    # 连接数
+
     local tcp_conn=0 udp_conn=0
     if command -v ss >/dev/null 2>&1; then
         tcp_conn=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
@@ -555,14 +305,12 @@ show_dual_column_sysinfo() {
         tcp_conn=$(awk 'NR>1 && $4=="01"{n++}END{print n+0}' /proc/net/tcp 2>/dev/null)
         udp_conn=$(awk 'NR>1{n++}END{print n+0}' /proc/net/udp 2>/dev/null)
     fi
-    
-    # 内存
+
     local mem_info swap_info
     if command -v free >/dev/null 2>&1; then
         mem_info=$(free -m | awk '/^Mem:/ {printf "%d/%dM %.0f%%", $3, $2, ($2>0)?$3/$2*100:0}')
         swap_info=$(free -m | awk '/^Swap:/ {if($2>0) printf "%d/%dM %.0f%%", $3, $2, $3/$2*100; else print "未启用"}')
     else
-        # OpenWrt fallback: 从 /proc/meminfo 读取
         local mt=$(awk '/^MemTotal/{print int($2/1024)}' /proc/meminfo)
         local mf=$(awk '/^MemAvailable/{print int($2/1024)}' /proc/meminfo)
         local mu=$((mt - mf))
@@ -570,58 +318,43 @@ show_dual_column_sysinfo() {
         swap_info="未启用"
     fi
     
-    # 磁盘
     local disk_info=$(df -h / | awk 'NR==2 {printf "%s/%s %s", $3, $2, $5}')
     
-    # 网络流量
     local main_if=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
     local rx_total="0B" tx_total="0B"
     if [[ -n "$main_if" ]]; then
-        local stats=$(awk -v iface="$main_if:" '$1==iface {print $2,$10}' /proc/net/dev 2>/dev/null)
-        if [[ -n "$stats" ]]; then
-            rx_total=$(echo "$stats" | awk '{
-                if($1>=1073741824) printf "%.2fG",$1/1073741824
-                else if($1>=1048576) printf "%.0fM",$1/1048576
-                else if($1>=1024) printf "%.0fK",$1/1024
-                else printf "%dB",$1
-            }')
-            tx_total=$(echo "$stats" | awk '{
-                if($2>=1073741824) printf "%.2fG",$2/1073741824
-                else if($2>=1048576) printf "%.0fM",$2/1048576
-                else if($2>=1024) printf "%.0fK",$2/1024
-                else printf "%dB",$2
-            }')
-        fi
+        read -r rx_total tx_total <<< "$(awk -v iface="$main_if:" '
+            function fmt(b) {
+                if(b>=1073741824) return sprintf("%.2fG",b/1073741824)
+                if(b>=1048576) return sprintf("%.0fM",b/1048576)
+                if(b>=1024) return sprintf("%.0fK",b/1024)
+                return sprintf("%dB",b)
+            }
+            $1==iface {print fmt($2), fmt($10)}
+        ' /proc/net/dev 2>/dev/null)"
+        rx_total=${rx_total:-0B}; tx_total=${tx_total:-0B}
     fi
     
-    # 网络算法
     local tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
     local qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
-    
-    # 运行时间
+
     local uptime_str=$(awk '{d=int($1/86400);h=int($1%86400/3600);m=int($1%3600/60);
         if(d>0)printf "%d天%d时%d分",d,h,m;else if(h>0)printf "%d时%d分",h,m;else printf "%d分",m}' /proc/uptime)
     
-    # 时间
     local sys_time=$(date "+%m-%d %H:%M")
     local timezone=$(timedatectl 2>/dev/null | awk '/Time zone/{print $3}' || echo "UTC")
-    
-    # SSH 端口
+
     local ssh_port=$(grep -E "^Port\s" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
     [[ -z "$ssh_port" ]] && ssh_port="22"
-    
-    # 服务状态 (简化符号)
+
     local ufw_st="○"; command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active" && ufw_st="●"
     local f2b_st="○"; systemctl is-active fail2ban &>/dev/null && f2b_st="●"
     local nginx_st="○"; systemctl is-active nginx &>/dev/null && nginx_st="●"
     local docker_st="○"; systemctl is-active docker &>/dev/null && docker_st="●"
-    
-    # ===== 双栏输出 =====
+    local wg_st="○"; ip link show wg0 &>/dev/null && wg_st="●"
+
     local W=76  # 总宽度
-    local LW=37 # 左栏宽度
-    local RW=37 # 右栏宽度
-    
-    # 主机信息
+
     printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
         "主机:" "$hostname" "IPv4:" "$CACHED_IPV4"
     printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
@@ -630,8 +363,7 @@ show_dual_column_sysinfo() {
         "内核:" "$kernel" "运营商:" "${CACHED_ISP:0:18}"
     
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    
-    # CPU 和内存
+
     printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
         "CPU:" "${cpu_model:0:17}" "内存:" "$mem_info"
     printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
@@ -642,8 +374,7 @@ show_dual_column_sysinfo() {
         "占用:" "$cpu_usage 连接:${tcp_conn}t/${udp_conn}u" "流量:" "↓${rx_total} ↑${tx_total}"
     
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    
-    # 网络和时间
+
     printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
         "算法:" "$tcp_cc + $qdisc" "位置:" "${CACHED_LOCATION:0:18}"
     printf " ${C_CYAN}%-18s${C_RESET}%-17s │ ${C_CYAN}%-8s${C_RESET}%s\n" \
@@ -652,12 +383,10 @@ show_dual_column_sysinfo() {
         "SSH:" "端口 $ssh_port" "时间:" "$sys_time"
     
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    
-    # 服务状态行
-    printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}]\n" \
-        "$ufw_st" "$f2b_st" "$nginx_st" "$docker_st"
-    
-        # 上次登录信息
+
+    printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}] WG[${C_GREEN}%s${C_RESET}]\n" \
+        "$ufw_st" "$f2b_st" "$nginx_st" "$docker_st" "$wg_st"
+
     local last_login="无记录"
     if command -v last >/dev/null 2>&1; then
         local login_line=$(last -n 10 -a -w 2>/dev/null | grep -E "^[a-zA-Z]" | grep -v -E "wtmp begins|^reboot" | head -1)
@@ -678,56 +407,21 @@ show_dual_column_sysinfo() {
     printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
     printf " ${C_CYAN}%-8s${C_RESET}%s\n" "登录:" "${last_login:0:65}"
 }
-# ============================================
-# 终端修复函数
-# ============================================
 fix_terminal() {
-    # 检查是否为交互式终端
     [[ -t 0 ]] || return 0
-    
-    # 修复删除键
-    stty erase '^?' 2>/dev/null || true
-    stty erase '^H' 2>/dev/null || true
-    
-    # 修复其他控制字符
-    stty intr '^C' 2>/dev/null || true
-    stty susp '^Z' 2>/dev/null || true
-    
-    # 启用行编辑
-    stty icanon 2>/dev/null || true
-    stty echo 2>/dev/null || true
-    
-    # 设置终端类型
+    stty erase '^?' intr '^C' susp '^Z' icanon echo 2>/dev/null || true
     export TERM="${TERM:-xterm-256color}"
-    
-    # 绑定删除键（如果支持 bind 命令）
-    if command -v bind >/dev/null 2>&1 && [[ $- == *i* ]]; then
-        bind '"\e[3~": delete-char' 2>/dev/null || true
-        bind '"\C-?": backward-delete-char' 2>/dev/null || true
-        bind '"\C-h": backward-delete-char' 2>/dev/null || true
-    fi
 }
-
-# 在脚本开始时调用
 fix_terminal
 
-
-# 获取终端宽度
-get_term_width() {
-    tput cols 2>/dev/null || echo 80
-}
-
-
-# 画分隔线
 draw_line() {
-    printf "%$(get_term_width)s\n" | tr " " "-"
+    printf "%$(tput cols 2>/dev/null || echo 80)s\n" | tr " " "-"
 }
 
-# 打印标题
 print_title() {
     clear || true
     local title=" $1 "
-    local width=$(get_term_width)
+    local width=$(tput cols 2>/dev/null || echo 80)
     local padding=$(( (width - ${#title}) / 2 ))
     [[ $padding -lt 0 ]] && padding=0
     
@@ -738,23 +432,16 @@ print_title() {
     echo -e "${C_RESET}"
 }
 
-
-
-# 统一输出
 print_info() { echo -e "${C_BLUE}[i]${C_RESET} $1"; }
 print_guide() { echo -e "${C_GREEN}>>${C_RESET} $1"; }
 print_success() { echo -e "${C_GREEN}[✓]${C_RESET} $1"; }
 print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1"; }
 print_error() { echo -e "${C_RED}[✗]${C_RESET} $1"; }
 
-# 结构化日志
 log_action() {
-    local level="${2:-INFO}"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "{\"time\":\"$timestamp\",\"level\":\"$level\",\"msg\":\"$1\"}" >> "$LOG_FILE" 2>/dev/null || true
+    echo "{\"time\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"level\":\"${2:-INFO}\",\"msg\":\"$1\"}" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# 暂停
 pause() {
     [[ -t 0 ]] || return 0
     echo ""
@@ -762,7 +449,6 @@ pause() {
     echo ""
 }
 
-# 原子写入
 write_file_atomic() {
     local filepath="$1" content="$2" tmpfile
     mkdir -p "$(dirname "$filepath")"
@@ -777,22 +463,8 @@ write_file_atomic() {
     trap - RETURN
 }
 
-# 安全 Curl
-safe_curl() {
-    curl -s -L --connect-timeout 5 --max-time 10 --retry 3 --retry-delay 2 "$@"
-}
-
-
-
-# 错误处理
-cleanup_temp_files() {
-    rm -f /etc/.tmp.* 2>/dev/null
-}
-
-
-
 handle_interrupt() {
-    cleanup_temp_files
+    rm -f /etc/.tmp.* 2>/dev/null
     echo ""
     print_warn "操作已取消 (用户中断)。"
     exit 130
@@ -800,11 +472,10 @@ handle_interrupt() {
 
 trap 'handle_interrupt' SIGINT SIGTERM
 
-# 环境检查
 check_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
         print_error "请使用 root 权限运行 (sudo)。"
-        exit $E_PERMISSION
+        exit 2
     fi
 }
 
@@ -817,12 +488,10 @@ check_os() {
         sleep 2
         return 0
     fi
-
     if [[ ! -f /etc/os-release ]]; then
         print_error "不支持的操作系统。"
-        exit $E_GENERAL
+        exit 1
     fi
-
     local os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
     if [[ "$os_id" != "ubuntu" && "$os_id" != "debian" ]]; then
         print_warn "脚本主要针对 Ubuntu/Debian 优化，其他系统可能存在兼容性问题。"
@@ -831,7 +500,6 @@ check_os() {
         fi
     fi
 }
-
 
 command_exists() { 
     command -v "$1" >/dev/null 2>&1
@@ -844,7 +512,6 @@ is_systemd() {
     return 0
 }
 
-# 更新 SSH 端口
 refresh_ssh_port() {
     if [[ -f "$SSHD_CONFIG" ]]; then
         CURRENT_SSH_PORT=$(grep -iE "^\s*Port\s+" "$SSHD_CONFIG" 2>/dev/null | tail -n 1 | awk '{print $2}')
@@ -852,7 +519,6 @@ refresh_ssh_port() {
     [[ "$CURRENT_SSH_PORT" =~ ^[0-9]+$ ]] || CURRENT_SSH_PORT=$DEFAULT_SSH_PORT
 }
 
-# 通用确认
 confirm() {
     local prompt="$1"
     local reply
@@ -866,7 +532,6 @@ confirm() {
     done
 }
 
-# 输入验证
 validate_port() {
     local port=$1
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
@@ -874,7 +539,6 @@ validate_port() {
 
 validate_ip() {
     local ip=$1
-    # IPv4
     if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
         local IFS='.'
         local -a octets
@@ -885,7 +549,6 @@ validate_ip() {
         done
         return 0
     fi
-    # IPv6
     [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
 }
 
@@ -894,9 +557,6 @@ validate_domain() {
     [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
 }
 
-
-
-# 脚本初始化
 init_environment() {
     mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
 
@@ -907,9 +567,7 @@ init_environment() {
 
     refresh_ssh_port
 
-    # OpenWrt 只装最基础的，跳过 apt
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        # 确保 curl jq openssl 可用
         for p in curl jq openssl-util ca-bundle; do
             command -v "${p%%-*}" &>/dev/null 2>&1 || {
                 opkg update >/dev/null 2>&1
@@ -923,17 +581,12 @@ init_environment() {
     log_action "Script initialized (platform=$PLATFORM)" "INFO"
 }
 
-# ==============================================================================
-# 1. 系统更新模块
-# ==============================================================================
-
 menu_update() {
     print_title "基础依赖安装"
     
     print_info "正在检查并安装基础依赖..."
     echo ""
-    
-    # 记录安装前的状态
+
     local ufw_was_active=0
     local f2b_was_active=0
     
@@ -944,7 +597,6 @@ menu_update() {
         f2b_was_active=1
     fi
     
-    # 更新软件源
     print_info "1/2 更新软件源..."
     if apt-get update -y >/dev/null 2>&1; then
         print_success "软件源更新完成"
@@ -954,7 +606,6 @@ menu_update() {
     
     echo ""
     
-    # 安装基础依赖
     print_info "2/2 安装基础依赖包..."
     local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban nginx iproute2 net-tools procps"
     local installed=0
@@ -983,7 +634,6 @@ menu_update() {
     echo "  新安装: $installed 个"
     [[ $failed -gt 0 ]] && echo -e "  ${C_RED}失败: $failed 个${C_RESET}"
     
-    # 显示新安装服务的配置提示
     if [[ "$new_packages" == *"ufw"* ]] || [[ "$new_packages" == *"fail2ban"* ]]; then
         echo ""
         echo -e "${C_YELLOW}提示:${C_RESET} 检测到新安装的安全服务"
@@ -991,7 +641,6 @@ menu_update() {
         [[ "$new_packages" == *"fail2ban"* ]] && echo "  - Fail2ban: 请通过菜单 [3] 配置后启用"
     fi
     
-    # 恢复之前的服务状态（如果之前是运行的）
     if [[ $ufw_was_active -eq 1 ]]; then
         ufw --force enable >/dev/null 2>&1 || true
     fi
@@ -1005,10 +654,6 @@ menu_update() {
     pause
 }
 
-# ==============================================================================
-# 2. 依赖管理模块
-# ==============================================================================
-
 update_apt_cache() {
     if [[ $APT_UPDATED -eq 0 ]]; then
         print_info "更新软件源缓存..."
@@ -1020,7 +665,6 @@ update_apt_cache() {
 install_package() {
     local pkg="$1"
     local silent="${2:-}"
-        # OpenWrt 走 opkg
     if [[ "$PLATFORM" == "openwrt" ]]; then
         if command -v "${pkg%%-*}" &>/dev/null 2>&1 || opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
             [[ "$silent" != "silent" ]] && print_warn "$pkg 已安装，跳过。"
@@ -1038,7 +682,6 @@ install_package() {
         fi
     fi
 
-    
     if dpkg -s "$pkg" &> /dev/null; then
         [[ "$silent" != "silent" ]] && print_warn "$pkg 已安装，跳过。"
         return 0
@@ -1060,68 +703,12 @@ install_package() {
     log_action "Installed package: $pkg"
     return 0
 }
-
-
-
-
-
-
 auto_deps() {
     local deps="curl wget jq unzip openssl ca-certificates iproute2 net-tools procps"
     for p in $deps; do
         dpkg -s "$p" &> /dev/null || install_package "$p" "silent"
     done
 }
-
-
-
-# ==============================================================================
-# 3. 系统信息模块
-# ==============================================================================
-
-# 获取公网 IPv6 地址
-get_public_ipv6() {
-    local ipv6=""
-    
-    # 方法 1: api64.ipify.org
-    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
-    if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
-        echo "$ipv6"
-        return 0
-    fi
-    
-    # 方法 2: ifconfig.co
-    ipv6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://ifconfig.co 2>/dev/null)
-    if [[ -n "$ipv6" ]] && [[ "$ipv6" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ipv6" == *:* ]]; then
-        echo "$ipv6"
-        return 0
-    fi
-    
-    # 方法 3: 本地接口
-    if command -v ip >/dev/null 2>&1; then
-        ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP '(?<=inet6 )[0-9a-fA-F:]+' | grep -v '^fe80:' | head -n1)
-        if [[ -n "$ipv6" ]]; then
-            echo "$ipv6"
-            return 0
-        fi
-    fi
-    
-    echo "未检测到"
-    return 0
-}
-
-
-sys_info() {
-    print_title "系统状态查询"
-    echo ""
-    show_compact_sysinfo
-    echo ""
-    pause
-}
-
-# ==============================================================================
-# 4. UFW 防火墙模块
-# ==============================================================================
 
 check_port_usage() {
     print_title "本机端口监听状态"
@@ -1186,7 +773,6 @@ ufw_del() {
     echo -e "${C_CYAN}当前放行的端口 (已过滤 Fail2ban 规则):${C_RESET}"
     echo ""
     
-    # 显示 ALLOW 规则（端口/协议）
     ufw status | grep "ALLOW" | awk '{print $1}' | sort -t'/' -k1,1n -u
     
     echo ""
@@ -1201,10 +787,8 @@ ufw_del() {
             local proto="${BASH_REMATCH[2]}"
             
             if [[ -n "$proto" ]]; then
-                # 指定了协议
                 ufw delete allow "${port}${proto}" 2>/dev/null && print_success "已删除: ${port}${proto}" || print_warn "${port}${proto} 不存在"
             else
-                # 未指定协议，删除 tcp 和 udp
                 ufw delete allow "${port}/tcp" 2>/dev/null && print_success "已删除: ${port}/tcp" || print_warn "${port}/tcp 不存在"
                 ufw delete allow "${port}/udp" 2>/dev/null && print_success "已删除: ${port}/udp" || true
             fi
@@ -1247,12 +831,10 @@ ufw_add() {
             
             if validate_port "$port"; then
                 if [[ -n "$proto" ]]; then
-                    # 指定了协议
                     ufw allow "${port}${proto}" comment "Manual-Add" >/dev/null && \
                         print_success "已放行: ${port}${proto}" || \
                         print_error "添加失败: ${port}${proto}"
                 else
-                    # 未指定协议，同时添加 tcp 和 udp
                     ufw allow "${port}/tcp" comment "Manual-Add" >/dev/null && \
                         print_success "已放行: ${port}/tcp" || \
                         print_error "添加失败: ${port}/tcp"
@@ -1343,10 +925,6 @@ menu_ufw() {
     done
 }
 
-# ==============================================================================
-# 5. Fail2ban 模块
-# ==============================================================================
-
 f2b_setup() {
     print_title "Fail2ban 安装与配置"
     install_package "fail2ban" "silent"
@@ -1358,24 +936,18 @@ f2b_setup() {
         systemctl restart rsyslog || true
         backend="systemd"
     fi
-
-    # SSH 端口
     read -e -r -p "监控 SSH 端口 [$CURRENT_SSH_PORT]: " port
     port=${port:-$CURRENT_SSH_PORT}
     if ! validate_port "$port"; then
         print_error "端口无效，使用默认值 $CURRENT_SSH_PORT"
         port=$CURRENT_SSH_PORT
     fi
-    
-    # 最大重试次数
     read -e -r -p "最大重试次数 (登录失败几次后封禁) [5]: " maxretry
     maxretry=${maxretry:-5}
     if ! [[ "$maxretry" =~ ^[0-9]+$ ]] || [ "$maxretry" -lt 1 ]; then
         print_warn "无效输入，使用默认值 5"
         maxretry=5
     fi
-    
-    # 封禁时间
     echo ""
     echo "封禁时间选项:"
     echo "  1) 10分钟 (10m)"
@@ -1409,8 +981,7 @@ f2b_setup() {
             bantime="10m"
             ;;
     esac
-    
-    # 检测时间窗口
+
     echo ""
     echo "检测时间窗口 (在此时间内达到最大重试次数则封禁):"
     echo "  1) 10分钟 (10m) - 默认"
@@ -1435,8 +1006,7 @@ f2b_setup() {
             ;;
         *) findtime="10m" ;;
     esac
-    
-    # 显示配置摘要
+
     echo ""
     draw_line
     echo -e "${C_CYAN}配置摘要:${C_RESET}"
@@ -1453,7 +1023,6 @@ f2b_setup() {
         return
     fi
 
-    # 先检测 banaction（在 conf_content 赋值之前）
     local banaction="iptables-multiport"
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         banaction="ufw"
@@ -1631,8 +1200,7 @@ menu_f2b() {
     fix_terminal
     while true; do
         print_title "Fail2ban 入侵防御"
-        
-        # 显示当前状态
+
         if command_exists fail2ban-client; then
             if systemctl is-active fail2ban &>/dev/null; then
                 local banned_count=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
@@ -1681,9 +1249,6 @@ menu_f2b() {
         esac
     done
 }
-# ==============================================================================
-# 6. SSH 安全模块
-# ==============================================================================
 
 ssh_change_port() {
     print_title "修改 SSH 端口"
@@ -1726,9 +1291,6 @@ ssh_change_port() {
     fi
     pause
 }
-# ==============================================================================
-# 7. 系统优化模块
-# ==============================================================================
 
 opt_cleanup() {
     print_title "系统清理"
@@ -1847,6 +1409,20 @@ opt_bbr() {
     pause
 }
 
+select_timezone() {
+    echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
+    read -e -r -p "选择: " t
+    local z
+    case $t in
+        1) z="Asia/Shanghai" ;; 2) z="Asia/Hong_Kong" ;; 3) z="Asia/Tokyo" ;;
+        4) z="America/New_York" ;; 5) z="Europe/London" ;; 6) z="UTC" ;;
+        *) print_error "无效选择"; return 1 ;;
+    esac
+    ln -sf /usr/share/zoneinfo/$z /etc/localtime
+    print_success "时区已设为 $z"
+    log_action "Timezone changed to $z"
+}
+
 menu_opt() {
     fix_terminal
     while true; do
@@ -1864,22 +1440,7 @@ menu_opt() {
             2) opt_swap ;;
             3) opt_hostname ;;
             4) opt_cleanup ;;
-            5)
-                echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
-                read -e -r -p "选择: " t
-                case $t in
-                    1) z="Asia/Shanghai" ;;
-                    2) z="Asia/Hong_Kong" ;;
-                    3) z="Asia/Tokyo" ;;
-                    4) z="America/New_York" ;;
-                    5) z="Europe/London" ;;
-                    6) z="UTC" ;;
-                    *) print_error "无效选择"; pause; continue ;;
-                esac
-                ln -sf /usr/share/zoneinfo/$z /etc/localtime
-                print_success "时区已设为 $z"
-                log_action "Timezone changed to $z"
-                pause ;;
+            5) select_timezone || true; pause ;;
             0|q) break ;;
             *) print_error "无效" ;;
         esac
@@ -1969,10 +1530,6 @@ menu_ssh() {
     done
 }
 
-# ==============================================================================
-# 8. 网络工具模块
-# ==============================================================================
-
 net_iperf3() {
     print_title "iPerf3 测速"
     install_package "iperf3"
@@ -1994,8 +1551,9 @@ net_iperf3() {
         fi
     fi
     
-    local ip4=$(safe_curl https://api.ipify.org)
-    local ip6=$(get_public_ipv6)
+    local ip4=$(curl -s -L --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null)
+    local ip6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
+    [[ -z "$ip6" || ! "$ip6" =~ : ]] && ip6="未检测到"
     
     echo -e "\n${C_BLUE}=== 客户端测速命令 ===${C_RESET}"
     [[ -n "$ip4" ]] && echo -e "IPv4 Upload: ${C_YELLOW}iperf3 -c $ip4 -p $port${C_RESET}"
@@ -2003,32 +1561,26 @@ net_iperf3() {
     [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Upload: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port${C_RESET}"
     [[ -n "$ip6" && "$ip6" != "未检测到" ]] && echo -e "IPv6 Download: ${C_YELLOW}iperf3 -6 -c $ip6 -p $port -R${C_RESET}"
     echo -e "${C_RED}按 Ctrl+C 停止测试...${C_RESET}"
-    
-    # 启动 iperf3 服务器
+
     iperf3 -s -p "$port" &
     local iperf_pid=$!
-    
-    # 标记是否已清理
+
     local cleaned=0
-    
-    # 清理函数
+
     cleanup_iperf() {
         [[ $cleaned -eq 1 ]] && return
         cleaned=1
         
         echo ""
         print_info "正在停止 iPerf3 服务..."
-        
-        # 杀死 iperf3 进程
+
         if [[ -n "$iperf_pid" ]] && kill -0 "$iperf_pid" 2>/dev/null; then
             kill "$iperf_pid" 2>/dev/null || true
             wait "$iperf_pid" 2>/dev/null || true
         fi
-        
-        # 清理可能残留的 iperf3 进程
+
         pkill -f "iperf3 -s -p $port" 2>/dev/null || true
-        
-        # 移除防火墙规则
+
         if [[ $ufw_opened -eq 1 ]]; then
             ufw delete allow "$port/tcp" >/dev/null 2>&1 || true
             print_info "防火墙规则已移除。"
@@ -2036,22 +1588,17 @@ net_iperf3() {
         
         print_success "iPerf3 服务已停止。"
     }
-    
-    # 设置中断处理
+
     trap 'cleanup_iperf; trap - SIGINT SIGTERM' SIGINT SIGTERM
-    
-    # 等待 iperf3 进程
+
     wait $iperf_pid 2>/dev/null || true
-    
-    # 恢复默认中断处理
+
     trap 'handle_interrupt' SIGINT SIGTERM
     
     cleanup_iperf
     log_action "iPerf3 test completed on port $port"
     pause
 }
-
-
 
 net_dns() {
     print_title "DNS 配置"
@@ -2126,20 +1673,14 @@ menu_net() {
     done
 }
 
-# ==============================================================================
-# 9. Web 服务模块 (Part 1 - 环境与 DNS)
-# ==============================================================================
-
 web_env_check() {
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        # OpenWrt: 用 opkg 安装
         for pkg in jq curl openssl-util ca-bundle; do
             command -v "${pkg%%-*}" &>/dev/null || {
                 opkg update >/dev/null 2>&1
                 opkg install "$pkg" >/dev/null 2>&1 || true
             }
         done
-        # 检查 certbot（OpenWrt 上可能需要手动安装或用 acme.sh）
         if ! command_exists certbot; then
             print_warn "OpenWrt 上 certbot 可能不可用。"
             print_info "建议使用 opkg install acme acme-dnsapi 或手动安装 certbot。"
@@ -2147,7 +1688,6 @@ web_env_check() {
                 return 1
             fi
         fi
-        # 检查 nginx
         if ! command_exists nginx; then
             print_info "安装 nginx..."
             opkg update >/dev/null 2>&1
@@ -2160,8 +1700,6 @@ web_env_check() {
         chmod 700 "$CONFIG_DIR"
         return 0
     fi
-
-    # Debian/Ubuntu 原逻辑
     command_exists jq || install_package "jq"
     command_exists nginx || install_package "nginx"
     is_systemd && (systemctl enable --now nginx >/dev/null 2>&1 || true)
@@ -2189,7 +1727,6 @@ web_env_check() {
     chmod 700 "$CONFIG_DIR"
 }
 
-# 传递结果给调用者的全局变量
 _CF_RESULT_DOMAIN=""
 _CF_RESULT_TOKEN=""
 
@@ -2266,9 +1803,7 @@ web_cf_dns_update() {
         pause; return
     fi
     
-    # 询问是否开启 CDN 代理
     echo ""
-        echo ""
     echo -e "${C_YELLOW}注意: 开启代理后，只有 HTTP/HTTPS 流量能通过 Cloudflare。${C_RESET}"
     echo -e "${C_YELLOW}SSH、RDP、端口转发等非 HTTP 服务将无法使用此域名访问。${C_RESET}"
     read -e -r -p "是否开启 Cloudflare 代理 (小云朵)? [y/N]: " proxy_choice
@@ -2318,21 +1853,15 @@ web_cf_dns_update() {
     print_success "DNS 配置完成。"
     log_action "Cloudflare DNS updated for $DOMAIN"
 
-    # DDNS 配置
     local ddns_v4=$([[ "$mode" == "1" || "$mode" == "3" ]] && echo "true" || echo "false")
     local ddns_v6=$([[ "$mode" == "2" || "$mode" == "3" ]] && echo "true" || echo "false")
     ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_v4" "$ddns_v6" "$proxied"
 
-    # 传递结果给 web_add_domain
     _CF_RESULT_DOMAIN="$DOMAIN"
     _CF_RESULT_TOKEN="$CF_API_TOKEN"
 
     sleep 2
 }
-
-# ==============================================================================
-# 9. Web 服务模块 (Part 2 - 域名管理)
-# ==============================================================================
 
 web_view_config() {
     print_title "查看详细配置"
@@ -2526,17 +2055,12 @@ web_delete_domain() {
         fi
         print_success "Nginx 配置已删除。"
     fi
-    
-        # 删除该域名的 hook 脚本
     local hook_script="${CERT_HOOKS_DIR}/renew-${target_domain}.sh"
-    # 兼容旧路径
     [[ ! -f "$hook_script" ]] && hook_script="/root/cert-renew-hook-${target_domain}.sh"
     if [[ -f "$hook_script" ]]; then
         rm -f "$hook_script"
         print_success "Hook 脚本已删除。"
     fi
-    
-    # 如果没有剩余的 hook 脚本了，清理 crontab
     shopt -s nullglob
     local remaining_hooks=("${CERT_HOOKS_DIR}"/*.sh /root/cert-renew-hook-*.sh)
     shopt -u nullglob
@@ -2555,10 +2079,6 @@ web_delete_domain() {
     pause
 }
 
-# ==============================================================================
-# 9. Web 服务模块 (Part 3 - 添加域名)
-# ==============================================================================
-
 web_add_domain() {
     print_title "添加域名配置 (SSL + Nginx)"
     local DOMAIN="" CF_API_TOKEN="" LOCAL_PROXY_PASS="" NGINX_HTTP_PORT="" NGINX_HTTPS_PORT="" BACKEND_PROTOCOL=""
@@ -2570,7 +2090,6 @@ web_add_domain() {
     
     if confirm "是否需要先自动配置 Cloudflare DNS 解析 (A/AAAA)?"; then
         web_cf_dns_update
-        # 继承 DNS 配置中已输入的域名和 Token
         [[ -n "$_CF_RESULT_DOMAIN" ]] && DOMAIN="$_CF_RESULT_DOMAIN"
         [[ -n "$_CF_RESULT_TOKEN" ]] && CF_API_TOKEN="$_CF_RESULT_TOKEN"
         _CF_RESULT_DOMAIN=""
@@ -2734,7 +2253,6 @@ server {
             fi
         fi
         
-        # 把 hook 脚本放到统一目录
                 mkdir -p "$CERT_HOOKS_DIR"
         local DEPLOY_HOOK_SCRIPT="${CERT_HOOKS_DIR}/renew-${DOMAIN}.sh"
         
@@ -2785,8 +2303,6 @@ exit 0
         write_file_atomic "$DEPLOY_HOOK_SCRIPT" "$hook_content"
         chmod +x "$DEPLOY_HOOK_SCRIPT"
         
-        
-        # 只添加一条全局续签 crontab（幂等）
         local cron_tmp=$(mktemp)
         crontab -l 2>/dev/null | grep -v "no crontab for" > "$cron_tmp" || true
         if ! grep -q "certbot renew" "$cron_tmp"; then
@@ -2818,7 +2334,6 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
         
         write_file_atomic "${CONFIG_DIR}/${DOMAIN}.conf" "$config_content"
 
-        # ========== 在这里插入 DDNS 配置 ==========
         if [[ -n "$CF_API_TOKEN" ]] && [[ ! -f "$DDNS_CONFIG_DIR/${DOMAIN}.conf" ]]; then
             local zone_id="" current="$DOMAIN"
             while [[ "$current" == *"."* && -z "$zone_id" ]]; do
@@ -2834,7 +2349,6 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
                 ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "false"
             fi
         fi
-        # ========== DDNS 配置结束 ==========
         
         echo ""
         draw_line
@@ -2872,16 +2386,11 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
     pause
 }
 
-# ==============================================================================
-# 9. Web 服务模块 (Part 4 - 菜单)
-# ==============================================================================
-
 menu_web() {
     fix_terminal
     while true; do
         print_title "Web 服务管理 (SSL + Nginx + DDNS)"
         
-        # 状态显示
         local cert_count=$(ls -1 "$CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
         local ddns_count=$(ls -1 "$DDNS_CONFIG_DIR"/*.conf 2>/dev/null | wc -l)
         echo -e "证书域名: ${C_GREEN}${cert_count}${C_RESET} | DDNS域名: ${C_GREEN}${ddns_count}${C_RESET}"
@@ -2920,7 +2429,6 @@ menu_web() {
                 command_exists certbot || { print_error "Certbot 未安装"; pause; continue; }
                 print_info "正在续签..."
                 certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log
-                # 执行所有 hook
                 shopt -s nullglob
                 for hook in "${CERT_HOOKS_DIR}"/*.sh /root/cert-renew-hook-*.sh; do
                     [[ -x "$hook" ]] && bash "$hook"
@@ -2943,10 +2451,6 @@ menu_web() {
         esac
     done
 }
-
-# ==============================================================================
-# 10. Docker 模块
-# ==============================================================================
 
 docker_install() {
     print_title "Docker 安装"
@@ -3058,8 +2562,7 @@ docker_compose_install() {
     print_info "正在安装 Docker Compose..."
     
     local compose_version="v2.24.5"
-    local arch=$(uname -m)
-    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-${arch}"
+    local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-$(uname -m)"
     
     if curl -L "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
         chmod +x /usr/local/bin/docker-compose
@@ -3274,9 +2777,548 @@ menu_docker() {
     done
 }
 
-# ==============================================================================
-# 11. 主菜单
-# ==============================================================================
+readonly WG_INTERFACE="wg0"
+readonly WG_DB_DIR="/etc/wireguard/db"
+readonly WG_DB_FILE="${WG_DB_DIR}/wg-data.json"
+readonly WG_CONF="/etc/wireguard/${WG_INTERFACE}.conf"
+readonly WG_ROLE_FILE="/etc/wireguard/.role"
+
+wg_db_init() {
+    mkdir -p "$WG_DB_DIR"
+    [[ -f "$WG_DB_FILE" ]] && return 0
+    cat > "$WG_DB_FILE" << 'WGEOF'
+{
+  "role": "",
+  "server": {},
+  "peers": [],
+  "port_forwards": [],
+  "client": {}
+}
+WGEOF
+    chmod 600 "$WG_DB_FILE"
+}
+
+wg_db_get() { jq -r "$@" "$WG_DB_FILE" 2>/dev/null; }
+
+wg_db_set() {
+    local tmp; tmp=$(mktemp)
+    if jq "$@" "$WG_DB_FILE" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$WG_DB_FILE"; chmod 600 "$WG_DB_FILE"
+    else
+        rm -f "$tmp"; print_error "数据库写入失败"; return 1
+    fi
+}
+
+wg_get_role() {
+    local role=""
+    [[ -f "$WG_ROLE_FILE" ]] && role=$(cat "$WG_ROLE_FILE" 2>/dev/null)
+    [[ -z "$role" && -f "$WG_DB_FILE" ]] && role=$(wg_db_get '.role // empty')
+    if [[ -z "$role" && -f "$WG_DB_FILE" ]]; then
+        local spk=$(wg_db_get '.server.private_key // empty')
+        [[ -n "$spk" ]] && role="server"
+    fi
+    echo "${role:-none}"
+}
+
+wg_set_role() {
+    mkdir -p /etc/wireguard
+    echo "$1" > "$WG_ROLE_FILE"
+    chmod 600 "$WG_ROLE_FILE"
+    wg_db_set --arg r "$1" '.role = $r' 2>/dev/null || true
+}
+
+wg_is_installed() { command_exists wg && [[ -f "$WG_DB_FILE" ]]; }
+wg_is_running()   { ip link show "$WG_INTERFACE" &>/dev/null; }
+
+wg_check_installed() {
+    if ! wg_is_installed; then
+        print_error "WireGuard 未安装，请先执行安装。"
+        pause; return 1
+    fi
+    return 0
+}
+
+wg_check_server() {
+    wg_check_installed || return 1
+    if [[ "$(wg_get_role)" != "server" ]]; then
+        print_error "当前不是服务端模式，此功能仅服务端可用。"
+        pause; return 1
+    fi
+    return 0
+}
+
+wg_install_packages() {
+    print_info "安装 WireGuard 软件包..."
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        opkg update >/dev/null 2>&1
+        for pkg in wireguard-tools qrencode; do
+            install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
+        done
+    else
+        update_apt_cache
+        for pkg in wireguard wireguard-tools qrencode; do
+            install_package "$pkg" "silent" || { print_error "安装 $pkg 失败"; return 1; }
+        done
+    fi
+    print_success "软件包安装完成"
+    return 0
+}
+
+wg_next_ip() {
+    local subnet prefix used_ips
+    subnet=$(wg_db_get '.server.subnet')
+    prefix=$(echo "$subnet" | cut -d'/' -f1 | cut -d'.' -f1-3)
+    used_ips=$(wg_db_get '.server.ip')
+    local pc; pc=$(wg_db_get '.peers | length')
+    local i=0
+    while [[ $i -lt $pc ]]; do
+        used_ips="$used_ips $(wg_db_get ".peers[$i].ip")"
+        i=$((i + 1))
+    done
+    local next
+    for next in $(seq 2 254); do
+        local candidate="${prefix}.${next}"
+        echo "$used_ips" | grep -qw "$candidate" || { echo "$candidate"; return 0; }
+    done
+    print_error "子网 IP 已耗尽"; return 1
+}
+
+wg_format_bytes() {
+    local bytes=$1
+    [[ -z "$bytes" || "$bytes" == "0" ]] && { echo "0 B"; return; }
+    awk -v b="$bytes" 'BEGIN {
+        if (b>=1073741824) printf "%.2f GB",b/1073741824
+        else if (b>=1048576) printf "%.2f MB",b/1048576
+        else if (b>=1024) printf "%.2f KB",b/1024
+        else printf "%d B",b
+    }'
+}
+
+wg_save_iptables() {
+    if command_exists netfilter-persistent; then
+        netfilter-persistent save 2>/dev/null
+    elif command_exists iptables-save; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
+        iptables-save > /etc/iptables.rules 2>/dev/null
+    fi
+}
+
+_wg_pf_iptables() {
+    local action=$1 proto=$2 ext_port=$3 dest_ip=$4 dest_port=$5
+    local iface=$(ip route show default | awk '{print $5; exit}')
+    _pf_one() {
+        iptables -t nat "$action" PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
+            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
+        iptables "$action" FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
+    }
+    if [[ "$proto" == "tcp+udp" ]]; then _pf_one tcp; _pf_one udp; else _pf_one "$proto"; fi
+}
+
+_wg_pf_iptables_ensure() {
+    local proto=$1 ext_port=$2 dest_ip=$3 dest_port=$4
+    local iface=$(ip route show default | awk '{print $5; exit}')
+    _pf_ensure_one() {
+        iptables -t nat -C PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
+            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || \
+        iptables -t nat -A PREROUTING -i "$iface" -p "$1" --dport "$ext_port" \
+            -j DNAT --to-destination "${dest_ip}:${dest_port}" 2>/dev/null || true
+        iptables -C FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "$iface" -o "$WG_INTERFACE" -p "$1" \
+            --dport "$dest_port" -d "$dest_ip" -j ACCEPT 2>/dev/null || true
+    }
+    if [[ "$proto" == "tcp+udp" ]]; then _pf_ensure_one tcp; _pf_ensure_one udp; else _pf_ensure_one "$proto"; fi
+}
+
+wg_rebuild_conf() {
+    [[ "$(wg_get_role)" != "server" ]] && return 1
+    local priv_key port subnet server_ip mask main_iface
+    priv_key=$(wg_db_get '.server.private_key')
+    port=$(wg_db_get '.server.port')
+    subnet=$(wg_db_get '.server.subnet')
+    server_ip=$(wg_db_get '.server.ip')
+    mask=$(echo "$subnet" | cut -d'/' -f2)
+    main_iface=$(ip route show default | awk '{print $5; exit}')
+
+    {
+        echo "[Interface]"
+        echo "PrivateKey = ${priv_key}"
+        echo "Address = ${server_ip}/${mask}"
+        echo "ListenPort = ${port}"
+        echo "PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${main_iface} -j MASQUERADE; iptables -t nat -A POSTROUTING -o %i -s ${subnet} -j MASQUERADE"
+        echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${main_iface} -j MASQUERADE; iptables -t nat -D POSTROUTING -o %i -s ${subnet} -j MASQUERADE"
+
+        local pc=$(wg_db_get '.peers | length') i=0
+        while [[ $i -lt $pc ]]; do
+            if [[ "$(wg_db_get ".peers[$i].enabled")" == "true" ]]; then
+                echo ""
+                echo "[Peer]"
+                echo "PublicKey = $(wg_db_get ".peers[$i].public_key")"
+                echo "PresharedKey = $(wg_db_get ".peers[$i].preshared_key")"
+                echo "AllowedIPs = $(wg_db_get ".peers[$i].ip")/32"
+            fi
+            i=$((i + 1))
+        done
+    } > "$WG_CONF"
+    chmod 600 "$WG_CONF"
+}
+
+wg_regenerate_client_confs() {
+    local pc=$(wg_db_get '.peers | length')
+    [[ "$pc" -eq 0 ]] && return
+    local spub sep sport sdns mask
+    spub=$(wg_db_get '.server.public_key')
+    sep=$(wg_db_get '.server.endpoint')
+    sport=$(wg_db_get '.server.port')
+    sdns=$(wg_db_get '.server.dns')
+    mask=$(echo "$(wg_db_get '.server.subnet')" | cut -d'/' -f2)
+    mkdir -p /etc/wireguard/clients
+    local i=0
+    while [[ $i -lt $pc ]]; do
+        local name=$(wg_db_get ".peers[$i].name")
+        write_file_atomic "/etc/wireguard/clients/${name}.conf" "[Interface]
+PrivateKey = $(wg_db_get ".peers[$i].private_key")
+Address = $(wg_db_get ".peers[$i].ip")/${mask}
+
+[Peer]
+PublicKey = ${spub}
+PresharedKey = $(wg_db_get ".peers[$i].preshared_key")
+Endpoint = ${sep}:${sport}
+AllowedIPs = $(wg_db_get ".peers[$i].client_allowed_ips")
+PersistentKeepalive = 25"
+        chmod 600 "/etc/wireguard/clients/${name}.conf"
+        i=$((i + 1))
+    done
+}
+
+wg_server_install() {
+    print_title "安装 WireGuard 服务端"
+
+    if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
+        print_warn "WireGuard 服务端已安装。"
+        wg_is_running && echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}" || echo -e "  状态: ${C_RED}● 已停止${C_RESET}"
+        pause; return 0
+    fi
+
+    if wg_is_installed && [[ "$(wg_get_role)" == "client" ]]; then
+        print_error "当前已安装为客户端模式。如需切换为服务端，请先卸载。"
+        pause; return 1
+    fi
+
+    echo ""
+    print_info "[1/5] 安装软件包..."
+    wg_install_packages || { pause; return 1; }
+
+    print_info "[2/5] 配置 IP 转发..."
+    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
+        sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    fi
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    print_success "IP 转发已开启"
+
+    print_info "[3/5] 配置服务端参数..."
+    echo ""
+
+    local wg_port
+    while true; do
+        read -e -r -p "WireGuard 监听端口 [51820]: " wg_port
+        wg_port=${wg_port:-51820}
+        validate_port "$wg_port" && break
+        print_warn "端口无效 (1-65535)"
+    done
+
+    local wg_subnet
+    while true; do
+        read -e -r -p "VPN 内网子网 [10.66.66.0/24]: " wg_subnet
+        wg_subnet=${wg_subnet:-10.66.66.0/24}
+        [[ "$wg_subnet" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && break
+        print_warn "子网格式无效，示例: 10.66.66.0/24"
+    done
+
+    local prefix server_ip
+    prefix=$(echo "$wg_subnet" | cut -d'.' -f1-3)
+    server_ip="${prefix}.1"
+
+    local wg_dns
+    read -e -r -p "客户端 DNS [1.1.1.1, 8.8.8.8]: " wg_dns
+    wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
+
+    local wg_endpoint default_ip
+    default_ip=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+    if [[ -n "$default_ip" ]]; then
+        read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
+        wg_endpoint=${wg_endpoint:-$default_ip}
+    else
+        while [[ -z "$wg_endpoint" ]]; do
+            read -e -r -p "公网端点 IP/域名: " wg_endpoint
+        done
+    fi
+
+    echo ""
+
+    print_info "[4/5] 生成服务端密钥..."
+    local server_privkey server_pubkey
+    server_privkey=$(wg genkey)
+    server_pubkey=$(echo "$server_privkey" | wg pubkey)
+    print_success "密钥已生成"
+
+    print_info "[5/5] 写入配置并启动..."
+
+    wg_db_init
+    wg_set_role "server"
+
+    wg_db_set --arg pk "$server_privkey" \
+              --arg pub "$server_pubkey" \
+              --arg ip "$server_ip" \
+              --arg sub "$wg_subnet" \
+              --arg port "$wg_port" \
+              --arg dns "$wg_dns" \
+              --arg ep "$wg_endpoint" \
+    '.server = {
+        private_key: $pk,
+        public_key: $pub,
+        ip: $ip,
+        subnet: $sub,
+        port: ($port | tonumber),
+        dns: $dns,
+        endpoint: $ep
+    }'
+    
+    wg_rebuild_conf
+
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        wg-quick up "$WG_INTERFACE" 2>/dev/null || true
+    elif is_systemd; then
+        systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
+        wg-quick up "$WG_INTERFACE" 2>/dev/null
+    fi
+
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${wg_port}/udp" comment "WireGuard" >/dev/null 2>&1
+        print_success "UFW 已放行端口 ${wg_port}/udp"
+    fi
+
+    echo ""
+    draw_line
+    if wg_is_running; then
+        print_success "WireGuard 服务端安装并启动成功！"
+    else
+        print_warn "WireGuard 已安装，但启动可能失败，请检查日志"
+    fi
+    echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
+    echo -e "  监听端口: ${C_GREEN}${wg_port}/udp${C_RESET}"
+    echo -e "  内网子网: ${C_GREEN}${wg_subnet}${C_RESET}"
+    echo -e "  服务端 IP: ${C_GREEN}${server_ip}${C_RESET}"
+    echo -e "  公网端点: ${C_GREEN}${wg_endpoint}:${wg_port}${C_RESET}"
+    draw_line
+
+    log_action "WireGuard server installed: port=$wg_port subnet=$wg_subnet endpoint=$wg_endpoint"
+    pause
+}
+
+wg_add_peer() {
+    wg_check_server || return 1
+
+    print_title "添加 WireGuard 设备 (Peer)"
+
+    local peer_name
+    while true; do
+        read -e -r -p "设备名称 (如 phone, laptop): " peer_name
+        [[ -z "$peer_name" ]] && { print_warn "名称不能为空"; continue; }
+        local exists
+        exists=$(wg_db_get --arg n "$peer_name" '.peers[] | select(.name == $n) | .name')
+        [[ -n "$exists" ]] && { print_error "设备名 '$peer_name' 已存在"; continue; }
+        [[ ! "$peer_name" =~ ^[a-zA-Z0-9_-]+$ ]] && { print_warn "名称只能包含字母、数字、下划线、连字符"; continue; }
+        break
+    done
+
+    local peer_ip
+    peer_ip=$(wg_next_ip) || { pause; return 1; }
+    echo -e "  分配 IP: ${C_GREEN}${peer_ip}${C_RESET}"
+
+    local peer_privkey peer_pubkey psk
+    peer_privkey=$(wg genkey)
+    peer_pubkey=$(echo "$peer_privkey" | wg pubkey)
+    psk=$(wg genpsk)
+
+    echo ""
+    echo "客户端路由模式:"
+    echo "  1. 全局代理 (所有流量走 VPN) - 0.0.0.0/0"
+    echo "  2. 仅 VPN 内网 (只访问 VPN 内部设备)"
+    echo "  3. 自定义路由"
+    read -e -r -p "选择 [1]: " route_mode
+    route_mode=${route_mode:-1}
+
+    local client_allowed_ips server_subnet
+    server_subnet=$(wg_db_get '.server.subnet')
+    case $route_mode in
+        1) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+        2) client_allowed_ips="$server_subnet" ;;
+        3)
+            read -e -r -p "输入允许的 IP 范围 (逗号分隔): " client_allowed_ips
+            [[ -z "$client_allowed_ips" ]] && client_allowed_ips="0.0.0.0/0, ::/0"
+            ;;
+        *) client_allowed_ips="0.0.0.0/0, ::/0" ;;
+    esac
+
+    local spub sep sport sdns
+    spub=$(wg_db_get '.server.public_key')
+    sep=$(wg_db_get '.server.endpoint')
+    sport=$(wg_db_get '.server.port')
+    sdns=$(wg_db_get '.server.dns')
+
+    local mask
+    mask=$(echo "$server_subnet" | cut -d'/' -f2)
+
+    local client_conf="[Interface]
+PrivateKey = ${peer_privkey}
+Address = ${peer_ip}/${mask}
+
+[Peer]
+PublicKey = ${spub}
+PresharedKey = ${psk}
+Endpoint = ${sep}:${sport}
+AllowedIPs = ${client_allowed_ips}
+PersistentKeepalive = 25"
+
+    mkdir -p /etc/wireguard/clients
+    local conf_file="/etc/wireguard/clients/${peer_name}.conf"
+    write_file_atomic "$conf_file" "$client_conf"
+    chmod 600 "$conf_file"
+
+    local now; now=$(date '+%Y-%m-%d %H:%M:%S')
+    wg_db_set --arg name "$peer_name" \
+              --arg ip "$peer_ip" \
+              --arg privkey "$peer_privkey" \
+              --arg pubkey "$peer_pubkey" \
+              --arg psk "$psk" \
+              --arg allowed "$client_allowed_ips" \
+              --arg created "$now" \
+    '.peers += [{
+        name: $name,
+        ip: $ip,
+        private_key: $privkey,
+        public_key: $pubkey,
+        preshared_key: $psk,
+        client_allowed_ips: $allowed,
+        enabled: true,
+        created: $created
+    }]'
+
+    wg_rebuild_conf
+    if wg_is_running; then
+        wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE") 2>/dev/null || {
+            print_warn "热加载失败，尝试重启接口..."
+            wg-quick down "$WG_INTERFACE" 2>/dev/null
+            wg-quick up "$WG_INTERFACE" 2>/dev/null
+        }
+    fi
+
+    echo ""
+    draw_line
+    print_success "设备 '${peer_name}' 添加成功！"
+    draw_line
+    echo -e "  名称: ${C_GREEN}${peer_name}${C_RESET}"
+    echo -e "  IP:   ${C_GREEN}${peer_ip}${C_RESET}"
+    echo -e "  路由: ${C_CYAN}${client_allowed_ips}${C_RESET}"
+    echo -e "  配置: ${C_CYAN}${conf_file}${C_RESET}"
+    draw_line
+
+    echo ""
+    if confirm "是否显示客户端二维码 (手机扫码导入)?"; then
+        echo ""
+        echo -e "${C_CYAN}=== ${peer_name} 二维码 ===${C_RESET}"
+        qrencode -t ansiutf8 < "$conf_file"
+        echo ""
+    fi
+
+    if confirm "是否显示客户端配置文本?"; then
+        echo ""
+        echo -e "${C_CYAN}=== ${peer_name} 配置文件 ===${C_RESET}"
+        cat "$conf_file"
+        echo ""
+    fi
+
+    log_action "WireGuard peer added: ${peer_name} (${peer_ip})"
+    pause
+}
+
+wg_list_peers() {
+    wg_check_server || return 1
+
+    print_title "WireGuard 设备列表"
+
+    local peer_count
+    peer_count=$(wg_db_get '.peers | length')
+
+    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+        print_warn "暂无设备"
+        pause; return
+    fi
+
+    local wg_dump=""
+    wg_is_running && wg_dump=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
+
+    printf "${C_CYAN}%-4s %-16s %-16s %-8s %-12s %-12s %s${C_RESET}\n" \
+        "#" "名称" "IP" "状态" "↓接收" "↑发送" "最近握手"
+    draw_line
+
+    local i=0
+    while [[ $i -lt $peer_count ]]; do
+        local name ip pubkey enabled
+        name=$(wg_db_get ".peers[$i].name")
+        ip=$(wg_db_get ".peers[$i].ip")
+        pubkey=$(wg_db_get ".peers[$i].public_key")
+        enabled=$(wg_db_get ".peers[$i].enabled")
+
+        local status_str
+        if [[ "$enabled" != "true" ]]; then
+            status_str="${C_GRAY}禁用${C_RESET}"
+        else
+            status_str="${C_GREEN}启用${C_RESET}"
+        fi
+
+        local rx_bytes="0" tx_bytes="0" last_handshake="从未"
+        if [[ -n "$wg_dump" ]]; then
+            local peer_line
+            peer_line=$(echo "$wg_dump" | grep "^${pubkey}" 2>/dev/null)
+            if [[ -n "$peer_line" ]]; then
+                rx_bytes=$(echo "$peer_line" | awk '{print $6}')
+                tx_bytes=$(echo "$peer_line" | awk '{print $7}')
+                local hs_epoch
+                hs_epoch=$(echo "$peer_line" | awk '{print $5}')
+                if [[ -n "$hs_epoch" && "$hs_epoch" != "0" ]]; then
+                    local now_epoch diff
+                    now_epoch=$(date +%s)
+                    diff=$((now_epoch - hs_epoch))
+                    if [[ $diff -lt 60 ]]; then
+                        last_handshake="${diff}秒前"
+                        status_str="${C_GREEN}在线${C_RESET}"
+                    elif [[ $diff -lt 3600 ]]; then
+                        last_handshake="$((diff / 60))分前"
+                    elif [[ $diff -lt 86400 ]]; then
+                        last_handshake="$((diff / 3600))时前"
+                    else
+                        last_handshake="$((diff / 86400))天前"
+                    fi
+                fi
+            fi
+        fi
+
+        printf "%-4s %-16s %-16s %-8b %-12s %-12s %s\n" \
+            "$((i + 1))" "$name" "$ip" "$status_str" \
+            "$(wg_format_bytes "$rx_bytes")" "$(wg_format_bytes "$tx_bytes")" "$last_handshake"
+
+        i=$((i + 1))
+    done
+
+    echo ""
+    echo -e "${C_CYAN}共 ${peer_count} 个设备${C_RESET}"
+    pause
+}
 
 show_main_menu() {
     fix_terminal
@@ -3300,25 +3342,1372 @@ show_main_menu() {
     echo ""
 
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        # OpenWrt 精简菜单，不可用项标灰
         printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}1. 基础依赖安装 [不可用]${C_RESET}")" "6. 网络工具 (DNS)"
         printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"    "7. Web 服务 (SSL+Nginx+DDNS)"
         printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}3. Fail2ban [不可用]${C_RESET}")"       "$(echo -e "${C_GRAY}8. Docker [不可用]${C_RESET}")"
         printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}4. SSH 管理 [不可用]${C_RESET}")"       "9. 查看操作日志"
-        printf " %-38s %-38s\n" "5. 系统优化 (BBR/主机名/时区)"                               "0. 退出脚本"
+        printf " %-38s %-38s\n" "5. 系统优化 (BBR/主机名/时区)"                               "10. WireGuard VPN"
+        printf " %-38s\n"      "0. 退出脚本"
     else
         printf " %-38s %-38s\n" "1. 基础依赖安装" "6. 网络工具 (DNS/测速)"
         printf " %-38s %-38s\n" "2. UFW 防火墙管理" "7. Web 服务 (SSL+Nginx)"
         printf " %-38s %-38s\n" "3. Fail2ban 入侵防御" "8. Docker 管理"
         printf " %-38s %-38s\n" "4. SSH 安全配置" "9. 查看操作日志"
-        printf " %-38s %-38s\n" "5. 系统优化 (BBR/Swap)" "0. 退出脚本"
+        printf " %-38s %-38s\n" "5. 系统优化 (BBR/Swap)" "10. WireGuard VPN"
+        printf " %-38s\n" "0. 退出脚本"
     fi
     echo ""
 }
 
-# ==============================================================================
-# OpenWrt 精简子菜单
-# ==============================================================================
+wg_delete_peer() {
+    wg_check_server || return 1
+
+    print_title "删除 WireGuard 设备"
+
+    local peer_count
+    peer_count=$(wg_db_get '.peers | length')
+
+    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+        print_warn "暂无设备"
+        pause; return
+    fi
+
+    local i=0
+    while [[ $i -lt $peer_count ]]; do
+        local name ip enabled mark=""
+        name=$(wg_db_get ".peers[$i].name")
+        ip=$(wg_db_get ".peers[$i].ip")
+        enabled=$(wg_db_get ".peers[$i].enabled")
+        [[ "$enabled" != "true" ]] && mark=" ${C_GRAY}(已禁用)${C_RESET}"
+        echo -e "  $((i + 1)). ${name} (${ip})${mark}"
+        i=$((i + 1))
+    done
+    echo "  0. 返回"
+    echo ""
+
+    read -e -r -p "选择要删除的设备序号: " idx
+    [[ "$idx" == "0" || -z "$idx" ]] && return
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$peer_count" ]]; then
+        print_error "无效序号"
+        pause; return
+    fi
+
+    local target_idx=$((idx - 1))
+    local target_name target_pubkey
+    target_name=$(wg_db_get ".peers[$target_idx].name")
+    target_pubkey=$(wg_db_get ".peers[$target_idx].public_key")
+
+    if ! confirm "确认删除设备 '${target_name}'？"; then
+        return
+    fi
+
+    if wg_is_running; then
+        wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
+    fi
+
+    wg_db_set --argjson idx "$target_idx" 'del(.peers[$idx])'
+
+    rm -f "/etc/wireguard/clients/${target_name}.conf"
+
+    wg_rebuild_conf
+
+    print_success "设备 '${target_name}' 已删除"
+    log_action "WireGuard peer deleted: ${target_name}"
+    pause
+}
+
+wg_toggle_peer() {
+    wg_check_server || return 1
+
+    print_title "启用/禁用 WireGuard 设备"
+
+    local peer_count
+    peer_count=$(wg_db_get '.peers | length')
+
+    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+        print_warn "暂无设备"
+        pause; return
+    fi
+
+    local i=0
+    while [[ $i -lt $peer_count ]]; do
+        local name ip enabled status_icon
+        name=$(wg_db_get ".peers[$i].name")
+        ip=$(wg_db_get ".peers[$i].ip")
+        enabled=$(wg_db_get ".peers[$i].enabled")
+
+        if [[ "$enabled" == "true" ]]; then
+            status_icon="${C_GREEN}● 启用${C_RESET}"
+        else
+            status_icon="${C_RED}○ 禁用${C_RESET}"
+        fi
+
+        echo -e "  $((i + 1)). ${name} (${ip}) - ${status_icon}"
+        i=$((i + 1))
+    done
+    echo "  0. 返回"
+    echo ""
+
+    read -e -r -p "选择要切换状态的设备序号: " idx
+    [[ "$idx" == "0" || -z "$idx" ]] && return
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$peer_count" ]]; then
+        print_error "无效序号"
+        pause; return
+    fi
+
+    local target_idx=$((idx - 1))
+    local target_name target_pubkey current_state
+    target_name=$(wg_db_get ".peers[$target_idx].name")
+    target_pubkey=$(wg_db_get ".peers[$target_idx].public_key")
+    current_state=$(wg_db_get ".peers[$target_idx].enabled")
+
+    if [[ "$current_state" == "true" ]]; then
+        wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = false'
+        wg_is_running && wg set "$WG_INTERFACE" peer "$target_pubkey" remove 2>/dev/null || true
+        wg_rebuild_conf
+        print_success "设备 '${target_name}' 已禁用"
+        log_action "WireGuard peer disabled: ${target_name}"
+    else
+        wg_db_set --argjson idx "$target_idx" '.peers[$idx].enabled = true'
+        wg_rebuild_conf
+        if wg_is_running; then
+            wg syncconf "$WG_INTERFACE" <(wg-quick strip "$WG_INTERFACE") 2>/dev/null || {
+                wg-quick down "$WG_INTERFACE" 2>/dev/null
+                wg-quick up "$WG_INTERFACE" 2>/dev/null
+            }
+        fi
+        print_success "设备 '${target_name}' 已启用"
+        log_action "WireGuard peer enabled: ${target_name}"
+    fi
+
+    pause
+}
+
+wg_show_peer_conf() {
+    wg_check_server || return 1
+
+    print_title "查看设备配置 / 二维码"
+
+    local peer_count
+    peer_count=$(wg_db_get '.peers | length')
+
+    if [[ "$peer_count" -eq 0 || "$peer_count" == "null" ]]; then
+        print_warn "暂无设备"
+        pause; return
+    fi
+
+    local i=0
+    while [[ $i -lt $peer_count ]]; do
+        local name ip
+        name=$(wg_db_get ".peers[$i].name")
+        ip=$(wg_db_get ".peers[$i].ip")
+        echo "  $((i + 1)). ${name} (${ip})"
+        i=$((i + 1))
+    done
+    echo "  0. 返回"
+    echo ""
+
+    read -e -r -p "选择设备序号: " idx
+    [[ "$idx" == "0" || -z "$idx" ]] && return
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$peer_count" ]]; then
+        print_error "无效序号"
+        pause; return
+    fi
+
+    local target_idx=$((idx - 1))
+    local target_name
+    target_name=$(wg_db_get ".peers[$target_idx].name")
+
+    local conf_file="/etc/wireguard/clients/${target_name}.conf"
+
+    if [[ ! -f "$conf_file" ]]; then
+        print_warn "配置文件不存在，正在从数据库重新生成..."
+
+        local peer_privkey peer_ip peer_psk client_allowed_ips
+        peer_privkey=$(wg_db_get ".peers[$target_idx].private_key")
+        peer_ip=$(wg_db_get ".peers[$target_idx].ip")
+        peer_psk=$(wg_db_get ".peers[$target_idx].preshared_key")
+        client_allowed_ips=$(wg_db_get ".peers[$target_idx].client_allowed_ips")
+
+        local spub sep sport sdns ssub mask
+        spub=$(wg_db_get '.server.public_key')
+        sep=$(wg_db_get '.server.endpoint')
+        sport=$(wg_db_get '.server.port')
+        sdns=$(wg_db_get '.server.dns')
+        ssub=$(wg_db_get '.server.subnet')
+        mask=$(echo "$ssub" | cut -d'/' -f2)
+
+        mkdir -p /etc/wireguard/clients
+        write_file_atomic "$conf_file" "[Interface]
+PrivateKey = ${peer_privkey}
+Address = ${peer_ip}/${mask}
+
+[Peer]
+PublicKey = ${spub}
+PresharedKey = ${peer_psk}
+Endpoint = ${sep}:${sport}
+AllowedIPs = ${client_allowed_ips}
+PersistentKeepalive = 25"
+        chmod 600 "$conf_file"
+        print_success "配置文件已重新生成"
+    fi
+
+    echo ""
+    draw_line
+    echo -e "${C_CYAN}=== ${target_name} 客户端配置 ===${C_RESET}"
+    draw_line
+    cat "$conf_file"
+    draw_line
+    echo ""
+
+    if command_exists qrencode; then
+        if confirm "显示二维码 (手机扫码导入)?"; then
+            echo ""
+            echo -e "${C_CYAN}=== ${target_name} 二维码 ===${C_RESET}"
+            qrencode -t ansiutf8 < "$conf_file"
+            echo ""
+        fi
+    fi
+
+    echo -e "配置文件路径: ${C_CYAN}${conf_file}${C_RESET}"
+    echo -e "下载命令: ${C_GRAY}scp root@服务器IP:${conf_file} ./${C_RESET}"
+
+    pause
+}
+
+wg_port_forward_menu() {
+    wg_check_server || return 1
+
+    while true; do
+        print_title "WireGuard 端口转发管理"
+
+        local pf_count
+        pf_count=$(wg_db_get '.port_forwards | length')
+
+        if [[ "$pf_count" -gt 0 && "$pf_count" != "null" ]]; then
+            printf "${C_CYAN}%-4s %-10s %-14s %-24s %-8s${C_RESET}\n" \
+                "#" "协议" "外部端口" "转发目标" "状态"
+            draw_line
+
+            local i=0
+            while [[ $i -lt $pf_count ]]; do
+                local proto ext_port dest_ip dest_port enabled
+                proto=$(wg_db_get ".port_forwards[$i].proto")
+                ext_port=$(wg_db_get ".port_forwards[$i].ext_port")
+                dest_ip=$(wg_db_get ".port_forwards[$i].dest_ip")
+                dest_port=$(wg_db_get ".port_forwards[$i].dest_port")
+                enabled=$(wg_db_get ".port_forwards[$i].enabled")
+
+                local status_str
+                [[ "$enabled" == "true" ]] && status_str="${C_GREEN}启用${C_RESET}" || status_str="${C_RED}禁用${C_RESET}"
+
+                printf "%-4s %-10s %-14s %-24s %-8b\n" \
+                    "$((i + 1))" "$proto" "$ext_port" "${dest_ip}:${dest_port}" "$status_str"
+                i=$((i + 1))
+            done
+            echo ""
+        else
+            print_info "暂无端口转发规则"
+            echo ""
+        fi
+
+        echo "  1. 添加端口转发"
+        echo "  2. 删除端口转发"
+        echo "  3. 启用/禁用端口转发"
+        echo "  0. 返回"
+        echo ""
+
+        read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" pf_choice
+
+        case $pf_choice in
+            1) wg_add_port_forward ;;
+            2) wg_delete_port_forward ;;
+            3) wg_toggle_port_forward ;;
+            0|"") return ;;
+            *) print_warn "无效选项" ;;
+        esac
+    done
+}
+
+wg_add_port_forward() {
+    echo ""
+    print_info "添加端口转发规则"
+    echo ""
+
+    echo "  1. TCP"
+    echo "  2. UDP"
+    echo "  3. TCP+UDP"
+    read -e -r -p "协议 [1]: " proto_choice
+    proto_choice=${proto_choice:-1}
+    local proto
+    case $proto_choice in
+        1) proto="tcp" ;;
+        2) proto="udp" ;;
+        3) proto="tcp+udp" ;;
+        *) proto="tcp" ;;
+    esac
+
+    local ext_port
+    while true; do
+        read -e -r -p "外部端口 (本机监听): " ext_port
+        validate_port "$ext_port" && break
+        print_warn "端口无效 (1-65535)"
+    done
+
+    local peer_count
+    peer_count=$(wg_db_get '.peers | length')
+
+    local dest_ip
+    if [[ "$peer_count" -gt 0 ]]; then
+        echo ""
+        echo "选择目标设备:"
+        local i=0
+        while [[ $i -lt $peer_count ]]; do
+            local name ip
+            name=$(wg_db_get ".peers[$i].name")
+            ip=$(wg_db_get ".peers[$i].ip")
+            echo "  $((i + 1)). ${name} (${ip})"
+            i=$((i + 1))
+        done
+        echo "  0. 手动输入 IP"
+        echo ""
+        read -e -r -p "选择: " dev_choice
+
+        if [[ "$dev_choice" == "0" || -z "$dev_choice" ]]; then
+            read -e -r -p "目标 IP: " dest_ip
+        elif [[ "$dev_choice" =~ ^[0-9]+$ ]] && [[ "$dev_choice" -ge 1 && "$dev_choice" -le "$peer_count" ]]; then
+            dest_ip=$(wg_db_get ".peers[$((dev_choice - 1))].ip")
+        else
+            print_error "无效选择"; return
+        fi
+    else
+        read -e -r -p "目标 IP: " dest_ip
+    fi
+
+    [[ -z "$dest_ip" ]] && { print_error "目标 IP 不能为空"; return; }
+
+    local dest_port
+    read -e -r -p "目标端口 [${ext_port}]: " dest_port
+    dest_port=${dest_port:-$ext_port}
+    validate_port "$dest_port" || { print_error "端口无效"; return; }
+
+    _wg_pf_iptables -A "$proto" "$ext_port" "$dest_ip" "$dest_port"
+    wg_save_iptables
+    wg_db_set --arg proto "$proto" \
+              --arg ext "$ext_port" \
+              --arg dip "$dest_ip" \
+              --arg dport "$dest_port" \
+    '.port_forwards += [{
+        proto: $proto,
+        ext_port: ($ext | tonumber),
+        dest_ip: $dip,
+        dest_port: ($dport | tonumber),
+        enabled: true
+    }]'
+
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if [[ "$proto" == "tcp+udp" ]]; then
+            ufw allow "$ext_port" comment "WG-PF" >/dev/null 2>&1
+        else
+            ufw allow "${ext_port}/${proto}" comment "WG-PF" >/dev/null 2>&1
+        fi
+    fi
+
+    print_success "端口转发已添加: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
+    log_action "WireGuard port forward added: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
+}
+
+wg_delete_port_forward() {
+    local pf_count
+    pf_count=$(wg_db_get '.port_forwards | length')
+
+    [[ "$pf_count" -eq 0 ]] && { print_warn "暂无规则"; return; }
+
+    echo ""
+    read -e -r -p "选择要删除的规则序号: " idx
+    [[ -z "$idx" ]] && return
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$pf_count" ]]; then
+        print_error "无效序号"; return
+    fi
+
+    local target_idx=$((idx - 1))
+    local proto ext_port dest_ip dest_port
+    proto=$(wg_db_get ".port_forwards[$target_idx].proto")
+    ext_port=$(wg_db_get ".port_forwards[$target_idx].ext_port")
+    dest_ip=$(wg_db_get ".port_forwards[$target_idx].dest_ip")
+    dest_port=$(wg_db_get ".port_forwards[$target_idx].dest_port")
+
+    _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
+    wg_save_iptables
+    wg_db_set --argjson idx "$target_idx" 'del(.port_forwards[$idx])'
+
+    print_success "端口转发规则已删除"
+    log_action "WireGuard port forward deleted: ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
+}
+
+wg_toggle_port_forward() {
+    local pf_count
+    pf_count=$(wg_db_get '.port_forwards | length')
+    [[ "$pf_count" -eq 0 ]] && { print_warn "暂无规则"; return; }
+
+    echo ""
+    read -e -r -p "选择要切换状态的规则序号: " idx
+    [[ -z "$idx" ]] && return
+
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || [[ "$idx" -lt 1 || "$idx" -gt "$pf_count" ]]; then
+        print_error "无效序号"; return
+    fi
+
+    local target_idx=$((idx - 1))
+    local proto ext_port dest_ip dest_port current_state
+    proto=$(wg_db_get ".port_forwards[$target_idx].proto")
+    ext_port=$(wg_db_get ".port_forwards[$target_idx].ext_port")
+    dest_ip=$(wg_db_get ".port_forwards[$target_idx].dest_ip")
+    dest_port=$(wg_db_get ".port_forwards[$target_idx].dest_port")
+    current_state=$(wg_db_get ".port_forwards[$target_idx].enabled")
+
+    if [[ "$current_state" == "true" ]]; then
+        _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
+        wg_db_set --argjson idx "$target_idx" '.port_forwards[$idx].enabled = false'
+        print_success "端口转发已禁用: ${ext_port}/${proto}"
+    else
+        _wg_pf_iptables -A "$proto" "$ext_port" "$dest_ip" "$dest_port"
+        wg_db_set --argjson idx "$target_idx" '.port_forwards[$idx].enabled = true'
+        print_success "端口转发已启用: ${ext_port}/${proto}"
+    fi
+    wg_save_iptables
+}
+
+wg_modify_server() {
+    wg_check_server || return 1
+
+    print_title "修改 WireGuard 服务端配置"
+
+    local cur_port cur_dns cur_ep
+    cur_port=$(wg_db_get '.server.port')
+    cur_dns=$(wg_db_get '.server.dns')
+    cur_ep=$(wg_db_get '.server.endpoint')
+
+    echo -e "  当前端口:   ${C_GREEN}${cur_port}${C_RESET}"
+    echo -e "  当前 DNS:   ${C_GREEN}${cur_dns}${C_RESET}"
+    echo -e "  当前端点:   ${C_GREEN}${cur_ep}${C_RESET}"
+    echo ""
+
+    local changed=false
+
+    read -e -r -p "新监听端口 [${cur_port}]: " new_port
+    new_port=${new_port:-$cur_port}
+    if [[ "$new_port" != "$cur_port" ]]; then
+        if validate_port "$new_port"; then
+            wg_db_set --argjson p "$new_port" '.server.port = $p'
+            changed=true
+            print_info "端口将更改为 ${new_port}"
+        else
+            print_warn "端口无效，保持原值"
+        fi
+    fi
+
+    read -e -r -p "新客户端 DNS [${cur_dns}]: " new_dns
+    new_dns=${new_dns:-$cur_dns}
+    if [[ "$new_dns" != "$cur_dns" ]]; then
+        wg_db_set --arg d "$new_dns" '.server.dns = $d'
+        changed=true
+        print_info "DNS 将更改为 ${new_dns}"
+    fi
+
+    read -e -r -p "新公网端点 [${cur_ep}]: " new_ep
+    new_ep=${new_ep:-$cur_ep}
+    if [[ "$new_ep" != "$cur_ep" ]]; then
+        wg_db_set --arg e "$new_ep" '.server.endpoint = $e'
+        changed=true
+        print_info "端点将更改为 ${new_ep}"
+    fi
+
+    if [[ "$changed" != "true" ]]; then
+        print_info "未做任何更改"
+        pause; return
+    fi
+
+    wg_rebuild_conf
+    wg_regenerate_client_confs
+
+    if wg_is_running; then
+        wg-quick down "$WG_INTERFACE" 2>/dev/null
+        wg-quick up "$WG_INTERFACE" 2>/dev/null
+    fi
+
+    if [[ "$new_port" != "$cur_port" ]]; then
+        if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw delete allow "${cur_port}/udp" 2>/dev/null || true
+            ufw allow "${new_port}/udp" comment "WireGuard" >/dev/null 2>&1
+        fi
+    fi
+
+    print_success "服务端配置已更新"
+    log_action "WireGuard server config modified: port=${new_port} dns=${new_dns} endpoint=${new_ep}"
+    pause
+}
+
+wg_client_install() {
+    print_title "安装 WireGuard 客户端"
+
+    if wg_is_installed && [[ "$(wg_get_role)" == "client" ]]; then
+        print_warn "WireGuard 客户端已安装。"
+        wg_is_running && echo -e "  状态: ${C_GREEN}● 已连接${C_RESET}" || echo -e "  状态: ${C_RED}● 未连接${C_RESET}"
+        pause; return 0
+    fi
+
+    if wg_is_installed && [[ "$(wg_get_role)" == "server" ]]; then
+        print_error "当前已安装为服务端模式。如需切换为客户端，请先卸载。"
+        pause; return 1
+    fi
+
+    echo ""
+    print_info "[1/3] 安装软件包..."
+    wg_install_packages || { pause; return 1; }
+
+    print_info "[2/3] 导入客户端配置..."
+    echo ""
+    echo "请选择导入方式:"
+    echo "  1. 粘贴配置内容"
+    echo "  2. 指定配置文件路径"
+    echo ""
+    read -e -r -p "选择 [1]: " import_mode
+    import_mode=${import_mode:-1}
+
+    local conf_content=""
+
+    case $import_mode in
+        1)
+            echo ""
+            echo -e "${C_CYAN}请粘贴客户端配置内容 (粘贴完成后按 Ctrl+D):${C_RESET}"
+            conf_content=$(cat)
+            ;;
+        2)
+            read -e -r -p "配置文件路径: " conf_path
+            if [[ ! -f "$conf_path" ]]; then
+                print_error "文件不存在: ${conf_path}"
+                pause; return 1
+            fi
+            conf_content=$(cat "$conf_path")
+            ;;
+        *)
+            print_error "无效选择"
+            pause; return 1
+            ;;
+    esac
+
+    if [[ -z "$conf_content" ]]; then
+        print_error "配置内容为空"
+        pause; return 1
+    fi
+
+    if ! echo "$conf_content" | grep -q "\[Interface\]"; then
+        print_error "配置格式无效: 缺少 [Interface] 段"
+        pause; return 1
+    fi
+
+    if ! echo "$conf_content" | grep -q "\[Peer\]"; then
+        print_error "配置格式无效: 缺少 [Peer] 段"
+        pause; return 1
+    fi
+
+    if ! echo "$conf_content" | grep -qi "PrivateKey"; then
+        print_error "配置格式无效: 缺少 PrivateKey"
+        pause; return 1
+    fi
+
+    write_file_atomic "$WG_CONF" "$conf_content"
+    chmod 600 "$WG_CONF"
+
+    print_info "[3/3] 保存配置信息..."
+    wg_db_init
+    wg_set_role "client"
+
+    local client_addr client_dns server_pubkey server_endpoint server_allowed
+    client_addr=$(echo "$conf_content" | grep -i "^Address" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+    client_dns=$(echo "$conf_content" | grep -i "^DNS" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+    server_pubkey=$(echo "$conf_content" | sed -n '/\[Peer\]/,/^$/p' | grep -i "^PublicKey" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+    server_endpoint=$(echo "$conf_content" | grep -i "^Endpoint" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+    server_allowed=$(echo "$conf_content" | grep -i "^AllowedIPs" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+
+    wg_db_set --arg addr "${client_addr:-unknown}" \
+              --arg dns "${client_dns:-}" \
+              --arg spub "${server_pubkey:-}" \
+              --arg ep "${server_endpoint:-}" \
+              --arg allowed "${server_allowed:-}" \
+    '.client = {
+        address: $addr,
+        dns: $dns,
+        server_pubkey: $spub,
+        server_endpoint: $ep,
+        allowed_ips: $allowed
+    }'
+
+    echo ""
+    draw_line
+    print_success "WireGuard 客户端安装完成！"
+    echo -e "  角色:     ${C_GREEN}客户端 (Client)${C_RESET}"
+    echo -e "  地址:     ${C_GREEN}${client_addr:-未知}${C_RESET}"
+    echo -e "  服务端:   ${C_GREEN}${server_endpoint:-未知}${C_RESET}"
+    draw_line
+
+    echo ""
+    if confirm "是否立即连接?"; then
+        wg_client_connect
+    fi
+
+    log_action "WireGuard client installed: addr=${client_addr} endpoint=${server_endpoint}"
+    pause
+}
+
+wg_client_connect() {
+    if wg_is_running; then
+        print_warn "WireGuard 已连接"
+        return 0
+    fi
+
+    print_info "正在连接..."
+
+    is_systemd && systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
+    wg-quick up "$WG_INTERFACE" 2>/dev/null
+
+    sleep 1
+
+    if wg_is_running; then
+        print_success "WireGuard 已连接"
+        log_action "WireGuard client connected"
+    else
+        print_error "连接失败，请检查配置"
+        log_action "WireGuard client connect failed"
+    fi
+}
+
+wg_client_disconnect() {
+    if ! wg_is_running; then
+        print_warn "WireGuard 未连接"
+        return 0
+    fi
+
+    print_info "正在断开..."
+    wg-quick down "$WG_INTERFACE" 2>/dev/null
+
+    if is_systemd; then
+        systemctl disable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
+    fi
+
+    sleep 1
+
+    if ! wg_is_running; then
+        print_success "WireGuard 已断开"
+        log_action "WireGuard client disconnected"
+    else
+        print_error "断开失败"
+    fi
+}
+
+wg_client_reconnect() {
+    print_info "正在重新连接..."
+    wg-quick down "$WG_INTERFACE" 2>/dev/null
+    sleep 1
+    wg-quick up "$WG_INTERFACE" 2>/dev/null
+    sleep 1
+
+    if wg_is_running; then
+        print_success "WireGuard 已重新连接"
+    else
+        print_error "重新连接失败"
+    fi
+}
+
+wg_client_status() {
+    print_title "WireGuard 客户端状态"
+
+    if ! wg_is_installed; then
+        print_warn "WireGuard 未安装"
+        pause; return
+    fi
+
+    local role
+    role=$(wg_get_role)
+    echo -e "  角色: ${C_GREEN}${role:-未知}${C_RESET}"
+
+    if wg_is_running; then
+        echo -e "  状态: ${C_GREEN}● 已连接${C_RESET}"
+    else
+        echo -e "  状态: ${C_RED}● 未连接${C_RESET}"
+        pause; return
+    fi
+
+    echo ""
+    draw_line
+
+    local wg_output
+    wg_output=$(wg show "$WG_INTERFACE" 2>/dev/null)
+
+    if [[ -n "$wg_output" ]]; then
+        echo "$wg_output" | while IFS= read -r line; do
+            case "$line" in
+                *"public key:"*)
+                    echo -e "  本机公钥:   ${C_CYAN}$(echo "$line" | awk -F': ' '{print $2}')${C_RESET}" ;;
+                *"listening port:"*)
+                    echo -e "  监听端口:   $(echo "$line" | awk -F': ' '{print $2}')" ;;
+                *"endpoint:"*)
+                    echo -e "  服务端端点: ${C_GREEN}$(echo "$line" | awk -F': ' '{print $2}')${C_RESET}" ;;
+                *"allowed ips:"*)
+                    echo -e "  允许 IP:    $(echo "$line" | awk -F': ' '{print $2}')" ;;
+                *"latest handshake:"*)
+                    echo -e "  最近握手:   ${C_GREEN}$(echo "$line" | awk -F': ' '{print $2}')${C_RESET}" ;;
+                *"transfer:"*)
+                    echo -e "  流量统计:   $(echo "$line" | awk -F': ' '{print $2}')" ;;
+                *"persistent keepalive:"*)
+                    echo -e "  保活间隔:   $(echo "$line" | awk -F': ' '{print $2}')" ;;
+            esac
+        done
+    fi
+
+    draw_line
+
+    echo ""
+    if [[ "$role" == "client" ]]; then
+        local client_info
+        client_info=$(wg_db_get '.client // empty')
+        if [[ -n "$client_info" ]]; then
+            local addr ep
+            addr=$(wg_db_get '.client.address')
+            ep=$(wg_db_get '.client.server_endpoint')
+            echo -e "  本机地址:   ${C_GREEN}${addr}${C_RESET}"
+            echo -e "  服务端:     ${C_GREEN}${ep}${C_RESET}"
+        fi
+
+        echo ""
+        print_info "连通性测试..."
+
+        local server_vip
+        server_vip=$(echo "$wg_output" | grep "allowed ips" | head -1 | awk -F': ' '{print $2}' | cut -d'/' -f1 | cut -d',' -f1 | xargs)
+
+        if [[ "$server_vip" == "0.0.0.0" || -z "$server_vip" ]]; then
+            local client_ip_base
+            client_ip_base=$(wg_db_get '.client.address' | cut -d'/' -f1)
+            if [[ -n "$client_ip_base" ]]; then
+                server_vip=$(echo "$client_ip_base" | awk -F'.' '{print $1"."$2"."$3".1"}')
+            fi
+        fi
+
+        if [[ -n "$server_vip" ]]; then
+            if ping -c 2 -W 3 "$server_vip" >/dev/null 2>&1; then
+                echo -e "  Ping ${server_vip}: ${C_GREEN}✓ 可达${C_RESET}"
+            else
+                echo -e "  Ping ${server_vip}: ${C_RED}✗ 不可达${C_RESET}"
+            fi
+        fi
+    fi
+
+    pause
+}
+
+wg_client_reconfig() {
+    if [[ "$(wg_get_role)" != "client" ]]; then
+        print_error "当前不是客户端模式"
+        pause; return 1
+    fi
+
+    print_title "更换客户端配置"
+
+    print_warn "这将替换当前的 WireGuard 配置"
+    if ! confirm "确认继续?"; then
+        return
+    fi
+
+    wg_is_running && wg-quick down "$WG_INTERFACE" 2>/dev/null
+
+    echo ""
+    echo "请选择导入方式:"
+    echo "  1. 粘贴配置内容"
+    echo "  2. 指定配置文件路径"
+    echo ""
+    read -e -r -p "选择 [1]: " import_mode
+    import_mode=${import_mode:-1}
+
+    local conf_content=""
+
+    case $import_mode in
+        1)
+            echo ""
+            echo -e "${C_CYAN}请粘贴新的客户端配置 (粘贴完成后按 Ctrl+D):${C_RESET}"
+            conf_content=$(cat)
+            ;;
+        2)
+            read -e -r -p "配置文件路径: " conf_path
+            if [[ ! -f "$conf_path" ]]; then
+                print_error "文件不存在: ${conf_path}"
+                pause; return 1
+            fi
+            conf_content=$(cat "$conf_path")
+            ;;
+    esac
+
+    if [[ -z "$conf_content" ]] || ! echo "$conf_content" | grep -q "\[Interface\]"; then
+        print_error "配置内容无效"
+        pause; return 1
+    fi
+
+    cp "$WG_CONF" "${WG_CONF}.bak.$(date +%s)" 2>/dev/null || true
+
+    write_file_atomic "$WG_CONF" "$conf_content"
+    chmod 600 "$WG_CONF"
+
+    local client_addr server_endpoint
+    client_addr=$(echo "$conf_content" | grep -i "^Address" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+    server_endpoint=$(echo "$conf_content" | grep -i "^Endpoint" | head -1 | sed 's/^[^=]*=[[:space:]]*//')
+
+    wg_db_set --arg addr "${client_addr:-unknown}" \
+              --arg ep "${server_endpoint:-}" \
+    '.client.address = $addr | .client.server_endpoint = $ep'
+
+    print_success "配置已更新"
+
+    if confirm "是否立即连接?"; then
+        wg_client_connect
+    fi
+
+    log_action "WireGuard client reconfigured: addr=${client_addr} endpoint=${server_endpoint}"
+    pause
+}
+
+wg_server_status() {
+    wg_check_server || return 1
+
+    print_title "WireGuard 服务端状态"
+
+    local port subnet endpoint dns
+    port=$(wg_db_get '.server.port')
+    subnet=$(wg_db_get '.server.subnet')
+    endpoint=$(wg_db_get '.server.endpoint')
+    dns=$(wg_db_get '.server.dns')
+
+    echo -e "  角色:     ${C_GREEN}服务端 (Server)${C_RESET}"
+
+    if wg_is_running; then
+        echo -e "  状态:     ${C_GREEN}● 运行中${C_RESET}"
+    else
+        echo -e "  状态:     ${C_RED}● 已停止${C_RESET}"
+    fi
+
+    echo -e "  端口:     ${port}/udp"
+    echo -e "  子网:     ${subnet}"
+    echo -e "  端点:     ${endpoint}"
+    echo -e "  DNS:      ${dns}"
+    echo ""
+
+    local peer_count
+    peer_count=$(wg_db_get '.peers | length')
+
+    echo -e "${C_CYAN}设备列表 (${peer_count} 个):${C_RESET}"
+    draw_line
+
+    if [[ "$peer_count" -gt 0 ]]; then
+        printf "${C_CYAN}%-4s %-16s %-18s %-8s %-20s %-16s${C_RESET}\n" \
+            "#" "名称" "IP" "状态" "最近握手" "流量"
+        draw_line
+
+        local wg_dump=""
+        wg_is_running && wg_dump=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
+
+        local i=0
+        while [[ $i -lt $peer_count ]]; do
+            local name ip pubkey enabled
+            name=$(wg_db_get ".peers[$i].name")
+            ip=$(wg_db_get ".peers[$i].ip")
+            pubkey=$(wg_db_get ".peers[$i].public_key")
+            enabled=$(wg_db_get ".peers[$i].enabled")
+
+            local status_str handshake_str transfer_str
+
+            if [[ "$enabled" != "true" ]]; then
+                status_str="${C_RED}禁用${C_RESET}"
+                handshake_str="-"
+                transfer_str="-"
+            elif [[ -n "$wg_dump" ]]; then
+                local peer_line
+                peer_line=$(echo "$wg_dump" | grep "^${pubkey}" || true)
+
+                if [[ -n "$peer_line" ]]; then
+                    local last_hs rx tx
+                    last_hs=$(echo "$peer_line" | awk '{print $5}')
+                    rx=$(echo "$peer_line" | awk '{print $6}')
+                    tx=$(echo "$peer_line" | awk '{print $7}')
+
+                    if [[ "$last_hs" -gt 0 ]] 2>/dev/null; then
+                        local now hs_ago
+                        now=$(date +%s)
+                        hs_ago=$((now - last_hs))
+
+                        if [[ $hs_ago -lt 180 ]]; then
+                            status_str="${C_GREEN}在线${C_RESET}"
+                        else
+                            status_str="${C_YELLOW}离线${C_RESET}"
+                        fi
+
+                        if [[ $hs_ago -lt 60 ]]; then
+                            handshake_str="${hs_ago}秒前"
+                        elif [[ $hs_ago -lt 3600 ]]; then
+                            handshake_str="$((hs_ago / 60))分钟前"
+                        elif [[ $hs_ago -lt 86400 ]]; then
+                            handshake_str="$((hs_ago / 3600))小时前"
+                        else
+                            handshake_str="$((hs_ago / 86400))天前"
+                        fi
+                    else
+                        status_str="${C_YELLOW}离线${C_RESET}"
+                        handshake_str="从未"
+                    fi
+
+                    transfer_str="↓$(wg_format_bytes "$rx") ↑$(wg_format_bytes "$tx")"
+                else
+                    status_str="${C_YELLOW}离线${C_RESET}"
+                    handshake_str="-"
+                    transfer_str="-"
+                fi
+            else
+                status_str="${C_GRAY}未知${C_RESET}"
+                handshake_str="-"
+                transfer_str="-"
+            fi
+
+            printf "%-4s %-16s %-18s %-8b %-20s %-16s\n" \
+                "$((i + 1))" "$name" "$ip" "$status_str" "$handshake_str" "$transfer_str"
+
+            i=$((i + 1))
+        done
+    else
+        print_info "暂无设备"
+    fi
+
+    draw_line
+
+    local pf_count
+    pf_count=$(wg_db_get '.port_forwards | length')
+
+    if [[ "$pf_count" -gt 0 ]]; then
+        echo ""
+        echo -e "${C_CYAN}端口转发规则 (${pf_count} 条):${C_RESET}"
+        draw_line
+        local j=0
+        while [[ $j -lt $pf_count ]]; do
+            local proto ext_port dest_ip dest_port pf_enabled
+            proto=$(wg_db_get ".port_forwards[$j].proto")
+            ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
+            dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
+            dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
+            pf_enabled=$(wg_db_get ".port_forwards[$j].enabled")
+
+            local pf_status
+            [[ "$pf_enabled" == "true" ]] && pf_status="${C_GREEN}●${C_RESET}" || pf_status="${C_RED}○${C_RESET}"
+
+            echo -e "  ${pf_status} ${ext_port}/${proto} -> ${dest_ip}:${dest_port}"
+            j=$((j + 1))
+        done
+        draw_line
+    fi
+
+    pause
+}
+
+wg_start() {
+    if wg_is_running; then
+        print_warn "WireGuard 已在运行"
+        return 0
+    fi
+
+    if [[ ! -f "$WG_CONF" ]]; then
+        print_error "配置文件不存在: ${WG_CONF}"
+        return 1
+    fi
+
+    print_info "正在启动 WireGuard..."
+    wg-quick up "$WG_INTERFACE" 2>/dev/null
+
+    if is_systemd; then
+        systemctl enable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1
+    fi
+
+    sleep 1
+
+    if wg_is_running; then
+        wg_restore_port_forwards
+        print_success "WireGuard 已启动"
+        log_action "WireGuard started"
+    else
+        print_error "启动失败"
+        log_action "WireGuard start failed"
+    fi
+}
+
+wg_stop() {
+    if ! wg_is_running; then
+        print_warn "WireGuard 未在运行"
+        return 0
+    fi
+
+    print_info "正在停止 WireGuard..."
+    wg-quick down "$WG_INTERFACE" 2>/dev/null
+
+    sleep 1
+
+    if ! wg_is_running; then
+        print_success "WireGuard 已停止"
+        log_action "WireGuard stopped"
+    else
+        print_error "停止失败"
+    fi
+}
+
+wg_restart() {
+    print_info "正在重启 WireGuard..."
+    wg_is_running && wg-quick down "$WG_INTERFACE" 2>/dev/null
+    sleep 1
+    wg-quick up "$WG_INTERFACE" 2>/dev/null
+    sleep 1
+
+    if wg_is_running; then
+        wg_restore_port_forwards
+        print_success "WireGuard 已重启"
+        log_action "WireGuard restarted"
+    else
+        print_error "重启失败"
+        log_action "WireGuard restart failed"
+    fi
+}
+
+wg_restore_port_forwards() {
+    local role
+    role=$(wg_get_role)
+    [[ "$role" != "server" ]] && return 0
+
+    local pf_count
+    pf_count=$(wg_db_get '.port_forwards | length')
+    [[ "$pf_count" -eq 0 || "$pf_count" == "null" ]] && return 0
+
+    local j=0
+    while [[ $j -lt $pf_count ]]; do
+        local proto ext_port dest_ip dest_port pf_enabled
+        proto=$(wg_db_get ".port_forwards[$j].proto")
+        ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
+        dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
+        dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
+        pf_enabled=$(wg_db_get ".port_forwards[$j].enabled")
+
+        if [[ "$pf_enabled" == "true" ]]; then
+            _wg_pf_iptables_ensure "$proto" "$ext_port" "$dest_ip" "$dest_port"
+        fi
+
+        j=$((j + 1))
+    done
+}
+
+wg_uninstall() {
+    print_title "卸载 WireGuard"
+
+    if ! wg_is_installed; then
+        print_warn "WireGuard 未安装"
+        pause; return 0
+    fi
+
+    local role
+    role=$(wg_get_role)
+
+    echo -e "  当前角色: ${C_GREEN}${role:-未知}${C_RESET}"
+    echo ""
+
+    print_warn "此操作将完全卸载 WireGuard，包括所有配置和密钥！"
+    echo ""
+
+    if ! confirm "确认卸载 WireGuard?"; then
+        return
+    fi
+
+    if ! confirm "再次确认: 所有配置将被永久删除，是否继续?"; then
+        return
+    fi
+
+    echo ""
+    print_info "[1/5] 停止 WireGuard..."
+    if wg_is_running; then
+        wg-quick down "$WG_INTERFACE" 2>/dev/null || true
+    fi
+
+    if is_systemd; then
+        systemctl disable "wg-quick@${WG_INTERFACE}" >/dev/null 2>&1 || true
+    fi
+
+    print_info "[2/5] 清理端口转发规则..."
+    if [[ "$role" == "server" ]]; then
+        local pf_count
+        pf_count=$(wg_db_get '.port_forwards | length' 2>/dev/null)
+
+        if [[ -n "$pf_count" && "$pf_count" -gt 0 ]] 2>/dev/null; then
+
+            local j=0
+            while [[ $j -lt $pf_count ]]; do
+                local proto ext_port dest_ip dest_port
+                proto=$(wg_db_get ".port_forwards[$j].proto")
+                ext_port=$(wg_db_get ".port_forwards[$j].ext_port")
+                dest_ip=$(wg_db_get ".port_forwards[$j].dest_ip")
+                dest_port=$(wg_db_get ".port_forwards[$j].dest_port")
+
+                _wg_pf_iptables -D "$proto" "$ext_port" "$dest_ip" "$dest_port"
+
+                j=$((j + 1))
+            done
+
+            wg_save_iptables
+        fi
+    fi
+
+    print_info "[3/5] 清理防火墙规则..."
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        if [[ "$role" == "server" ]]; then
+            local port
+            port=$(wg_db_get '.server.port' 2>/dev/null)
+            [[ -n "$port" ]] && ufw delete allow "${port}/udp" 2>/dev/null || true
+        fi
+        ufw status numbered 2>/dev/null | grep "WG-PF" | awk -F'[][]' '{print $2}' | sort -rn | while read -r num; do
+            yes | ufw delete "$num" 2>/dev/null || true
+        done
+    fi
+
+    print_info "[4/5] 删除配置文件..."
+    rm -f "$WG_CONF" 2>/dev/null || true
+    rm -rf /etc/wireguard/clients 2>/dev/null || true
+    rm -f "$WG_DB_FILE" 2>/dev/null || true
+    rm -rf "$WG_DB_DIR" 2>/dev/null || true          # ← 新增
+    rm -f "$WG_ROLE_FILE" 2>/dev/null || true         # ← 新增
+    rm -f /etc/wireguard/*.key 2>/dev/null || true
+
+    rmdir /etc/wireguard 2>/dev/null || true
+
+    print_info "[5/5] 卸载软件包..."
+    local remove_pkg=true
+
+    if confirm "是否卸载 WireGuard 软件包? (选 N 仅删除配置)"; then
+        case $PLATFORM in
+            debian|ubuntu)
+                apt-get remove -y wireguard wireguard-tools >/dev/null 2>&1 || true
+                apt-get autoremove -y >/dev/null 2>&1 || true
+                ;;
+            centos|rhel|rocky|alma|fedora)
+                if command_exists dnf; then
+                    dnf remove -y wireguard-tools >/dev/null 2>&1 || true
+                else
+                    yum remove -y wireguard-tools >/dev/null 2>&1 || true
+                fi
+                ;;
+            alpine)
+                apk del wireguard-tools >/dev/null 2>&1 || true
+                ;;
+            arch|manjaro)
+                pacman -Rns --noconfirm wireguard-tools >/dev/null 2>&1 || true
+                ;;
+            openwrt)
+                opkg remove wireguard-tools luci-proto-wireguard >/dev/null 2>&1 || true
+                ;;
+        esac
+    else
+        remove_pkg=false
+    fi
+
+    if [[ "$role" == "server" ]]; then
+        if confirm "是否恢复 IP 转发设置? (如果其他服务需要转发请选 N)"; then
+            sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+            sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+        fi
+    fi
+
+    echo ""
+    draw_line
+    print_success "WireGuard 已完全卸载"
+    draw_line
+
+    log_action "WireGuard uninstalled: role=${role} pkg_removed=${remove_pkg}"
+    pause
+}
+
+wg_server_menu() {
+    while true; do
+        print_title "WireGuard 服务端管理"
+
+        if wg_is_running; then
+            echo -e "  状态: ${C_GREEN}● 运行中${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}"
+        else
+            echo -e "  状态: ${C_RED}● 已停止${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}"
+        fi
+
+        local peer_count
+        peer_count=$(wg_db_get '.peers | length')
+        echo -e "  设备数: ${C_CYAN}${peer_count}${C_RESET}"
+        echo ""
+
+        echo "  ── 设备管理 ──────────────────"
+        echo "  1. 查看状态"
+        echo "  2. 添加设备"
+        echo "  3. 删除设备"
+        echo "  4. 启用/禁用设备"
+        echo "  5. 查看设备配置/二维码"
+        echo ""
+        echo "  ── 端口转发 ──────────────────"
+        echo "  6. 端口转发管理"
+        echo ""
+        echo "  ── 服务控制 ──────────────────"
+        echo "  7. 启动 WireGuard"
+        echo "  8. 停止 WireGuard"
+        echo "  9. 重启 WireGuard"
+        echo ""
+        echo "  ── 系统设置 ──────────────────"
+        echo "  10. 修改服务端配置"
+        echo "  11. 卸载 WireGuard"
+        echo ""
+        echo "  0. 返回上级菜单"
+        echo ""
+
+        read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
+
+        case $choice in
+            1) wg_server_status ;;
+            2) wg_add_peer ;;
+            3) wg_delete_peer ;;
+            4) wg_toggle_peer ;;
+            5) wg_show_peer_conf ;;
+            6) wg_port_forward_menu ;;
+            7) wg_start; pause ;;
+            8) wg_stop; pause ;;
+            9) wg_restart; pause ;;
+            10) wg_modify_server ;;
+            11) wg_uninstall; return ;;
+            0|"") return ;;
+            *) print_warn "无效选项" ;;
+        esac
+    done
+}
+
+wg_client_menu() {
+    while true; do
+        print_title "WireGuard 客户端管理"
+
+        if wg_is_running; then
+            echo -e "  状态: ${C_GREEN}● 已连接${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}"
+        else
+            echo -e "  状态: ${C_RED}● 未连接${C_RESET}    接口: ${C_CYAN}${WG_INTERFACE}${C_RESET}"
+        fi
+
+        local client_addr client_ep
+        client_addr=$(wg_db_get '.client.address' 2>/dev/null)
+        client_ep=$(wg_db_get '.client.server_endpoint' 2>/dev/null)
+        [[ -n "$client_addr" && "$client_addr" != "null" ]] && echo -e "  地址: ${C_CYAN}${client_addr}${C_RESET}"
+        [[ -n "$client_ep" && "$client_ep" != "null" ]] && echo -e "  服务端: ${C_CYAN}${client_ep}${C_RESET}"
+        echo ""
+
+        echo "  1. 查看连接状态"
+        echo "  2. 连接"
+        echo "  3. 断开"
+        echo "  4. 重新连接"
+        echo "  5. 更换配置"
+        echo "  6. 卸载 WireGuard"
+        echo ""
+        echo "  0. 返回上级菜单"
+        echo ""
+
+        read -e -r -p "$(echo -e "${C_CYAN}选择操作: ${C_RESET}")" choice
+
+        case $choice in
+            1) wg_client_status ;;
+            2) wg_client_connect; pause ;;
+            3) wg_client_disconnect; pause ;;
+            4) wg_client_reconnect; pause ;;
+            5) wg_client_reconfig ;;
+            6) wg_uninstall; return ;;
+            0|"") return ;;
+            *) print_warn "无效选项" ;;
+        esac
+    done
+}
+
+wg_install_menu() {
+    print_title "安装 WireGuard"
+    echo ""
+    echo "  请选择安装模式:"
+    echo ""
+    echo "  1. 服务端 (Server) - 作为 VPN 服务器，管理多个客户端"
+    echo "  2. 客户端 (Client) - 连接到已有的 WireGuard 服务器"
+    echo ""
+    echo "  0. 返回"
+    echo ""
+
+    read -e -r -p "$(echo -e "${C_CYAN}选择: ${C_RESET}")" mode
+
+    case $mode in
+        1) wg_server_install ;;
+        2) wg_client_install ;;
+        0|"") return ;;
+        *) print_warn "无效选项" ;;
+    esac
+}
+
+wg_main_menu() {
+    while true; do
+        if wg_is_installed; then
+            local role
+            role=$(wg_get_role)
+
+            case $role in
+                server) wg_server_menu; return ;;
+                client) wg_client_menu; return ;;
+                *)
+                    if [[ -f "$WG_CONF" ]] && grep -q "ListenPort" "$WG_CONF" && grep -q "\[Peer\]" "$WG_CONF"; then
+                        if grep -c "\[Peer\]" "$WG_CONF" | grep -q "^1$" && ! grep -q "PostUp" "$WG_CONF"; then
+                            print_warn "检测到 WireGuard 已安装但角色未知"
+                            echo "  1. 作为服务端管理"
+                            echo "  2. 作为客户端管理"
+                            echo "  3. 卸载重装"
+                            echo "  0. 返回"
+                            read -e -r -p "选择: " rc
+                            case $rc in
+                                1) wg_set_role "server"; continue ;;
+                                2) wg_set_role "client"; continue ;;
+                                3) wg_uninstall; continue ;;
+                                *) return ;;
+                            esac
+                        else
+                            wg_set_role "server"; continue
+                        fi
+                    elif [[ -f "$WG_CONF" ]]; then
+                        wg_set_role "client"; continue
+                    else
+                        print_warn "WireGuard 已安装但无配置文件"
+                        echo "  1. 安装为服务端"
+                        echo "  2. 安装为客户端"
+                        echo "  3. 卸载"
+                        echo "  0. 返回"
+                        read -e -r -p "选择: " rc2
+                        case $rc2 in
+                            1) wg_server_install; continue ;;
+                            2) wg_client_install; continue ;;
+                            3) wg_uninstall; continue ;;
+                            *) return ;;
+                        esac
+                    fi
+                    ;;
+            esac
+        else
+            wg_install_menu
+            wg_is_installed || return
+        fi
+    done
+}
 
 menu_opt_openwrt() {
     fix_terminal
@@ -3335,23 +4724,7 @@ menu_opt_openwrt() {
         case $c in
             1) opt_bbr ;;
             2) opt_hostname ;;
-            3)
-                echo "1.上海 2.香港 3.东京 4.纽约 5.伦敦 6.UTC"
-                read -e -r -p "选择: " t
-                case $t in
-                    1) z="Asia/Shanghai" ;;
-                    2) z="Asia/Hong_Kong" ;;
-                    3) z="Asia/Tokyo" ;;
-                    4) z="America/New_York" ;;
-                    5) z="Europe/London" ;;
-                    6) z="UTC" ;;
-                    *) print_error "无效选择"; pause; continue ;;
-                esac
-                ln -sf /usr/share/zoneinfo/$z /etc/localtime
-                print_success "时区已设为 $z"
-                log_action "Timezone changed to $z"
-                pause
-                ;;
+            3) select_timezone || true; pause ;;
             4) feature_blocked "虚拟内存 Swap" ;;
             5) feature_blocked "系统垃圾清理 (apt)" ;;
             0|q) break ;;
@@ -3359,7 +4732,6 @@ menu_opt_openwrt() {
         esac
     done
 }
-
 menu_net_openwrt() {
     fix_terminal
     while true; do
@@ -3380,7 +4752,6 @@ menu_net_openwrt() {
         esac
     done
 }
-
 main() {
     check_root
     check_os
@@ -3389,7 +4760,7 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-9]: " choice
+        read -e -r -p "请选择功能 [0-10]: " choice
         
                 case $choice in
             1)
@@ -3451,6 +4822,9 @@ main() {
                 fi
                 pause
                 ;;
+            10)
+                wg_main_menu
+                ;;
             0|q|Q)
                 echo ""
                 print_success "感谢使用 $SCRIPT_NAME！"
@@ -3464,9 +4838,4 @@ main() {
         esac
     done
 }
-
-# ==============================================================================
-# 脚本入口
-# ==============================================================================
-
 main "$@"
