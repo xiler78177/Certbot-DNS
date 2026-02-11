@@ -80,8 +80,16 @@ DDNS_LOG="/var/log/ddns.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
 
 get_ip() {
-    [[ "$1" == "4" ]] && { curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null; } || \
-    { curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null; }
+    if [[ "$1" == "4" ]]; then
+        curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || \
+        curl -4 -s --max-time 5 https://myip.ipip.net/ip 2>/dev/null || \
+        curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+        curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null
+    else
+        curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || \
+        curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null || \
+        curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null
+    fi
 }
 
 update_cf() {
@@ -172,8 +180,8 @@ ddns_list() {
     done
     
     echo ""
-    local ip4=$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)
-    local ip6=$(curl -6 -s --max-time 3 ifconfig.me 2>/dev/null)
+    local ip4=$(curl -4 -s --max-time 3 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 3 https://ifconfig.me 2>/dev/null)
+    local ip6=$(curl -6 -s --max-time 3 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 3 https://ifconfig.me 2>/dev/null)
     echo -e "${C_CYAN}当前IP:${C_RESET} IPv4=${ip4:-N/A} IPv6=${ip6:-N/A}"
     pause
 }
@@ -230,9 +238,12 @@ load_cache() {
 }
 
 refresh_network_cache() {
-    CACHED_IPV4=$(curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+    CACHED_IPV4=$(curl -4 -s --connect-timeout 3 --max-time 5 https://4.ipw.cn 2>/dev/null || \
+              curl -4 -s --connect-timeout 3 --max-time 5 https://myip.ipip.net/ip 2>/dev/null || \
+              curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
 
-    CACHED_IPV6=$(curl -6 -s --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null)
+    CACHED_IPV6=$(curl -6 -s --connect-timeout 3 --max-time 5 https://6.ipw.cn 2>/dev/null || \
+              curl -6 -s --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null)
     [[ -z "$CACHED_IPV6" || ! "$CACHED_IPV6" =~ : ]] && CACHED_IPV6="未配置"
     
     local ipinfo=$(curl -s --connect-timeout 3 --max-time 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
@@ -1551,8 +1562,8 @@ net_iperf3() {
         fi
     fi
     
-    local ip4=$(curl -s -L --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null)
-    local ip6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
+    local ip4=$(curl -4 -s -L --connect-timeout 5 --max-time 10 https://4.ipw.cn 2>/dev/null || curl -4 -s -L --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null)
+    local ip6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://6.ipw.cn 2>/dev/null || curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
     [[ -z "$ip6" || ! "$ip6" =~ : ]] && ip6="未检测到"
     
     echo -e "\n${C_BLUE}=== 客户端测速命令 ===${C_RESET}"
@@ -1740,8 +1751,8 @@ web_cf_dns_update() {
 
     print_info "正在探测本机公网 IP..."
     local ipv4 ipv6
-    ipv4=$(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null) || ipv4=""
-    ipv6=$(curl -6 -s --max-time 5 ifconfig.me 2>/dev/null) || ipv6=""
+    ipv4=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv4=""
+    ipv6=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null) || ipv6=""
 
     echo "----------------------------------------"
     echo "IPv4: ${ipv4:-[✗] 未检测到}"
@@ -2344,8 +2355,8 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
             
             if [[ -n "$zone_id" ]]; then
                 local ddns_ipv4="false" ddns_ipv6="false"
-                [[ -n "$(curl -4 -s --max-time 3 ifconfig.me 2>/dev/null)" ]] && ddns_ipv4="true"
-                [[ -n "$(curl -6 -s --max-time 3 ifconfig.me 2>/dev/null)" ]] && ddns_ipv6="true"
+                [[ -n "$(curl -4 -s --max-time 3 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 3 https://ifconfig.me 2>/dev/null)" ]] && ddns_ipv4="true"
+                [[ -n "$(curl -6 -s --max-time 3 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 3 https://ifconfig.me 2>/dev/null)" ]] && ddns_ipv6="true"
                 ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "false"
             fi
         fi
@@ -3047,7 +3058,7 @@ wg_server_install() {
     wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
 
     local wg_endpoint default_ip
-    default_ip=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+    default_ip=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
     if [[ -n "$default_ip" ]]; then
         read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
         wg_endpoint=${wg_endpoint:-$default_ip}
