@@ -3886,10 +3886,13 @@ wg_show_peer_conf() {
 
     local i=0
     while [[ $i -lt $peer_count ]]; do
-        local name ip
+        local name ip is_gw
         name=$(wg_db_get ".peers[$i].name")
         ip=$(wg_db_get ".peers[$i].ip")
-        echo "  $((i + 1)). ${name} (${ip})"
+        is_gw=$(wg_db_get ".peers[$i].is_gateway // false")
+        local mark=""
+        [[ "$is_gw" == "true" ]] && mark=" ${C_YELLOW}(网关)${C_RESET}"
+        echo -e "  $((i + 1)). ${name} (${ip})${mark}"
         i=$((i + 1))
     done
     echo "  0. 返回"
@@ -3926,10 +3929,14 @@ wg_show_peer_conf() {
         ssub=$(wg_db_get '.server.subnet')
         mask=$(echo "$ssub" | cut -d'/' -f2)
 
-        mkdir -p /etc/wireguard/clients
-        write_file_atomic "$conf_file" "[Interface]
+        local is_gw_check=$(wg_db_get ".peers[$target_idx].is_gateway // false")
+        local dns_line="DNS = ${sdns}"
+        [[ "$is_gw_check" == "true" ]] && dns_line=""
+
+        local regen_content="[Interface]
 PrivateKey = ${peer_privkey}
 Address = ${peer_ip}/${mask}
+${dns_line}
 
 [Peer]
 PublicKey = ${spub}
@@ -3937,6 +3944,11 @@ PresharedKey = ${peer_psk}
 Endpoint = ${sep}:${sport}
 AllowedIPs = ${client_allowed_ips}
 PersistentKeepalive = 25"
+
+        regen_content=$(echo "$regen_content" | sed '/^$/N;/^\n$/d')
+
+        mkdir -p /etc/wireguard/clients
+        write_file_atomic "$conf_file" "$regen_content"
         chmod 600 "$conf_file"
         print_success "配置文件已重新生成"
     fi
@@ -3958,6 +3970,107 @@ PersistentKeepalive = 25"
         fi
     fi
 
+    # === 网关设备: 显示 OpenWrt 部署命令 ===
+    local is_gateway
+    is_gateway=$(wg_db_get ".peers[$target_idx].is_gateway // false")
+
+    if [[ "$is_gateway" == "true" ]]; then
+        echo ""
+        if confirm "显示 OpenWrt uci 部署命令?"; then
+            local peer_privkey peer_ip peer_psk client_allowed_ips
+            peer_privkey=$(wg_db_get ".peers[$target_idx].private_key")
+            peer_ip=$(wg_db_get ".peers[$target_idx].ip")
+            peer_psk=$(wg_db_get ".peers[$target_idx].preshared_key")
+            client_allowed_ips=$(wg_db_get ".peers[$target_idx].client_allowed_ips")
+
+            local spub sep sport ssub mask
+            spub=$(wg_db_get '.server.public_key')
+            sep=$(wg_db_get '.server.endpoint')
+            sport=$(wg_db_get '.server.port')
+            ssub=$(wg_db_get '.server.subnet')
+            mask=$(echo "$ssub" | cut -d'/' -f2)
+
+            local ep_host="$sep"
+
+            local uci_allowed_lines=""
+            local IFS_BAK="$IFS"; IFS=','
+            for cidr in $client_allowed_ips; do
+                cidr=$(echo "$cidr" | xargs)
+                [[ -n "$cidr" ]] && uci_allowed_lines="${uci_allowed_lines}uci add_list network.wg_server.allowed_ips='${cidr}'
+"
+            done
+            IFS="$IFS_BAK"
+
+            echo ""
+            draw_line
+            echo -e "${C_CYAN}=== OpenWrt 部署命令 ===${C_RESET}"
+            echo -e "${C_YELLOW}在 OpenWrt SSH 终端依次执行以下命令:${C_RESET}"
+            draw_line
+
+            cat << OPENWRT_EOF
+
+uci delete network.wg0 2>/dev/null; true
+uci delete network.wg_server 2>/dev/null; true
+uci delete firewall.wg_zone 2>/dev/null; true
+uci delete firewall.wg_fwd_lan 2>/dev/null; true
+uci delete firewall.wg_fwd_wg 2>/dev/null; true
+uci commit network 2>/dev/null; true
+uci commit firewall 2>/dev/null; true
+ifdown wg0 2>/dev/null; true
+if ! lsmod | grep -q wireguard; then
+    opkg update
+    opkg install kmod-wireguard || echo '[!] kmod 安装失败，请确认固件已内置 WireGuard 或内核版本匹配'
+fi
+opkg update
+opkg install wireguard-tools luci-proto-wireguard
+uci set network.wg0=interface
+uci set network.wg0.proto='wireguard'
+uci set network.wg0.private_key='${peer_privkey}'
+uci delete network.wg0.addresses 2>/dev/null; true
+uci add_list network.wg0.addresses='${peer_ip}/${mask}'
+uci set network.wg_server=wireguard_wg0
+uci set network.wg_server.public_key='${spub}'
+uci set network.wg_server.preshared_key='${peer_psk}'
+uci set network.wg_server.endpoint_host='${ep_host}'
+uci set network.wg_server.endpoint_port='${sport}'
+uci set network.wg_server.persistent_keepalive='25'
+uci set network.wg_server.route_allowed_ips='1'
+${uci_allowed_lines}
+uci set firewall.wg_zone=zone
+uci set firewall.wg_zone.name='wg'
+uci set firewall.wg_zone.input='ACCEPT'
+uci set firewall.wg_zone.output='ACCEPT'
+uci set firewall.wg_zone.forward='ACCEPT'
+uci set firewall.wg_zone.masq='1'
+uci add_list firewall.wg_zone.network='wg0'
+
+# LAN -> WG 转发 (LAN 设备访问 VPN 网络)
+uci set firewall.wg_fwd_lan=forwarding
+uci set firewall.wg_fwd_lan.src='lan'
+uci set firewall.wg_fwd_lan.dest='wg'
+
+# WG -> LAN 转发 (VPN 对端访问本地 LAN 设备)
+uci set firewall.wg_fwd_wg=forwarding
+uci set firewall.wg_fwd_wg.src='wg'
+uci set firewall.wg_fwd_wg.dest='lan'
+uci commit network
+uci commit firewall
+/etc/init.d/firewall reload
+/etc/init.d/network reload
+
+OPENWRT_EOF
+            draw_line
+            echo -e "${C_GREEN}复制以上全部命令到 OpenWrt SSH 终端执行即可。${C_RESET}"
+            echo ""
+            echo -e "${C_CYAN}验证方法:${C_RESET}"
+            echo "  1. OpenWrt 上执行: wg show"
+            echo "  2. LuCI 界面: Network -> Interfaces 查看 wg0 状态"
+            echo "  3. LAN 设备 ping VPN 服务端: ping $(wg_db_get '.server.ip')"
+            draw_line
+        fi
+    fi
+
+    echo ""
     echo -e "配置文件路径: ${C_CYAN}${conf_file}${C_RESET}"
     echo -e "下载命令: ${C_GRAY}scp root@服务器IP:${conf_file} ./${C_RESET}"
 
