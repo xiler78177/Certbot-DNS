@@ -629,7 +629,7 @@ menu_update() {
     echo ""
     
     print_info "2/2 安装基础依赖包..."
-    local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban iproute2 net-tools procps"
+    local deps="curl wget jq unzip openssl ca-certificates ufw fail2ban ipset iproute2 net-tools procps"
     local installed=0
     local failed=0
     local new_packages=""
@@ -951,6 +951,7 @@ f2b_setup() {
     print_title "Fail2ban 安装与配置"
     install_package "fail2ban" "silent"
     install_package "rsyslog" "silent"
+    install_package "ipset" "silent"
     
     local backend="auto"
     if is_systemd; then
@@ -977,30 +978,30 @@ f2b_setup() {
     echo "  3) 1小时 (1h)"
     echo "  4) 6小时 (6h)"
     echo "  5) 24小时 (24h)"
-    echo "  6) 永久封禁 (-1)"
+    echo "  6) 7天 (7d)"
     echo "  7) 自定义"
-    read -e -r -p "选择封禁时间 [1]: " bantime_choice
+    read -e -r -p "选择封禁时间 [5]: " bantime_choice
     
-    local bantime="10m"
+    local bantime="24h"
     case $bantime_choice in
-        1|"") bantime="10m" ;;
+        1) bantime="10m" ;;
         2) bantime="30m" ;;
         3) bantime="1h" ;;
         4) bantime="6h" ;;
-        5) bantime="24h" ;;
-        6) bantime="-1" ;;
+        5|"") bantime="24h" ;;
+        6) bantime="7d" ;;
         7)
-            read -e -r -p "输入封禁时间 (如 10m, 1h, 24h, -1表示永久): " custom_bantime
-            if [[ "$custom_bantime" =~ ^-?[0-9]+[smhd]?$ ]] || [[ "$custom_bantime" == "-1" ]]; then
+            read -e -r -p "输入封禁时间 (如 10m, 1h, 24h, 7d): " custom_bantime
+            if [[ "$custom_bantime" =~ ^[0-9]+[smhd]?$ ]]; then
                 bantime="$custom_bantime"
             else
-                print_warn "格式无效，使用默认值 10m"
-                bantime="10m"
+                print_warn "格式无效，使用默认值 24h"
+                bantime="24h"
             fi
             ;;
         *) 
-            print_warn "无效选择，使用默认值 10m"
-            bantime="10m"
+            print_warn "无效选择，使用默认值 24h"
+            bantime="24h"
             ;;
     esac
 
@@ -1036,7 +1037,8 @@ f2b_setup() {
     echo "  最大重试:     $maxretry 次"
     echo "  检测窗口:     $findtime"
     echo "  封禁时间:     $bantime"
-    [[ "$bantime" == "-1" ]] && echo -e "  ${C_RED}警告: 永久封禁需要手动解封！${C_RESET}"
+    echo "  封禁方式:     ipset + iptables (高性能)"
+    echo -e "  ${C_YELLOW}提示: 不再使用永久封禁(-1)，避免规则无限增长${C_RESET}"
     draw_line
     
     if ! confirm "确认应用此配置?"; then
@@ -1045,15 +1047,24 @@ f2b_setup() {
         return
     fi
 
-    local banaction="iptables-multiport"
+    # 迁移：清理旧的 UFW 封禁规则
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        banaction="ufw"
+        local old_f2b_rules=$(ufw status numbered 2>/dev/null | grep -ciE "f2b|fail2ban" || echo 0)
+        if [[ "$old_f2b_rules" -gt 0 ]]; then
+            echo ""
+            print_warn "检测到 UFW 中有 ${old_f2b_rules} 条 Fail2ban 旧规则"
+            print_info "新配置使用 ipset 替代 UFW 封禁，旧规则已无用且拖慢系统"
+            if confirm "是否清理这些旧规则? (强烈建议)"; then
+                f2b_migrate_ufw_to_ipset
+            fi
+        fi
     fi
 
     local conf_content="[DEFAULT]
 bantime = $bantime
 findtime = $findtime
-banaction = $banaction
+banaction = iptables-ipset-proto6-allports
+banaction_allports = iptables-ipset-proto6-allports
 
 [sshd]
 enabled = true
@@ -1062,22 +1073,46 @@ maxretry = $maxretry
 backend = $backend
 logpath = %(sshd_log)s"
 
-
-
     write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
     print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL"
     
     if is_systemd; then
         systemctl enable fail2ban >/dev/null || true
         if systemctl restart fail2ban; then
-            print_success "Fail2ban 已启动。"
+            print_success "Fail2ban 已启动 (使用 ipset 高性能封禁)。"
         else
             print_error "Fail2ban 启动失败！"
             echo "请检查日志: journalctl -u fail2ban -n 20"
         fi
-        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime"
+        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=ipset"
     fi
     pause
+}
+
+f2b_migrate_ufw_to_ipset() {
+    print_info "正在清理 UFW 中的 Fail2ban 旧规则..."
+    
+    # 先停止 fail2ban 防止它继续往 UFW 写规则
+    systemctl stop fail2ban 2>/dev/null || true
+    
+    local cleaned=0
+    # 从后往前删除，避免序号偏移
+    while true; do
+        local rule_num=$(ufw status numbered 2>/dev/null | grep -iE "f2b|fail2ban" | tail -1 | grep -oP '^\[\s*\K[0-9]+')
+        [[ -z "$rule_num" ]] && break
+        echo "y" | ufw delete "$rule_num" >/dev/null 2>&1 || break
+        ((cleaned++))
+        # 每100条打印一次进度
+        [[ $((cleaned % 100)) -eq 0 ]] && print_info "已清理 ${cleaned} 条..."
+    done
+    
+    if [[ $cleaned -gt 0 ]]; then
+        print_success "已清理 ${cleaned} 条 UFW 旧规则"
+        ufw reload >/dev/null 2>&1 || true
+        log_action "Migrated fail2ban: cleaned $cleaned UFW rules, switched to ipset"
+    else
+        print_info "无需清理"
+    fi
 }
 
 f2b_status() {
