@@ -3544,6 +3544,51 @@ uci commit firewall
 /etc/init.d/network reload
 
 OPENWRT_EOF
+
+            # 如果 endpoint 是域名，追加看门狗
+            if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                cat << 'WDEOF'
+
+# === WireGuard 看门狗 (DNS重解析 + 连通性保活) ===
+cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
+#!/bin/sh
+LOG="logger -t wg-watchdog"
+if ! ifstatus wg0 &>/dev/null; then
+    $LOG "wg0 down, restarting"; ifup wg0; exit 0
+fi
+EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
+echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && EP_HOST=""
+if [ -n "$EP_HOST" ]; then
+    RESOLVED=$(nslookup "$EP_HOST" 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+    CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
+    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CURRENT" ]; then
+        $LOG "DNS changed: $CURRENT -> $RESOLVED"
+        PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
+        PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
+        wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
+    fi
+fi
+VIP=$(uci get network.wg_server.allowed_ips 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+VIP=$(echo "$VIP" | awk -F. '{print $1"."$2"."$3".1"}')
+if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
+    if [ -f /tmp/.wg-wd-fail ]; then
+        $LOG "ping $VIP failed twice, restarting"
+        ifdown wg0; sleep 1; ifup wg0
+        rm -f /tmp/.wg-wd-fail
+    else
+        touch /tmp/.wg-wd-fail
+    fi
+else
+    rm -f /tmp/.wg-wd-fail 2>/dev/null
+fi
+WDSCRIPT
+chmod +x /usr/bin/wg-watchdog.sh
+(crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
+/etc/init.d/cron restart
+echo '[+] WireGuard 看门狗已安装 (每分钟检测DNS+连通性)'
+WDEOF
+            fi
+
             draw_line
             echo -e "${C_GREEN}复制以上全部命令到 OpenWrt SSH 终端执行即可。${C_RESET}"
             echo ""
@@ -4100,6 +4145,51 @@ uci commit firewall
 /etc/init.d/network reload
 
 OPENWRT_EOF
+
+            # 如果 endpoint 是域名，追加看门狗
+            if [[ ! "$ep_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                cat << 'WDEOF'
+
+# === WireGuard 看门狗 (DNS重解析 + 连通性保活) ===
+cat > /usr/bin/wg-watchdog.sh << 'WDSCRIPT'
+#!/bin/sh
+LOG="logger -t wg-watchdog"
+if ! ifstatus wg0 &>/dev/null; then
+    $LOG "wg0 down, restarting"; ifup wg0; exit 0
+fi
+EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
+echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && EP_HOST=""
+if [ -n "$EP_HOST" ]; then
+    RESOLVED=$(nslookup "$EP_HOST" 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+    CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
+    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CURRENT" ]; then
+        $LOG "DNS changed: $CURRENT -> $RESOLVED"
+        PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
+        PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
+        wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
+    fi
+fi
+VIP=$(uci get network.wg_server.allowed_ips 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+VIP=$(echo "$VIP" | awk -F. '{print $1"."$2"."$3".1"}')
+if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
+    if [ -f /tmp/.wg-wd-fail ]; then
+        $LOG "ping $VIP failed twice, restarting"
+        ifdown wg0; sleep 1; ifup wg0
+        rm -f /tmp/.wg-wd-fail
+    else
+        touch /tmp/.wg-wd-fail
+    fi
+else
+    rm -f /tmp/.wg-wd-fail 2>/dev/null
+fi
+WDSCRIPT
+chmod +x /usr/bin/wg-watchdog.sh
+(crontab -l 2>/dev/null | grep -v wg-watchdog; echo '* * * * * /usr/bin/wg-watchdog.sh') | crontab -
+/etc/init.d/cron restart
+echo '[+] WireGuard 看门狗已安装 (每分钟检测DNS+连通性)'
+WDEOF
+            fi
+
             draw_line
             echo -e "${C_GREEN}复制以上全部命令到 OpenWrt SSH 终端执行即可。${C_RESET}"
             echo ""
@@ -5437,15 +5527,17 @@ CLEANEOF
 }
 
 wg_setup_watchdog() {
-    wg_check_server || return 1
+    wg_check_installed || return 1
 
+    local role=$(wg_get_role)
     local watchdog_script="/usr/local/bin/wg-watchdog.sh"
     local watchdog_log="/var/log/wg-watchdog.log"
 
-    print_title "WireGuard 服务端看门狗"
+    print_title "WireGuard 看门狗 (${role})"
 
     if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
         echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
+        echo -e "  角色: ${C_CYAN}${role}${C_RESET}"
         echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
         echo -e "  日志: ${C_CYAN}${watchdog_log}${C_RESET}"
         echo ""
@@ -5477,22 +5569,47 @@ wg_setup_watchdog() {
         pause; return
     fi
 
-    echo "看门狗功能说明:"
-    echo "  • 每分钟检测 wg0 接口状态"
-    echo "  • 第一层: wg0 接口消失 → 立即拉起"
-    echo "  • 第二层: wg show 命令失败 → 重启接口"
-    echo "  • 第三层: 所有 peer 超过 10 分钟无握手 → 连续两次确认后重启"
+    if [[ "$role" == "server" ]]; then
+        echo "服务端看门狗功能:"
+        echo "  • 每分钟检测 wg0 接口状态"
+        echo "  • 接口消失 → 立即拉起"
+        echo "  • wg show 失败 → 重启接口"
+        echo "  • 所有 peer 超 10 分钟无握手 → 连续两次确认后重启"
+    else
+        echo "客户端看门狗功能:"
+        echo "  • 每分钟检测 wg0 接口状态"
+        echo "  • 接口消失 → 立即拉起"
+        echo "  • 自动重解析服务端 Endpoint DNS (应对动态 IP)"
+        echo "  • Ping 服务端 VPN IP 失败 → 重启接口"
+    fi
     echo ""
-    if ! confirm "启用 WireGuard 看门狗?"; then pause; return; fi
+    if ! confirm "启用看门狗?"; then pause; return; fi
 
-    cat > "$watchdog_script" << 'WDEOF'
+    # 客户端需要获取 endpoint 域名
+    local endpoint_host=""
+    if [[ "$role" == "client" ]]; then
+        endpoint_host=$(grep -i "^Endpoint" "$WG_CONF" 2>/dev/null | head -1 | sed 's/^[^=]*=[[:space:]]*//' | cut -d: -f1)
+        if [[ -z "$endpoint_host" ]]; then
+            read -e -r -p "服务端 Endpoint (域名或IP): " endpoint_host
+        fi
+        # 判断是否为域名（需要 DNS 重解析）
+        if [[ "$endpoint_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            print_info "Endpoint 是固定 IP，DNS 重解析将跳过"
+            endpoint_host=""
+        else
+            print_info "Endpoint 域名: ${endpoint_host}，将启用 DNS 重解析"
+        fi
+    fi
+
+    # 生成看门狗脚本
+    cat > "$watchdog_script" << 'WDEOF_COMMON'
 #!/bin/bash
 LOG="/var/log/wg-watchdog.log"
 WG_INTERFACE="wg0"
 STALE_THRESHOLD=600
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
 
-# 检查1: 接口是否存在
+# === 通用检查: 接口是否存在 ===
 if ! ip link show "$WG_INTERFACE" &>/dev/null; then
     log "WARN: $WG_INTERFACE interface missing, restarting..."
     wg-quick up "$WG_INTERFACE" 2>>"$LOG"
@@ -5500,32 +5617,31 @@ if ! ip link show "$WG_INTERFACE" &>/dev/null; then
     if ip link show "$WG_INTERFACE" &>/dev/null; then
         log "OK: $WG_INTERFACE recovered (interface was missing)"
     else
-        log "ERROR: $WG_INTERFACE restart failed (interface still missing)"
+        log "ERROR: $WG_INTERFACE restart failed"
     fi
     exit 0
 fi
 
-# 检查2: wg 命令是否正常响应
+# === 通用检查: wg 命令是否正常 ===
 if ! wg show "$WG_INTERFACE" &>/dev/null; then
     log "WARN: wg show failed, restarting..."
-    wg-quick down "$WG_INTERFACE" 2>>"$LOG"
-    sleep 1
+    wg-quick down "$WG_INTERFACE" 2>>"$LOG"; sleep 1
     wg-quick up "$WG_INTERFACE" 2>>"$LOG"
     sleep 2
-    if wg show "$WG_INTERFACE" &>/dev/null; then
-        log "OK: $WG_INTERFACE recovered (wg show was failing)"
-    else
-        log "ERROR: $WG_INTERFACE restart failed (wg show still failing)"
-    fi
+    wg show "$WG_INTERFACE" &>/dev/null && log "OK: recovered" || log "ERROR: restart failed"
     exit 0
 fi
+WDEOF_COMMON
 
-# 检查3: 是否所有 peer 的 handshake 都超时 (僵死检测)
+    if [[ "$role" == "server" ]]; then
+        cat >> "$watchdog_script" << 'WDEOF_SERVER'
+
+# === 服务端: 全 peer 僵死检测 ===
 peer_count=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2 | wc -l)
 if [[ "$peer_count" -gt 0 ]]; then
     now=$(date +%s)
     any_alive=0
-    while IFS=$'\t' read -r _ _ _ _ last_hs _ _; do
+    while IFS=$'\t' read -r _ _ _ _ last_hs _; do
         [[ "$last_hs" == "0" ]] && continue
         age=$((now - last_hs))
         [[ $age -lt $STALE_THRESHOLD ]] && { any_alive=1; break; }
@@ -5534,31 +5650,100 @@ if [[ "$peer_count" -gt 0 ]]; then
     if [[ $any_alive -eq 0 ]]; then
         stale_flag="/tmp/.wg-watchdog-stale"
         if [[ -f "$stale_flag" ]]; then
-            log "WARN: all ${peer_count} peers stale for 2 consecutive checks, restarting $WG_INTERFACE..."
-            wg-quick down "$WG_INTERFACE" 2>>"$LOG"
-            sleep 1
+            log "WARN: all peers stale 2 consecutive checks, restarting..."
+            wg-quick down "$WG_INTERFACE" 2>>"$LOG"; sleep 1
             wg-quick up "$WG_INTERFACE" 2>>"$LOG"
             rm -f "$stale_flag"
-            sleep 2
-            if wg show "$WG_INTERFACE" &>/dev/null; then
-                log "OK: $WG_INTERFACE recovered from stale state"
-            else
-                log "ERROR: $WG_INTERFACE restart failed after stale detection"
-            fi
         else
-            log "NOTICE: all ${peer_count} peers stale (>${STALE_THRESHOLD}s), flagging for next check"
+            log "NOTICE: all peers stale, flagging"
             touch "$stale_flag"
         fi
     else
         rm -f /tmp/.wg-watchdog-stale 2>/dev/null
     fi
 fi
+WDEOF_SERVER
 
-# 日志轮转: 保留最近 500 行
+    else
+        # 客户端看门狗
+        if [[ -n "$endpoint_host" ]]; then
+            cat >> "$watchdog_script" << WDEOF_CLIENT_DNS
+
+# === 客户端: Endpoint DNS 重解析 ===
+ENDPOINT_HOST="${endpoint_host}"
+resolve_ip() {
+    local ip=""
+    if command -v dig &>/dev/null; then
+        ip=\$(dig +short "\$1" A 2>/dev/null | grep -E '^[0-9]+\.' | head -1)
+    elif command -v nslookup &>/dev/null; then
+        ip=\$(nslookup "\$1" 2>/dev/null | awk '/^Address: / && !/127\.0\.0/ {print \$2; exit}')
+    elif command -v getent &>/dev/null; then
+        ip=\$(getent ahosts "\$1" 2>/dev/null | awk '/STREAM/ {print \$1; exit}')
+    fi
+    echo "\$ip"
+}
+
+resolved=\$(resolve_ip "\$ENDPOINT_HOST")
+if [[ -n "\$resolved" ]]; then
+    wg show "\$WG_INTERFACE" endpoints 2>/dev/null | while read -r pub ep; do
+        [[ -z "\$ep" || "\$ep" == "(none)" ]] && continue
+        current_ip=\$(echo "\$ep" | sed 's/\[//;s/\]//' | rev | cut -d: -f2- | rev)
+        current_port=\$(echo "\$ep" | rev | cut -d: -f1 | rev)
+        if [[ "\$resolved" != "\$current_ip" ]]; then
+            log "DNS changed: \$current_ip -> \$resolved (\$ENDPOINT_HOST)"
+            wg set "\$WG_INTERFACE" peer "\$pub" endpoint "\${resolved}:\${current_port}" 2>>"$LOG" && \
+                log "OK: endpoint updated to \${resolved}:\${current_port}" || \
+                log "ERROR: endpoint update failed"
+        fi
+    done
+fi
+WDEOF_CLIENT_DNS
+        fi
+
+        cat >> "$watchdog_script" << 'WDEOF_CLIENT_PING'
+
+# === 客户端: 连通性检测 ===
+# 从 AllowedIPs 或接口地址推算服务端 VPN IP
+server_vip=""
+my_addr=$(ip -4 addr show "$WG_INTERFACE" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1)
+if [[ -n "$my_addr" ]]; then
+    server_vip=$(echo "$my_addr" | awk -F'.' '{print $1"."$2"."$3".1"}')
+fi
+
+if [[ -n "$server_vip" ]]; then
+    if ! ping -c 2 -W 3 "$server_vip" &>/dev/null; then
+        ping_fail="/tmp/.wg-watchdog-ping-fail"
+        if [[ -f "$ping_fail" ]]; then
+            log "WARN: ping $server_vip failed 2 consecutive checks, restarting..."
+            wg-quick down "$WG_INTERFACE" 2>>"$LOG"; sleep 1
+            wg-quick up "$WG_INTERFACE" 2>>"$LOG"
+            rm -f "$ping_fail"
+            sleep 2
+            if ping -c 1 -W 3 "$server_vip" &>/dev/null; then
+                log "OK: connectivity restored after restart"
+            else
+                log "WARN: still unreachable after restart"
+            fi
+        else
+            log "NOTICE: ping $server_vip failed, flagging"
+            touch "$ping_fail"
+        fi
+    else
+        rm -f /tmp/.wg-watchdog-ping-fail 2>/dev/null
+    fi
+fi
+WDEOF_CLIENT_PING
+    fi
+
+    # 通用尾部：日志轮转
+    cat >> "$watchdog_script" << 'WDEOF_TAIL'
+
+# === 日志轮转 ===
 if [[ -f "$LOG" ]] && [[ $(wc -l < "$LOG") -gt 500 ]]; then
     tail -n 300 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
 fi
-WDEOF
+WDEOF_TAIL
+
     chmod +x "$watchdog_script"
 
     local cron_tmp=$(mktemp)
@@ -5566,15 +5751,26 @@ WDEOF
     echo "* * * * * $watchdog_script >/dev/null 2>&1" >> "$cron_tmp"
     crontab "$cron_tmp"; rm -f "$cron_tmp"
 
+    echo ""
     print_success "看门狗已启用 (每分钟检测)"
     echo ""
-    echo -e "  脚本路径: ${C_CYAN}${watchdog_script}${C_RESET}"
-    echo -e "  日志路径: ${C_CYAN}/var/log/wg-watchdog.log${C_RESET}"
-    echo -e "  检测逻辑:"
-    echo "    1. wg0 接口消失 → 立即 wg-quick up"
-    echo "    2. wg show 失败 → down + up 重启"
-    echo "    3. 所有 peer 超 10 分钟无握手 → 连续 2 次确认后重启"
-    log_action "WireGuard watchdog enabled"
+    echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
+    echo -e "  日志: ${C_CYAN}${watchdog_log}${C_RESET}"
+    echo -e "  角色: ${C_CYAN}${role}${C_RESET}"
+    echo ""
+    if [[ "$role" == "server" ]]; then
+        echo "  检测逻辑:"
+        echo "    1. wg0 接口消失 → 立即拉起"
+        echo "    2. wg show 失败 → 重启"
+        echo "    3. 所有 peer 超 10 分钟无握手 → 连续 2 次确认后重启"
+    else
+        echo "  检测逻辑:"
+        echo "    1. wg0 接口消失 → 立即拉起"
+        echo "    2. wg show 失败 → 重启"
+        [[ -n "$endpoint_host" ]] && echo "    3. DNS 重解析 ${endpoint_host} → IP 变化时自动更新 endpoint"
+        echo "    4. Ping 服务端 VPN IP 失败 → 连续 2 次确认后重启"
+    fi
+    log_action "WireGuard watchdog enabled (role=$role)"
     pause
 }
 
@@ -5663,7 +5859,8 @@ wg_client_menu() {
         echo "  3. 断开"
         echo "  4. 重新连接"
         echo "  5. 更换配置"
-        echo "  6. 卸载 WireGuard"
+        echo "  6. 看门狗 (自动重连/DNS重解析)"
+        echo "  7. 卸载 WireGuard"
         echo ""
         echo "  0. 返回上级菜单"
         echo ""
@@ -5676,7 +5873,8 @@ wg_client_menu() {
             3) wg_client_disconnect; pause ;;
             4) wg_client_reconnect; pause ;;
             5) wg_client_reconfig ;;
-            6) wg_uninstall; return ;;
+            6) wg_setup_watchdog ;;
+            7) wg_uninstall; return ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac
