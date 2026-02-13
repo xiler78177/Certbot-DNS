@@ -5299,12 +5299,20 @@ wg_uninstall() {
         done
     fi
 
+    print_info "[3.5/5] 清理看门狗..."
+    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+        local cron_tmp=$(mktemp)
+        crontab -l 2>/dev/null | grep -v "wg-watchdog.sh" > "$cron_tmp" || true
+        crontab "$cron_tmp"; rm -f "$cron_tmp"
+    fi
+    rm -f /usr/local/bin/wg-watchdog.sh /var/log/wg-watchdog.log /tmp/.wg-watchdog-stale 2>/dev/null || true
+
     print_info "[4/5] 删除配置文件..."
     rm -f "$WG_CONF" 2>/dev/null || true
     rm -rf /etc/wireguard/clients 2>/dev/null || true
     rm -f "$WG_DB_FILE" 2>/dev/null || true
-    rm -rf "$WG_DB_DIR" 2>/dev/null || true          # ← 新增
-    rm -f "$WG_ROLE_FILE" 2>/dev/null || true         # ← 新增
+    rm -rf "$WG_DB_DIR" 2>/dev/null || true          
+    rm -f "$WG_ROLE_FILE" 2>/dev/null || true         
     rm -f /etc/wireguard/*.key 2>/dev/null || true
 
     rmdir /etc/wireguard 2>/dev/null || true
@@ -5387,6 +5395,148 @@ CLEANEOF
     pause
 }
 
+wg_setup_watchdog() {
+    wg_check_server || return 1
+
+    local watchdog_script="/usr/local/bin/wg-watchdog.sh"
+    local watchdog_log="/var/log/wg-watchdog.log"
+
+    print_title "WireGuard 服务端看门狗"
+
+    if crontab -l 2>/dev/null | grep -q "wg-watchdog.sh"; then
+        echo -e "  状态: ${C_GREEN}已启用${C_RESET}"
+        echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
+        echo -e "  日志: ${C_CYAN}${watchdog_log}${C_RESET}"
+        echo ""
+        echo "  1. 禁用看门狗"
+        echo "  2. 查看日志"
+        echo "  3. 手动触发一次检测"
+        echo "  0. 返回"
+        read -e -r -p "选择: " c
+        case $c in
+            1)
+                local cron_tmp=$(mktemp)
+                crontab -l 2>/dev/null | grep -v "wg-watchdog.sh" > "$cron_tmp" || true
+                crontab "$cron_tmp"; rm -f "$cron_tmp"
+                rm -f "$watchdog_script"
+                print_success "看门狗已禁用"
+                log_action "WireGuard watchdog disabled"
+                ;;
+            2) echo ""; tail -n 30 "$watchdog_log" 2>/dev/null || print_warn "无日志" ;;
+            3)
+                if [[ -x "$watchdog_script" ]]; then
+                    bash "$watchdog_script"
+                    print_success "检测完成"
+                    echo ""; tail -n 5 "$watchdog_log" 2>/dev/null
+                else
+                    print_warn "看门狗脚本不存在"
+                fi
+                ;;
+        esac
+        pause; return
+    fi
+
+    echo "看门狗功能说明:"
+    echo "  • 每分钟检测 wg0 接口状态"
+    echo "  • 第一层: wg0 接口消失 → 立即拉起"
+    echo "  • 第二层: wg show 命令失败 → 重启接口"
+    echo "  • 第三层: 所有 peer 超过 10 分钟无握手 → 连续两次确认后重启"
+    echo ""
+    if ! confirm "启用 WireGuard 看门狗?"; then pause; return; fi
+
+    cat > "$watchdog_script" << 'WDEOF'
+#!/bin/bash
+LOG="/var/log/wg-watchdog.log"
+WG_INTERFACE="wg0"
+STALE_THRESHOLD=600
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
+
+# 检查1: 接口是否存在
+if ! ip link show "$WG_INTERFACE" &>/dev/null; then
+    log "WARN: $WG_INTERFACE interface missing, restarting..."
+    wg-quick up "$WG_INTERFACE" 2>>"$LOG"
+    sleep 2
+    if ip link show "$WG_INTERFACE" &>/dev/null; then
+        log "OK: $WG_INTERFACE recovered (interface was missing)"
+    else
+        log "ERROR: $WG_INTERFACE restart failed (interface still missing)"
+    fi
+    exit 0
+fi
+
+# 检查2: wg 命令是否正常响应
+if ! wg show "$WG_INTERFACE" &>/dev/null; then
+    log "WARN: wg show failed, restarting..."
+    wg-quick down "$WG_INTERFACE" 2>>"$LOG"
+    sleep 1
+    wg-quick up "$WG_INTERFACE" 2>>"$LOG"
+    sleep 2
+    if wg show "$WG_INTERFACE" &>/dev/null; then
+        log "OK: $WG_INTERFACE recovered (wg show was failing)"
+    else
+        log "ERROR: $WG_INTERFACE restart failed (wg show still failing)"
+    fi
+    exit 0
+fi
+
+# 检查3: 是否所有 peer 的 handshake 都超时 (僵死检测)
+peer_count=$(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2 | wc -l)
+if [[ "$peer_count" -gt 0 ]]; then
+    now=$(date +%s)
+    any_alive=0
+    while IFS=$'\t' read -r _ _ _ _ last_hs _ _; do
+        [[ "$last_hs" == "0" ]] && continue
+        age=$((now - last_hs))
+        [[ $age -lt $STALE_THRESHOLD ]] && { any_alive=1; break; }
+    done < <(wg show "$WG_INTERFACE" dump 2>/dev/null | tail -n +2)
+
+    if [[ $any_alive -eq 0 ]]; then
+        stale_flag="/tmp/.wg-watchdog-stale"
+        if [[ -f "$stale_flag" ]]; then
+            log "WARN: all ${peer_count} peers stale for 2 consecutive checks, restarting $WG_INTERFACE..."
+            wg-quick down "$WG_INTERFACE" 2>>"$LOG"
+            sleep 1
+            wg-quick up "$WG_INTERFACE" 2>>"$LOG"
+            rm -f "$stale_flag"
+            sleep 2
+            if wg show "$WG_INTERFACE" &>/dev/null; then
+                log "OK: $WG_INTERFACE recovered from stale state"
+            else
+                log "ERROR: $WG_INTERFACE restart failed after stale detection"
+            fi
+        else
+            log "NOTICE: all ${peer_count} peers stale (>${STALE_THRESHOLD}s), flagging for next check"
+            touch "$stale_flag"
+        fi
+    else
+        rm -f /tmp/.wg-watchdog-stale 2>/dev/null
+    fi
+fi
+
+# 日志轮转: 保留最近 500 行
+if [[ -f "$LOG" ]] && [[ $(wc -l < "$LOG") -gt 500 ]]; then
+    tail -n 300 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+fi
+WDEOF
+    chmod +x "$watchdog_script"
+
+    local cron_tmp=$(mktemp)
+    crontab -l 2>/dev/null | grep -v "wg-watchdog.sh" > "$cron_tmp" || true
+    echo "* * * * * $watchdog_script >/dev/null 2>&1" >> "$cron_tmp"
+    crontab "$cron_tmp"; rm -f "$cron_tmp"
+
+    print_success "看门狗已启用 (每分钟检测)"
+    echo ""
+    echo -e "  脚本路径: ${C_CYAN}${watchdog_script}${C_RESET}"
+    echo -e "  日志路径: ${C_CYAN}/var/log/wg-watchdog.log${C_RESET}"
+    echo -e "  检测逻辑:"
+    echo "    1. wg0 接口消失 → 立即 wg-quick up"
+    echo "    2. wg show 失败 → down + up 重启"
+    echo "    3. 所有 peer 超 10 分钟无握手 → 连续 2 次确认后重启"
+    log_action "WireGuard watchdog enabled"
+    pause
+}
+
 wg_server_menu() {
     while true; do
         print_title "WireGuard 服务端管理"
@@ -5422,6 +5572,7 @@ wg_server_menu() {
         echo "  11. 修改服务端配置"
         echo "  12. 卸载 WireGuard"
         echo "  13. 生成 OpenWrt 清空 WG 配置命令"
+        echo "  14. 服务端看门狗 (自动重启保活)"
         echo ""
         echo "  0. 返回上级菜单"
         echo ""
@@ -5442,6 +5593,7 @@ wg_server_menu() {
             11) wg_modify_server ;;
             12) wg_uninstall; return ;;
             13) wg_openwrt_clean_cmd ;;
+            14) wg_setup_watchdog ;;
             0|"") return ;;
             *) print_warn "无效选项" ;;
         esac
