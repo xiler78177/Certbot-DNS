@@ -2,7 +2,7 @@
 # install.sh - 引导脚本，确保 bash/curl 存在后拉取主脚本执行
 set -e
 
-REPO_URL="https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/1.sh"
+REPO_URL="https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/v4.sh"
 
 # 检测并安装 bash
 if ! command -v bash >/dev/null 2>&1; then
