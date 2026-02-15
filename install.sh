@@ -1,15 +1,11 @@
 #!/bin/sh
-# install.sh - 引导脚本，确保 bash 存在后拉取主脚本执行
-# 用法: sh <(curl -sSL https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/install.sh)
-
+# install.sh - 引导脚本，确保 bash/curl 存在后拉取主脚本执行
 set -e
 
-need_bash() {
-    command -v bash >/dev/null 2>&1 && return 1
-    return 0
-}
+REPO_URL="https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/1.sh"
 
-if need_bash; then
+# 检测并安装 bash
+if ! command -v bash >/dev/null 2>&1; then
     echo "[!] 未检测到 bash，正在自动安装..."
     if command -v opkg >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1
@@ -23,6 +19,7 @@ if need_bash; then
     fi
 fi
 
+# 检测并安装 curl
 if ! command -v curl >/dev/null 2>&1; then
     echo "[!] 未检测到 curl，正在安装..."
     if command -v opkg >/dev/null 2>&1; then
@@ -33,4 +30,5 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 echo "[✓] 环境就绪，启动主脚本..."
-exec bash <(curl -sSL https://raw.githubusercontent.com/xiler78177/Certbot-DNS/main/v4.sh) "$@"
+curl -sSL "$REPO_URL" -o /tmp/_main_script.sh
+exec bash /tmp/_main_script.sh "$@"
