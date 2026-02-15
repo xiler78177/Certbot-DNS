@@ -74,10 +74,32 @@ DDNS_LOG="/var/log/ddns.log"
 SAAS_CONFIG_DIR="/etc/saas-cdn"
 SAAS_PREFERRED_DOMAINS="saas.sin.fan cdn.anycast.eu.org cdn-all.xn--b6gac.eu.org www.freedidi.com"
 
+ddns_rebuild_cron() {
+    local cron_tmp=$(mktemp)
+    crontab -l 2>/dev/null | grep -v "ddns-update.sh" > "$cron_tmp" || true
+    if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
+        local min=59
+        for conf in "$DDNS_CONFIG_DIR"/*.conf; do
+            [[ -f "$conf" ]] || continue
+            local iv=$(grep '^DDNS_INTERVAL=' "$conf" | cut -d'"' -f2)
+            [[ -n "$iv" && "$iv" =~ ^[0-9]+$ && "$iv" -ge 1 && "$iv" -le 59 && "$iv" -lt "$min" ]] && min=$iv
+        done
+        echo "*/$min * * * * /usr/local/bin/ddns-update.sh >/dev/null 2>&1" >> "$cron_tmp"
+    fi
+    crontab "$cron_tmp"; rm -f "$cron_tmp"
+}
+
 ddns_create_script() {
     mkdir -p "$DDNS_CONFIG_DIR"
         cat > /usr/local/bin/ddns-update.sh << 'EOF'
 #!/bin/bash
+if command -v flock >/dev/null 2>&1; then
+    exec 200>/var/lock/ddns-update.lock
+    flock -n 200 || exit 0
+else
+    mkdir /tmp/ddns-update.lock 2>/dev/null || exit 0
+    trap 'rmdir /tmp/ddns-update.lock 2>/dev/null' EXIT
+fi
 DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$DDNS_LOG"; }
@@ -116,7 +138,12 @@ update_cf() {
 }
 
 for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-    [[ -f "$conf" ]] || continue
+    [ -f "$conf" ] || continue
+    # 格式白名单校验
+    if grep -qvE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$conf"; then
+        log "格式异常，跳过: $conf"
+        continue
+    fi
     source "$conf"
     [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
@@ -134,9 +161,12 @@ ddns_setup() {
         return 0
     fi
     
-    read -e -r -p "检测间隔(分钟) [5]: " interval
+        read -e -r -p "检测间隔(分钟, 1-59) [5]: " interval
     interval=${interval:-5}
-    [[ ! "$interval" =~ ^[0-9]+$ || "$interval" -lt 1 ]] && interval=5
+    if [[ ! "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 || "$interval" -gt 59 ]]; then
+        print_warn "间隔必须为 1-59，使用默认值 5"
+        interval=5
+    fi
     
     mkdir -p "$DDNS_CONFIG_DIR"
     cat > "$DDNS_CONFIG_DIR/${domain}.conf" << EOF
@@ -152,17 +182,7 @@ EOF
     
     ddns_create_script
     
-    local min_interval=$interval
-    for conf in "$DDNS_CONFIG_DIR"/*.conf; do
-        [[ -f "$conf" ]] || continue
-        local conf_interval=$(grep '^DDNS_INTERVAL=' "$conf" | cut -d'"' -f2)
-        [[ -n "$conf_interval" && "$conf_interval" -lt "$min_interval" ]] 2>/dev/null && min_interval=$conf_interval
-    done
-    
-    local cron_tmp=$(mktemp)
-    crontab -l 2>/dev/null | grep -v "ddns-update.sh" > "$cron_tmp" || true
-    echo "*/$min_interval * * * * /usr/local/bin/ddns-update.sh >/dev/null 2>&1" >> "$cron_tmp"
-    crontab "$cron_tmp"; rm -f "$cron_tmp"
+    ddns_rebuild_cron
     
     print_success "DDNS 已启用 (每 ${interval} 分钟检测)"
     log_action "DDNS enabled: $domain interval=${interval}m"
@@ -177,6 +197,7 @@ ddns_list() {
     draw_line
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
+        validate_conf_file "$conf" || continue
         source "$conf"
         printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
             "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
@@ -198,6 +219,7 @@ ddns_delete() {
     local i=1 domains=() files=()
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
+        validate_conf_file "$conf" || continue
         source "$conf"; domains+=("$DDNS_DOMAIN"); files+=("$conf")
         echo "$i. $DDNS_DOMAIN"; ((i++))
     done
@@ -209,10 +231,12 @@ ddns_delete() {
     
     confirm "删除 ${domains[$((idx-1))]} 的 DDNS?" && {
         rm -f "${files[$((idx-1))]}"
-        [[ -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]] && {
+        if [[ -z "$(ls -A "$DDNS_CONFIG_DIR" 2>/dev/null)" ]]; then
             crontab -l 2>/dev/null | grep -v "ddns-update.sh" | crontab - 2>/dev/null || true
             rm -f /usr/local/bin/ddns-update.sh
-        }
+        else
+            ddns_rebuild_cron
+        fi
         print_success "已删除"; log_action "DDNS deleted: ${domains[$((idx-1))]}"
     }
     pause
@@ -305,7 +329,7 @@ get_ip_location() {
 show_dual_column_sysinfo() {
     load_cache || refresh_network_cache
 
-    local hostname=$(hostname)
+    local hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null || echo "unknown")
     local os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -c 35)
     local kernel=$(uname -r | head -c 20)
     local arch=$(uname -m)
@@ -316,7 +340,7 @@ show_dual_column_sysinfo() {
 
     local cpu_usage
     cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){u1=u;t1=t}else{if(t-t1>0)printf "%.0f%%",(u-u1)*100/(t-t1);else print "0%"}}' \
-        <(grep 'cpu ' /proc/stat) <(sleep 0.3; grep 'cpu ' /proc/stat) 2>/dev/null) || true
+    <(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat) 2>/dev/null) || true
     [[ -z "$cpu_usage" ]] && cpu_usage="0%"
     
     local load_avg=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg 2>/dev/null)
@@ -463,7 +487,15 @@ print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1"; }
 print_error() { echo -e "${C_RED}[✗]${C_RESET} $1"; }
 
 log_action() {
-    echo "{\"time\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"level\":\"${2:-INFO}\",\"msg\":\"$1\"}" >> "$LOG_FILE" 2>/dev/null || true
+    if command_exists jq; then
+        jq -n --arg t "$(date '+%Y-%m-%d %H:%M:%S')" \
+              --arg l "${2:-INFO}" \
+              --arg m "$1" \
+              '{time:$t,level:$l,msg:$m}' >> "$LOG_FILE" 2>/dev/null || true
+    else
+        local msg="${1//\"/\\\"}"
+        echo "{\"time\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"level\":\"${2:-INFO}\",\"msg\":\"$msg\"}" >> "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 
 pause() {
@@ -581,6 +613,17 @@ validate_domain() {
     [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
 }
 
+validate_conf_file() {
+    local conf="$1"
+    [[ -f "$conf" ]] || return 1
+    if grep -qvE '^[[:space:]]*($|#|[A-Za-z_][A-Za-z0-9_]*=)' "$conf"; then
+        print_error "配置文件格式异常，已跳过: $conf"
+        log_action "Rejected config file: $conf" "WARN"
+        return 1
+    fi
+    return 0
+}
+
 init_environment() {
     mkdir -p "$CACHE_DIR" "$(dirname "$LOG_FILE")"
 
@@ -591,12 +634,12 @@ init_environment() {
 
     refresh_ssh_port
 
-    if [[ "$PLATFORM" == "openwrt" ]]; then
+        if [[ "$PLATFORM" == "openwrt" ]]; then
         for p in curl jq openssl-util ca-bundle; do
-            command -v "${p%%-*}" &>/dev/null 2>&1 || {
+            if ! opkg list-installed 2>/dev/null | grep -q "^${p} "; then
                 opkg update >/dev/null 2>&1
                 opkg install "$p" >/dev/null 2>&1 || true
-            }
+            fi
         done
     else
         auto_deps
@@ -622,7 +665,7 @@ menu_update() {
     fi
     
     print_info "1/2 更新软件源..."
-    if apt-get update -y >/dev/null 2>&1; then
+    if apt-get update >/dev/null 2>&1; then
         print_success "软件源更新完成"
     else
         print_warn "软件源更新失败，但继续安装"
@@ -681,7 +724,7 @@ menu_update() {
 update_apt_cache() {
     if [[ $APT_UPDATED -eq 0 ]]; then
         print_info "更新软件源缓存..."
-        apt-get update -y >/dev/null 2>&1
+        apt-get update >/dev/null 2>&1
         APT_UPDATED=1
     fi
 }
@@ -1041,8 +1084,8 @@ f2b_setup() {
     echo "  最大重试:     $maxretry 次"
     echo "  检测窗口:     $findtime"
     echo "  封禁时间:     $bantime"
-    echo "  封禁方式:     ipset + iptables (高性能)"
-    [[ "$bantime" == "-1" ]] && echo -e "  ${C_YELLOW}提示: 永久封禁使用 ipset 存储，性能远优于 UFW，但建议定期检查规则数量${C_RESET}"
+    echo "  封禁方式:     自动检测 (iptables-ipset 或 nftables)"
+    [[ "$bantime" == "-1" ]] && echo -e "  ${C_YELLOW}提示: 永久封禁建议定期检查规则数量${C_RESET}"
     draw_line
     
     if ! confirm "确认应用此配置?"; then
@@ -1064,11 +1107,20 @@ f2b_setup() {
         fi
     fi
 
+        # 自动检测 nftables 环境，选择合适的 banaction
+    local banaction="iptables-ipset-proto6-allports"
+    if command_exists nft && nft list ruleset &>/dev/null 2>&1; then
+        if ! command_exists iptables || iptables -V 2>&1 | grep -qi "nf_tables"; then
+            banaction="nftables-allports"
+            print_info "检测到 nftables 环境，使用 nftables-allports"
+        fi
+    fi
+
     local conf_content="[DEFAULT]
 bantime = $bantime
 findtime = $findtime
-banaction = iptables-ipset-proto6-allports
-banaction_allports = iptables-ipset-proto6-allports
+banaction = $banaction
+banaction_allports = $banaction
 
 [sshd]
 enabled = true
@@ -1078,17 +1130,27 @@ backend = $backend
 logpath = %(sshd_log)s"
 
     write_file_atomic "$FAIL2BAN_JAIL_LOCAL" "$conf_content"
-    print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL"
+    print_success "配置已写入: $FAIL2BAN_JAIL_LOCAL (banaction=$banaction)"
     
+    # 配置预检
+    if command_exists fail2ban-client; then
+        if ! fail2ban-client -d >/dev/null 2>&1; then
+            print_error "Fail2ban 配置校验失败！请检查配置。"
+            echo "运行 fail2ban-client -d 查看详情"
+            pause; return
+        fi
+        print_success "配置校验通过"
+    fi
+
     if is_systemd; then
         systemctl enable fail2ban >/dev/null || true
         if systemctl restart fail2ban; then
-            print_success "Fail2ban 已启动 (使用 ipset 高性能封禁)。"
+            print_success "Fail2ban 已启动 (banaction=$banaction)。"
         else
             print_error "Fail2ban 启动失败！"
             echo "请检查日志: journalctl -u fail2ban -n 20"
         fi
-        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=ipset"
+        log_action "Fail2ban configured: port=$port, maxretry=$maxretry, bantime=$bantime, banaction=$banaction"
     fi
     pause
 }
@@ -1328,8 +1390,11 @@ ssh_change_port() {
     local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
     cp "$SSHD_CONFIG" "$backup_file"
     
+    # 先放行新端口（防止改完连不上）
+    local ufw_opened=0
     if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw allow "$port/tcp" comment "SSH-New" >/dev/null
+        ufw_opened=1
         print_success "UFW 已放行新端口 $port。"
     fi
 
@@ -1339,11 +1404,25 @@ ssh_change_port() {
         echo "Port ${port}" >> "$SSHD_CONFIG"
     fi
 
+    # 校验配置语法
+    if ! sshd -t 2>/dev/null; then
+        print_error "sshd 配置校验失败！已回滚。"
+        mv "$backup_file" "$SSHD_CONFIG"
+        [[ $ufw_opened -eq 1 ]] && ufw delete allow "$port/tcp" 2>/dev/null || true
+        pause; return
+    fi
+
     if is_systemd; then
         if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
             print_success "SSH 重启成功。请使用新端口 $port 连接。"
-            if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            if [[ $ufw_opened -eq 1 ]]; then
                 ufw delete allow "$CURRENT_SSH_PORT/tcp" 2>/dev/null || true
+            fi
+            # 同步更新 Fail2ban jail 端口
+            if [[ -f "$FAIL2BAN_JAIL_LOCAL" ]]; then
+                sed -i "s/^port = .*/port = $port/" "$FAIL2BAN_JAIL_LOCAL"
+                systemctl restart fail2ban 2>/dev/null || true
+                print_info "Fail2ban 已同步新端口 $port"
             fi
             CURRENT_SSH_PORT=$port
             log_action "SSH port changed to $port"
@@ -1351,6 +1430,7 @@ ssh_change_port() {
         else
             print_error "重启失败！已回滚配置。"
             mv "$backup_file" "$SSHD_CONFIG" 2>/dev/null || true
+            [[ $ufw_opened -eq 1 ]] && ufw delete allow "$port/tcp" 2>/dev/null || true
             systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
         fi
     fi
@@ -1686,20 +1766,30 @@ net_dns() {
         fi
     done
     
-    if is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        if [[ "$PLATFORM" == "openwrt" ]]; then
+        # OpenWrt 使用 uci 修改，防止重启后被覆盖
+        uci delete network.wan.dns 2>/dev/null || true
+        for ip in $dns; do
+            uci add_list network.wan.dns="$ip"
+        done
+        uci set network.wan.peerdns='0'
+        uci commit network
+        /etc/init.d/network reload 2>/dev/null || true
+        print_success "DNS 已通过 uci 修改 (持久化)。"
+    elif is_systemd && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         local res_conf="/etc/systemd/resolved.conf"
         grep -q '^\[Resolve\]' "$res_conf" || echo -e "\n[Resolve]" >> "$res_conf"
         sed -i '/^DNS=/d' "$res_conf"
         sed -i '/^\[Resolve\]/a DNS='"$dns" "$res_conf"
         systemctl restart systemd-resolved
+        print_success "DNS 已修改。"
     else
         > /etc/resolv.conf
         for ip in $dns; do
             echo "nameserver $ip" >> /etc/resolv.conf
         done
+        print_success "DNS 已修改。"
     fi
-    
-    print_success "DNS 已修改。"
     log_action "DNS changed to: $dns"
     pause
 }
@@ -1740,11 +1830,11 @@ menu_net() {
 
 web_env_check() {
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        for pkg in jq curl openssl-util ca-bundle; do
-            command -v "${pkg%%-*}" &>/dev/null || {
+                for pkg in jq curl openssl-util ca-bundle; do
+            if ! opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
                 opkg update >/dev/null 2>&1
                 opkg install "$pkg" >/dev/null 2>&1 || true
-            }
+            fi
         done
         if ! command_exists certbot; then
             print_warn "OpenWrt 上 certbot 可能不可用。"
@@ -2500,6 +2590,7 @@ web_cf_saas_status() {
     for conf in "$SAAS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         local SAAS_STATUS="" BIZ_DOMAIN="" PREFERRED_DOMAIN="" ORIGIN_DOMAIN="" CREATED=""
+        validate_conf_file "$conf" || continue
         source "$conf"
         local status_display="${C_GREEN}${SAAS_STATUS}${C_RESET}"
         [[ "$SAAS_STATUS" == "pending" ]] && status_display="${C_YELLOW}${SAAS_STATUS}${C_RESET}"
@@ -2522,6 +2613,7 @@ web_cf_saas_delete() {
     for conf in "$SAAS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         local BIZ_DOMAIN=""
+        validate_conf_file "$conf" || continue
         source "$conf"
         domains+=("$BIZ_DOMAIN")
         files+=("$conf")
@@ -2896,6 +2988,12 @@ web_delete_domain() {
         rm -f "$hook_script"
         print_success "Hook 脚本已删除。"
     fi
+    # 清理 Cloudflare 凭据文件
+    local cf_cred="/root/.cloudflare-${target_domain}.ini"
+    if [[ -f "$cf_cred" ]]; then
+        rm -f "$cf_cred"
+        print_success "Cloudflare 凭据文件已清理。"
+    fi
     shopt -s nullglob
     local remaining_hooks=("${CERT_HOOKS_DIR}"/*.sh /root/cert-renew-hook-*.sh)
     shopt -u nullglob
@@ -3067,7 +3165,7 @@ server {
             write_file_atomic "$NGINX_CONF_PATH" "$nginx_conf"
             ln -sf "$NGINX_CONF_PATH" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
             
-            if nginx -t 2>&1 | grep -q "successful"; then
+            if nginx -t >/dev/null 2>&1; then
                 if is_systemd; then
                     systemctl reload nginx || systemctl restart nginx
                 else
@@ -3076,6 +3174,7 @@ server {
                 print_success "Nginx 配置已生效。"
             else
                 print_error "Nginx 配置测试失败！"
+                nginx -t 2>&1 | tail -5
                 rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
                 rm -f "$NGINX_CONF_PATH"
                 pause; return
@@ -3269,14 +3368,27 @@ menu_web() {
             8)
                 print_title "手动续签证书"
                 command_exists certbot || { print_error "Certbot 未安装"; pause; continue; }
+                echo "1. 常规续签 (仅续签即将过期的证书)"
+                echo "2. 强制续签 (忽略过期时间，可能触发 Let's Encrypt 频率限制)"
+                read -e -r -p "选择 [1]: " renew_mode
+                renew_mode=${renew_mode:-1}
                 print_info "正在续签..."
-                certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log
+                if [[ "$renew_mode" == "2" ]]; then
+                    print_warn "强制续签: Let's Encrypt 限制每周 5 次相同证书"
+                    if confirm "确认强制续签?"; then
+                        certbot renew --force-renewal 2>&1 | tee /tmp/certbot-renew.log
+                    else
+                        pause; continue
+                    fi
+                else
+                    certbot renew 2>&1 | tee /tmp/certbot-renew.log
+                fi
                 shopt -s nullglob
                 for hook in "${CERT_HOOKS_DIR}"/*.sh /root/cert-renew-hook-*.sh; do
                     [[ -x "$hook" ]] && bash "$hook"
                 done
                 shopt -u nullglob
-                log_action "Manual cert renewal"
+                log_action "Manual cert renewal (mode=$renew_mode)"
                 pause
                 ;;
             9)
