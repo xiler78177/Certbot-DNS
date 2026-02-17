@@ -1952,13 +1952,44 @@ _install_certbot_dns_cf_apt() {
 }
 
 _install_certbot_dns_cf_snap() {
-    install_package "snapd" "silent" || return 1
-    if ! snap list certbot &>/dev/null; then
-        snap install --classic certbot >/dev/null 2>&1 || return 1
-        ln -sf /snap/bin/certbot /usr/bin/certbot
+    if ! command_exists snap; then
+        install_package "snapd" "silent" || { print_error "snapd 安装失败"; return 1; }
+        if is_systemd; then
+            systemctl enable --now snapd.socket >/dev/null 2>&1 || true
+            print_info "等待 snapd 初始化 (低配机器可能需要几分钟)..."
+            local wait=0
+            while [[ $wait -lt 120 ]]; do
+                snap version &>/dev/null && break
+                echo -ne "\r  已等待 ${wait}s..."
+                sleep 3; wait=$((wait + 3))
+            done
+            echo ""
+            if ! snap version &>/dev/null; then
+                print_error "snapd 未就绪 (等待 ${wait}s 超时)"
+                return 1
+            fi
+        fi
     fi
-    snap install certbot-dns-cloudflare >/dev/null 2>&1 || return 1
+
+    snap install core 2>/dev/null || true
+    snap refresh core 2>/dev/null || true
+
+    print_info "snap 安装 certbot (可能需要几分钟，请耐心等待)..."
+    if ! snap install --classic certbot 2>&1; then
+        print_error "snap install certbot 失败"
+        return 1
+    fi
+    ln -sf /snap/bin/certbot /usr/bin/certbot
+
+    print_info "snap 安装 certbot-dns-cloudflare..."
+    if ! snap install certbot-dns-cloudflare 2>&1; then
+        print_error "snap install certbot-dns-cloudflare 失败"
+        return 1
+    fi
     snap connect certbot:plugin certbot-dns-cloudflare >/dev/null 2>&1 || true
+
+    print_success "snap 安装完成"
+    return 0
 }
 
 _install_certbot_dns_cf() {
