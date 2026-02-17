@@ -1,6 +1,6 @@
 #!/bin/bash
 
-readonly VERSION="v13.58"
+readonly VERSION="v14.0"
 readonly SCRIPT_NAME="server-manage"
 readonly LOG_FILE="/var/log/${SCRIPT_NAME}.log"
 readonly CONFIG_FILE="/etc/${SCRIPT_NAME}.conf"
@@ -9,6 +9,8 @@ readonly CACHE_FILE="${CACHE_DIR}/sysinfo.cache"
 readonly CACHE_TTL=300 
 readonly CERT_HOOKS_DIR="/root/cert-hooks"
 readonly WG_DEFAULT_PORT=50000
+readonly BACKUP_LOCAL_DIR="/root/${SCRIPT_NAME}-backups"
+readonly BACKUP_CONFIG_FILE="/etc/${SCRIPT_NAME}-backup.conf"
 PLATFORM="debian"
 
 detect_platform() {
@@ -73,9 +75,30 @@ DDNS_CONFIG_DIR="/etc/ddns"
 DDNS_LOG="/var/log/ddns.log"
 SAAS_CONFIG_DIR="/etc/saas-cdn"
 SAAS_PREFERRED_DOMAINS="saas.sin.fan cdn.anycast.eu.org cdn-all.xn--b6gac.eu.org www.freedidi.com"
+# BACKUP_CONFIG_FILE 和 BACKUP_LOCAL_DIR 已在文件头 readonly 定义
+
+# 统一公网 IP 获取函数（使用国内可达的 API）
+get_public_ipv4() {
+    local ip=""
+    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://4.ipw.cn 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://myip.ipip.net/ip 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://ip.3322.net 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    ip=$(curl -4 -s --connect-timeout 3 --max-time 5 https://ifconfig.me 2>/dev/null) && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+    return 1
+}
+
+get_public_ipv6() {
+    local ip=""
+    ip=$(curl -6 -s --connect-timeout 3 --max-time 5 https://6.ipw.cn 2>/dev/null) && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]] && { echo "$ip"; return 0; }
+    ip=$(curl -6 -s --connect-timeout 3 --max-time 5 https://v6.ident.me 2>/dev/null) && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]] && { echo "$ip"; return 0; }
+    ip=$(curl -6 -s --connect-timeout 3 --max-time 5 https://ifconfig.me 2>/dev/null) && [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]] && { echo "$ip"; return 0; }
+    return 1
+}
 
 ddns_rebuild_cron() {
     local cron_tmp=$(mktemp)
+    # 保护临时文件：中断时自动清理
+    trap "rm -f '$cron_tmp'" RETURN
     crontab -l 2>/dev/null | grep -v "ddns-update.sh" > "$cron_tmp" || true
     if [[ -d "$DDNS_CONFIG_DIR" ]] && ls "$DDNS_CONFIG_DIR"/*.conf &>/dev/null 2>&1; then
         local min=59
@@ -87,6 +110,7 @@ ddns_rebuild_cron() {
         echo "*/$min * * * * /usr/local/bin/ddns-update.sh >/dev/null 2>&1" >> "$cron_tmp"
     fi
     crontab "$cron_tmp"; rm -f "$cron_tmp"
+    trap - RETURN
 }
 
 ddns_create_script() {
@@ -109,12 +133,12 @@ get_ip() {
     if [[ "$1" == "4" ]]; then
         raw=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || \
               curl -4 -s --max-time 5 https://myip.ipip.net/ip 2>/dev/null || \
-              curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || \
+              curl -4 -s --max-time 5 https://ip.3322.net 2>/dev/null || \
               curl -4 -s --max-time 5 https://ifconfig.me 2>/dev/null)
         [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo "$raw" || return 1
     else
         raw=$(curl -6 -s --max-time 5 https://6.ipw.cn 2>/dev/null || \
-              curl -6 -s --max-time 5 https://api64.ipify.org 2>/dev/null || \
+              curl -6 -s --max-time 5 https://v6.ident.me 2>/dev/null || \
               curl -6 -s --max-time 5 https://ifconfig.me 2>/dev/null)
         [[ "$raw" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$raw" == *:* ]] && echo "$raw" || return 1
     fi
@@ -144,6 +168,8 @@ for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         log "格式异常，跳过: $conf"
         continue
     fi
+    # 清空变量防止跨文件残留
+    DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
     source "$conf"
     [[ "$DDNS_IPV4" == "true" ]] && { ip=$(get_ip 4); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" A "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
     [[ "$DDNS_IPV6" == "true" ]] && { ip=$(get_ip 6); [[ -n "$ip" ]] && update_cf "$DDNS_DOMAIN" AAAA "$ip" "$DDNS_TOKEN" "$DDNS_ZONE_ID" "$DDNS_PROXIED"; }
@@ -198,6 +224,8 @@ ddns_list() {
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         validate_conf_file "$conf" || continue
+        # 清空变量防止跨文件残留
+        DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
         source "$conf"
         printf "%-30s %-6s %-6s %-8s %s\n" "$DDNS_DOMAIN" \
             "$([[ "$DDNS_IPV4" == "true" ]] && echo "✓" || echo "-")" \
@@ -207,8 +235,8 @@ ddns_list() {
     done
     
     echo ""
-    local ip4=$(curl -4 -s --max-time 3 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 3 https://ifconfig.me 2>/dev/null)
-    local ip6=$(curl -6 -s --max-time 3 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 3 https://ifconfig.me 2>/dev/null)
+    local ip4=$(get_public_ipv4)
+    local ip6=$(get_public_ipv6)
     echo -e "${C_CYAN}当前IP:${C_RESET} IPv4=${ip4:-N/A} IPv6=${ip6:-N/A}"
     pause
 }
@@ -220,6 +248,7 @@ ddns_delete() {
     for conf in "$DDNS_CONFIG_DIR"/*.conf; do
         [[ -f "$conf" ]] || continue
         validate_conf_file "$conf" || continue
+        DDNS_DOMAIN="" DDNS_TOKEN="" DDNS_ZONE_ID="" DDNS_IPV4="" DDNS_IPV6="" DDNS_PROXIED="" DDNS_INTERVAL=""
         source "$conf"; domains+=("$DDNS_DOMAIN"); files+=("$conf")
         echo "$i. $DDNS_DOMAIN"; ((i++))
     done
@@ -260,21 +289,22 @@ load_cache() {
         file_mtime=$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
         local cache_age=$(($(date +%s) - file_mtime))
         if [[ $cache_age -lt $CACHE_TTL ]]; then
-            source "$CACHE_FILE" 2>/dev/null || return 1
-            return 0
+            # 安全检查：仅允许合法的变量赋值格式
+            if validate_conf_file "$CACHE_FILE" 2>/dev/null; then
+                source "$CACHE_FILE" 2>/dev/null || return 1
+                return 0
+            fi
+            return 1
         fi
     fi
     return 1
 }
 
 refresh_network_cache() {
-    CACHED_IPV4=$(curl -4 -s --connect-timeout 3 --max-time 5 https://4.ipw.cn 2>/dev/null || \
-              curl -4 -s --connect-timeout 3 --max-time 5 https://myip.ipip.net/ip 2>/dev/null || \
-              curl -4 -s --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+    CACHED_IPV4=$(get_public_ipv4 || echo "N/A")
 
-    CACHED_IPV6=$(curl -6 -s --connect-timeout 3 --max-time 5 https://6.ipw.cn 2>/dev/null || \
-              curl -6 -s --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null)
-    [[ -z "$CACHED_IPV6" || ! "$CACHED_IPV6" =~ : ]] && CACHED_IPV6="未配置"
+    CACHED_IPV6=$(get_public_ipv6 || echo "")
+    [[ -z "$CACHED_IPV6" ]] && CACHED_IPV6="未配置"
     
     local ipinfo=$(curl -s --connect-timeout 3 --max-time 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
     CACHED_ISP=$(echo "$ipinfo" | grep -o '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
@@ -339,9 +369,8 @@ show_dual_column_sysinfo() {
     local cpu_freq=$(awk '/MHz/ {printf "%.1fGHz", $4/1000; exit}' /proc/cpuinfo 2>/dev/null || echo "N/A")
 
     local cpu_usage
-    cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){u1=u;t1=t}else{if(t-t1>0)printf "%.0f%%",(u-u1)*100/(t-t1);else print "0%"}}' \
-    <(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat) 2>/dev/null) || true
-    [[ -z "$cpu_usage" ]] && cpu_usage="0%"
+    cpu_usage=$(top -bn1 2>/dev/null | awk '/^%?Cpu/{gsub(/[^0-9.]/," ",$0); split($0,a); printf "%.0f%%", 100-a[4]}' 2>/dev/null) || true
+    [[ -z "$cpu_usage" || "$cpu_usage" == "%" ]] && cpu_usage="0%"
     
     local load_avg=$(awk '{printf "%.2f %.2f %.2f", $1, $2, $3}' /proc/loadavg 2>/dev/null)
 
@@ -435,25 +464,35 @@ show_dual_column_sysinfo() {
     printf " 服务: UFW[${C_GREEN}%s${C_RESET}] F2B[${C_GREEN}%s${C_RESET}] Nginx[${C_GREEN}%s${C_RESET}] Docker[${C_GREEN}%s${C_RESET}] WG[${C_GREEN}%s${C_RESET}]\n" \
         "$ufw_st" "$f2b_st" "$nginx_st" "$docker_st" "$wg_st"
 
-    local last_login="无记录"
+    # 展示最近 3 条登录记录
+    local login_count=0
     if command -v last >/dev/null 2>&1; then
-        local login_line=$(last -n 10 -a -w 2>/dev/null | grep -E "^[a-zA-Z]" | grep -v -E "wtmp begins|^reboot" | head -1)
-        if [[ -n "$login_line" ]]; then
-            local login_user=$(echo "$login_line" | awk '{print $1}')
-            local login_ip=$(echo "$login_line" | awk '{print $NF}')
-            local login_time=$(echo "$login_line" | awk '{print $4, $5, $6}')
-            
-            if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
-                local ip_loc=$(get_ip_location "$login_ip")
-                last_login="${login_user}@${login_ip} (${ip_loc}) ${login_time}"
-            else
-                last_login="${login_user} ${login_time}"
-            fi
+        local login_lines
+        login_lines=$(last -n 20 -a -w 2>/dev/null | grep -E "^[a-zA-Z]" | grep -v -E "wtmp begins|^reboot" | head -3)
+        if [[ -n "$login_lines" ]]; then
+            printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+            while IFS= read -r login_line; do
+                [[ -z "$login_line" ]] && continue
+                login_count=$((login_count + 1))
+                local login_user=$(echo "$login_line" | awk '{print $1}')
+                local login_ip=$(echo "$login_line" | awk '{print $NF}')
+                local login_time=$(echo "$login_line" | awk '{print $4, $5, $6}')
+                local login_display=""
+                
+                if [[ -n "$login_ip" && "$login_ip" =~ ^[0-9a-f.:]+$ ]]; then
+                    local ip_loc=$(get_ip_location "$login_ip")
+                    login_display="${login_user}@${login_ip} (${ip_loc}) ${login_time}"
+                else
+                    login_display="${login_user} ${login_time}"
+                fi
+                printf " ${C_CYAN}%-8s${C_RESET}%s\n" "登录${login_count}:" "${login_display:0:65}"
+            done <<< "$login_lines"
         fi
     fi
-    
-    printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
-    printf " ${C_CYAN}%-8s${C_RESET}%s\n" "登录:" "${last_login:0:65}"
+    if [[ "$login_count" -eq 0 ]]; then
+        printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+        printf " ${C_CYAN}%-8s${C_RESET}%s\n" "登录:" "无记录"
+    fi
 }
 fix_terminal() {
     [[ -t 0 ]] || return 0
@@ -487,13 +526,23 @@ print_warn() { echo -e "${C_YELLOW}[!]${C_RESET} $1"; }
 print_error() { echo -e "${C_RED}[✗]${C_RESET} $1"; }
 
 log_action() {
+    # 日志轮转: 超过 5MB 自动归档
+    if [[ -f "$LOG_FILE" ]]; then
+        local log_size
+        log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+        if [[ "$log_size" -gt 5242880 ]]; then
+            mv "$LOG_FILE" "${LOG_FILE}.1"
+            : > "$LOG_FILE"
+            chmod 600 "$LOG_FILE"
+        fi
+    fi
     if command_exists jq; then
         jq -n --arg t "$(date '+%Y-%m-%d %H:%M:%S')" \
               --arg l "${2:-INFO}" \
               --arg m "$1" \
               '{time:$t,level:$l,msg:$m}' >> "$LOG_FILE" 2>/dev/null || true
     else
-        local msg="${1//\"/\\\"}"
+        local msg="${1//\"/\\\"\"}" 
         echo "{\"time\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"level\":\"${2:-INFO}\",\"msg\":\"$msg\"}" >> "$LOG_FILE" 2>/dev/null || true
     fi
 }
@@ -508,19 +557,21 @@ pause() {
 write_file_atomic() {
     local filepath="$1" content="$2" tmpfile
     mkdir -p "$(dirname "$filepath")"
-    tmpfile=$(mktemp "$(dirname "$filepath")/.tmp.XXXXXX")
-    trap "rm -f '$tmpfile'" RETURN
+    tmpfile=$(mktemp "$(dirname "$filepath")/.tmp.server-manage.XXXXXX")
     printf "%s\n" "$content" > "$tmpfile"
     if [[ -f "$filepath" ]]; then
         chmod --reference="$filepath" "$tmpfile" 2>/dev/null || true
         chown --reference="$filepath" "$tmpfile" 2>/dev/null || true
     fi
-    mv "$tmpfile" "$filepath"
-    trap - RETURN
+    if ! mv "$tmpfile" "$filepath"; then
+        rm -f "$tmpfile"
+        return 1
+    fi
 }
 
 handle_interrupt() {
-    rm -f /etc/.tmp.* 2>/dev/null
+    # 仅清理本脚本创建的临时文件，避免误删其他服务的文件
+    rm -f /etc/.tmp.server-manage.* 2>/dev/null
     echo ""
     print_warn "操作已取消 (用户中断)。"
     exit 130
@@ -610,6 +661,8 @@ validate_ip() {
 
 validate_domain() {
     local domain=$1
+    # 域名至少需要包含一个点号
+    [[ "$domain" == *"."* ]] || return 1
     [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
 }
 
@@ -1387,6 +1440,15 @@ ssh_change_port() {
         pause; return
     fi
 
+    # 检查端口是否已被其他服务占用
+    if command_exists ss && ss -tlpn 2>/dev/null | grep -q ":${port} "; then
+        local occupier=$(ss -tlpn 2>/dev/null | grep ":${port} " | awk '{print $NF}' | head -1)
+        print_error "端口 $port 已被占用: $occupier"
+        if ! confirm "是否强制继续修改？(可能导致冲突)"; then
+            pause; return
+        fi
+    fi
+
     local backup_file="${SSHD_CONFIG}.bak.$(date +%s)"
     cp "$SSHD_CONFIG" "$backup_file"
     
@@ -1494,7 +1556,13 @@ opt_swap() {
         swapoff -a 2>/dev/null || true
         rm -f /swapfile
         
-        if ! fallocate -l "${s}M" /swapfile 2>/dev/null; then
+        # 检测文件系统类型，btrfs 不支持 fallocate 创建 swap
+        local fs_type=$(df -T / 2>/dev/null | awk 'NR==2{print $2}')
+        if [[ "$fs_type" == "btrfs" ]]; then
+            truncate -s 0 /swapfile
+            chattr +C /swapfile 2>/dev/null || true
+            dd if=/dev/zero of=/swapfile bs=1M count="$s" status=progress
+        elif ! fallocate -l "${s}M" /swapfile 2>/dev/null; then
             dd if=/dev/zero of=/swapfile bs=1M count="$s" status=progress
         fi
         
@@ -1696,9 +1764,9 @@ net_iperf3() {
         fi
     fi
     
-    local ip4=$(curl -4 -s -L --connect-timeout 5 --max-time 10 https://4.ipw.cn 2>/dev/null || curl -4 -s -L --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null)
-    local ip6=$(curl -6 -s --connect-timeout 5 --max-time 10 https://6.ipw.cn 2>/dev/null || curl -6 -s --connect-timeout 5 --max-time 10 https://api64.ipify.org 2>/dev/null)
-    [[ -z "$ip6" || ! "$ip6" =~ : ]] && ip6="未检测到"
+    local ip4=$(get_public_ipv4)
+    local ip6=$(get_public_ipv6 || echo "")
+    [[ -z "$ip6" ]] && ip6="未检测到"
     
     echo -e "\n${C_BLUE}=== 客户端测速命令 ===${C_RESET}"
     [[ -n "$ip4" ]] && echo -e "IPv4 Upload: ${C_YELLOW}iperf3 -c $ip4 -p $port${C_RESET}"
@@ -2153,6 +2221,8 @@ web_env_check() {
 # ============================================================
 
 _cf_api() {
+    # 基础速率保护：防止触发 CF API 1200 req/5min 限制
+    sleep 0.3
     local method=$1 endpoint=$2 token=$3; shift 3
     curl -s -X "$method" "https://api.cloudflare.com/client/v4${endpoint}" \
         -H "Authorization: Bearer $token" \
@@ -2296,7 +2366,7 @@ web_cf_saas_setup() {
 
     echo ""
     print_guide "源服务器 IP (回源域名将指向此 IP)"
-    local default_ip=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null)
+    local default_ip=$(get_public_ipv4)
     [[ -n "$default_ip" ]] && echo -e "  ${C_GRAY}检测到本机 IP: ${default_ip}${C_RESET}"
     read -e -r -p "服务器 IP [${default_ip:-}]: " server_ip
     server_ip=${server_ip:-$default_ip}
@@ -3540,8 +3610,8 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
             
             if [[ -n "$zone_id" ]]; then
                 local ddns_ipv4="false" ddns_ipv6="false"
-                [[ -n "$(curl -4 -s --max-time 3 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 3 https://ifconfig.me 2>/dev/null)" ]] && ddns_ipv4="true"
-                [[ -n "$(curl -6 -s --max-time 3 https://6.ipw.cn 2>/dev/null || curl -6 -s --max-time 3 https://ifconfig.me 2>/dev/null)" ]] && ddns_ipv6="true"
+                [[ -n "$(get_public_ipv4)" ]] && ddns_ipv4="true"
+                [[ -n "$(get_public_ipv6)" ]] && ddns_ipv6="true"
                 ddns_setup "$DOMAIN" "$CF_API_TOKEN" "$zone_id" "$ddns_ipv4" "$ddns_ipv6" "false"
             fi
         fi
@@ -3582,6 +3652,301 @@ LOCAL_PROXY_PASS=\"$LOCAL_PROXY_PASS\"
     pause
 }
 
+# ============================================================
+# Nginx 反代网站模块 (Emby/Jellyfin/通用)
+# ============================================================
+web_reverse_proxy_site() {
+    print_title "添加反向代理网站"
+    
+    # 检查 Nginx 是否可用
+    if ! command_exists nginx; then
+        print_error "Nginx 未安装。请先使用菜单 1 添加域名以自动安装依赖。"
+        pause; return
+    fi
+    
+    echo -e "${C_CYAN}选择反代模板:${C_RESET}"
+    echo ""
+    echo "  1. Emby / Jellyfin (流媒体优化: 大缓冲区/WebSocket/超长超时)"
+    echo "  2. 通用反代 (适用于大多数 Web 服务)"
+    echo ""
+    echo "  0. 返回"
+    echo ""
+    read -e -r -p "选择模板: " tpl_choice
+    [[ "$tpl_choice" == "0" || -z "$tpl_choice" ]] && return
+    
+    local template_name=""
+    case $tpl_choice in
+        1) template_name="emby" ;;
+        2) template_name="generic" ;;
+        *) print_error "无效选项"; pause; return ;;
+    esac
+    
+    # 域名输入
+    local DOMAIN=""
+    while [[ -z "$DOMAIN" ]]; do
+        read -e -r -p "请输入域名 (如 emby.example.com): " DOMAIN
+        if ! validate_domain "$DOMAIN"; then
+            print_error "域名格式无效。"
+            DOMAIN=""
+        fi
+    done
+    
+    # 检查 Nginx 配置是否已存在
+    if [[ -f "/etc/nginx/sites-available/${DOMAIN}.conf" ]]; then
+        print_warn "该域名的 Nginx 配置已存在: /etc/nginx/sites-available/${DOMAIN}.conf"
+        if ! confirm "是否覆盖?"; then
+            pause; return
+        fi
+    fi
+    
+    # 证书路径
+    local cert_dir="${CERT_PATH_PREFIX}/${DOMAIN}"
+    local has_cert=0
+    
+    if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/privkey.pem" ]]; then
+        print_success "检测到已有证书: ${cert_dir}"
+        has_cert=1
+    else
+        # 尝试查找通配符证书或主域证书
+        local parent_domain=$(echo "$DOMAIN" | sed 's/^[^.]*\.//')
+        if [[ -f "${CERT_PATH_PREFIX}/${parent_domain}/fullchain.pem" ]]; then
+            cert_dir="${CERT_PATH_PREFIX}/${parent_domain}"
+            print_success "使用主域证书: ${cert_dir}"
+            has_cert=1
+        fi
+    fi
+    
+    if [[ $has_cert -eq 0 ]]; then
+        print_warn "未找到证书。"
+        echo "  1. 使用菜单 [1.添加域名] 先申请证书再回来配置反代"
+        echo "  2. 手动指定证书路径"
+        echo ""
+        read -e -r -p "选择: " cert_opt
+        case $cert_opt in
+            1) pause; return ;;
+            2)
+                read -e -r -p "证书公钥路径 (fullchain.pem): " custom_cert
+                read -e -r -p "证书私钥路径 (privkey.pem): " custom_key
+                if [[ ! -f "$custom_cert" || ! -f "$custom_key" ]]; then
+                    print_error "证书文件不存在"; pause; return
+                fi
+                mkdir -p "$cert_dir"
+                cp -L "$custom_cert" "$cert_dir/fullchain.pem"
+                cp -L "$custom_key" "$cert_dir/privkey.pem"
+                chmod 644 "$cert_dir/fullchain.pem"
+                chmod 600 "$cert_dir/privkey.pem"
+                has_cert=1
+                ;;
+            *) pause; return ;;
+        esac
+    fi
+    
+    # 后端地址
+    local BACKEND_URL=""
+    print_guide "输入后端服务地址 (例如 127.0.0.1:8096, 或完整URL http://127.0.0.1:8096)"
+    while [[ -z "$BACKEND_URL" ]]; do
+        read -e -r -p "后端地址: " inp
+        # 纯端口号自动补全
+        [[ "$inp" =~ ^[0-9]+$ ]] && inp="127.0.0.1:$inp"
+        # 没有协议头的自动补 http
+        if [[ "$inp" =~ ^(http|https):// ]]; then
+            BACKEND_URL="$inp"
+        elif [[ "$inp" =~ ^(\[.*\]|[a-zA-Z0-9.-]+):[0-9]+$ ]]; then
+            BACKEND_URL="http://${inp}"
+        else
+            print_warn "格式错误，请输入 IP:端口 或完整URL"
+        fi
+    done
+    
+    # 端口配置
+    local HTTP_PORT HTTPS_PORT
+    read -e -r -p "HTTP 端口 [80]: " hp
+    HTTP_PORT=${hp:-80}
+    validate_port "$HTTP_PORT" || { print_error "端口无效"; pause; return; }
+    
+    read -e -r -p "HTTPS 端口 [443]: " sp
+    HTTPS_PORT=${sp:-443}
+    validate_port "$HTTPS_PORT" || { print_error "端口无效"; pause; return; }
+    
+    # 生成 SSL 参数文件（如果不存在）
+    if [[ ! -f /etc/nginx/snippets/ssl-params.conf ]]; then
+        local ssl_params="ssl_session_timeout 1d;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+ssl_prefer_server_ciphers off;
+add_header Strict-Transport-Security \"max-age=15768000\" always;"
+        write_file_atomic "/etc/nginx/snippets/ssl-params.conf" "$ssl_params"
+    fi
+    
+    local redir_port=""
+    [[ "$HTTPS_PORT" != "443" ]] && redir_port=":${HTTPS_PORT}"
+    
+    # 根据模板生成 Nginx 配置
+    local nginx_conf=""
+    
+    if [[ "$template_name" == "emby" ]]; then
+        nginx_conf="# Emby/Jellyfin 流媒体反代配置
+# Generated by $SCRIPT_NAME $VERSION
+# 模板: Emby/Jellyfin 流媒体优化
+
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+
+server {
+    listen $HTTPS_PORT ssl http2;
+    listen [::]:$HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+
+    # 流媒体优化参数
+    client_max_body_size 128M;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+    send_timeout 86400s;
+
+    # 主页面和 API
+    location / {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Protocol \$scheme;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        
+        # WebSocket 支持 (Emby/Jellyfin 远程控制)
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        
+        # 流媒体缓冲优化
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+
+    # WebSocket 端点
+    location /embywebsocket {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
+    # Jellyfin WebSocket 端点
+    location /socket {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}"
+    else
+        # 通用反代模板
+        nginx_conf="# 通用反向代理配置
+# Generated by $SCRIPT_NAME $VERSION
+# 模板: 通用
+
+server {
+    listen $HTTP_PORT;
+    listen [::]:$HTTP_PORT;
+    server_name $DOMAIN;
+    return 301 https://\$host${redir_port}\$request_uri;
+}
+
+server {
+    listen $HTTPS_PORT ssl http2;
+    listen [::]:$HTTPS_PORT ssl http2;
+    server_name $DOMAIN;
+
+    ssl_certificate ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+    ssl_trusted_certificate ${cert_dir}/fullchain.pem;
+    include snippets/ssl-params.conf;
+
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass $BACKEND_URL;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \"upgrade\";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+    }
+}"
+    fi
+    
+    local NGINX_CONF_PATH="/etc/nginx/sites-available/${DOMAIN}.conf"
+    write_file_atomic "$NGINX_CONF_PATH" "$nginx_conf"
+    ln -sf "$NGINX_CONF_PATH" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
+    
+    # 测试并加载配置
+    if nginx -t >/dev/null 2>&1; then
+        if is_systemd; then
+            systemctl reload nginx || systemctl restart nginx
+        else
+            nginx -s reload 2>/dev/null || service nginx reload
+        fi
+        print_success "Nginx 反代配置已生效。"
+    else
+        print_error "Nginx 配置测试失败！"
+        nginx -t 2>&1 | tail -5
+        rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
+        rm -f "$NGINX_CONF_PATH"
+        pause; return
+    fi
+    
+    # 防火墙规则
+    if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$HTTP_PORT/tcp" comment "ReverseProxy-HTTP" >/dev/null 2>&1 || true
+        ufw allow "$HTTPS_PORT/tcp" comment "ReverseProxy-HTTPS" >/dev/null 2>&1 || true
+        print_success "防火墙规则已更新。"
+    fi
+    
+    echo ""
+    draw_line
+    print_success "反向代理配置完成！"
+    draw_line
+    echo -e "${C_CYAN}[访问地址]${C_RESET}"
+    echo "  https://${DOMAIN}${redir_port}"
+    echo -e "\n${C_CYAN}[反代后端]${C_RESET}"
+    echo "  $BACKEND_URL"
+    echo -e "\n${C_CYAN}[模板]${C_RESET}"
+    echo "  $( [[ "$template_name" == "emby" ]] && echo "Emby/Jellyfin 流媒体优化" || echo "通用")"
+    echo -e "\n${C_CYAN}[配置文件]${C_RESET}"
+    echo "  $NGINX_CONF_PATH"
+    draw_line
+    
+    log_action "Reverse proxy configured: $DOMAIN -> $BACKEND_URL (template=$template_name)"
+    
+    pause
+}
+
 menu_web() {
     fix_terminal
     while true; do
@@ -3605,6 +3970,10 @@ menu_web() {
         echo "6. 删除 DDNS 配置"
         echo "7. 立即更新 DDNS"
         echo ""
+        echo -e "${C_CYAN}--- 证书维护 ---${C_RESET}"
+        echo "8. 手动续签所有证书"
+        echo "9. 查看日志 (证书/DDNS)"
+        echo ""
         echo -e "${C_CYAN}--- SaaS 优选加速 ---${C_RESET}"
         echo "10. 配置 SaaS 优选加速 (CF CDN 优选)"
         echo "11. 查看 SaaS 优选配置"
@@ -3615,9 +3984,8 @@ menu_web() {
         echo "14. 查看回源规则"
         echo "15. 删除回源规则"
         echo ""
-        echo -e "${C_CYAN}--- 证书维护 ---${C_RESET}"
-        echo "8. 手动续签所有证书"
-        echo "9. 查看日志 (证书/DDNS)"
+        echo -e "${C_CYAN}--- 反向代理 ---${C_RESET}"
+        echo "16. 添加反代网站 (Emby/Jellyfin/通用)"
         echo ""
         echo "0. 返回主菜单"
         echo ""
@@ -3672,6 +4040,7 @@ menu_web() {
             13) web_cf_origin_rule_create ;;
             14) web_cf_origin_rule_list ;;
             15) web_cf_origin_rule_delete ;;
+            16) web_reverse_proxy_site ;;
             0|q) break ;;
             *) print_error "无效选项" ;;
         esac
@@ -3795,7 +4164,11 @@ docker_compose_install() {
     
     print_info "正在安装 Docker Compose..."
     
-    local compose_version="v2.24.5"
+    # 自动获取最新版本，失败时使用固定版本作为 fallback
+    local compose_version
+    compose_version=$(curl -s --max-time 10 https://api.github.com/repos/docker/compose/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
+    [[ -z "$compose_version" ]] && compose_version="v2.24.5"
+    print_info "版本: $compose_version"
     local compose_url="https://github.com/docker/compose/releases/download/${compose_version}/docker-compose-linux-$(uname -m)"
     
     if curl -L "$compose_url" -o /usr/local/bin/docker-compose 2>/dev/null; then
@@ -4296,7 +4669,7 @@ wg_server_install() {
     wg_dns=${wg_dns:-"1.1.1.1, 8.8.8.8"}
 
     local wg_endpoint default_ip
-    default_ip=$(curl -4 -s --max-time 5 https://4.ipw.cn 2>/dev/null || curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+    default_ip=$(get_public_ipv4 || echo "")
     if [[ -n "$default_ip" ]]; then
         read -e -r -p "公网端点 IP/域名 [${default_ip}]: " wg_endpoint
         wg_endpoint=${wg_endpoint:-$default_ip}
@@ -4927,24 +5300,36 @@ show_main_menu() {
     printf "${C_CYAN}%${W}s${C_RESET}\n" | tr ' ' '='
 
     echo ""
-    echo -e " ${C_CYAN}功能菜单${C_RESET}"
-    echo ""
+    echo -e " ${C_CYAN}[ 安全防护 ]${C_RESET}"
 
     if [[ "$PLATFORM" == "openwrt" ]]; then
-        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}1. 基础依赖安装 [不可用]${C_RESET}")" "6. 网络工具 (DNS)"
-        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"    "7. Web 服务 (SSL+Nginx+DDNS)"
-        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}3. Fail2ban [不可用]${C_RESET}")"       "$(echo -e "${C_GRAY}8. Docker [不可用]${C_RESET}")"
-        printf " %-38s %-38s\n" "$(echo -e "${C_GRAY}4. SSH 管理 [不可用]${C_RESET}")"       "9. 查看操作日志"
-        printf " %-38s %-38s\n" "5. 系统优化 (BBR/主机名/时区)"                               "10. WireGuard VPN"
-        printf " %-38s\n"      "0. 退出脚本"
+        printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}1. 基础依赖安装 [不可用]${C_RESET}")" "$(echo -e "${C_GRAY}2. UFW 防火墙 [不可用]${C_RESET}")"
+        printf "  %-36s %-36s\n" "$(echo -e "${C_GRAY}3. Fail2ban [不可用]${C_RESET}")"       "$(echo -e "${C_GRAY}4. SSH 管理 [不可用]${C_RESET}")"
     else
-        printf " %-38s %-38s\n" "1. 基础依赖安装" "6. 网络工具 (DNS/测速)"
-        printf " %-38s %-38s\n" "2. UFW 防火墙管理" "7. Web 服务 (SSL+Nginx)"
-        printf " %-38s %-38s\n" "3. Fail2ban 入侵防御" "8. Docker 管理"
-        printf " %-38s %-38s\n" "4. SSH 安全配置" "9. 查看操作日志"
-        printf " %-38s %-38s\n" "5. 系统优化 (BBR/Swap)" "10. WireGuard VPN"
-        printf " %-38s\n" "0. 退出脚本"
+        printf "  %-36s %-36s\n" "1. 基础依赖安装" "2. UFW 防火墙管理"
+        printf "  %-36s %-36s\n" "3. Fail2ban 入侵防御" "4. SSH 安全配置"
     fi
+
+    echo -e " ${C_CYAN}[ 系统优化 ]${C_RESET}"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        printf "  %-36s %-36s\n" "5. 系统优化 (BBR/主机名/时区)" "6. 网络工具 (DNS)"
+    else
+        printf "  %-36s %-36s\n" "5. 系统优化 (BBR/Swap)" "6. 网络工具 (DNS/测速)"
+    fi
+
+    echo -e " ${C_CYAN}[ 网络服务 ]${C_RESET}"
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        printf "  %-36s %-36s\n" "7. Web 服务 (SSL+Nginx+DDNS)" "$(echo -e "${C_GRAY}8. Docker [不可用]${C_RESET}")"
+    else
+        printf "  %-36s %-36s\n" "7. Web 服务 (SSL+Nginx)" "8. Docker 管理"
+    fi
+    printf "  %-36s\n" "9. WireGuard VPN"
+
+    echo -e " ${C_CYAN}[ 维护工具 ]${C_RESET}"
+    printf "  %-36s %-36s\n" "10. 查看操作日志" "11. 备份与恢复 (WebDAV)"
+
+    printf "${C_DIM}%${W}s${C_RESET}\n" | tr ' ' '-'
+    printf "  %-36s\n" "0. 退出脚本"
     echo ""
 }
 
@@ -7160,7 +7545,774 @@ menu_net_openwrt() {
         esac
     done
 }
+
+# ============================================================
+# 备份与恢复模块 (支持 WebDAV)
+# ============================================================
+backup_create() {
+    print_title "创建备份"
+    
+    # ========== 第一步：自动扫描 VPS 可备份项 ==========
+    print_info "正在扫描 VPS 可备份项..."
+    echo ""
+    
+    local -a scan_names=()
+    local -a scan_paths=()
+    local -a scan_types=()   # dir / file / cmd
+    local -a scan_tags=()    # 存档内目录名
+    local -a scan_selected=()
+    
+    _scan_add() {
+        scan_names+=("$1"); scan_paths+=("$2")
+        scan_types+=("$3"); scan_tags+=("$4")
+        scan_selected+=(1)
+    }
+    
+    # --- 核心配置 ---
+    [[ -d /etc/nginx ]] && _scan_add "Nginx 配置" "/etc/nginx" "dir" "nginx"
+    [[ -d /etc/wireguard ]] && _scan_add "WireGuard 配置" "/etc/wireguard" "dir" "wireguard"
+    [[ -d "$DDNS_CONFIG_DIR" ]] && _scan_add "DDNS 配置" "$DDNS_CONFIG_DIR" "dir" "ddns"
+    [[ -d "$SAAS_CONFIG_DIR" ]] && _scan_add "SaaS CDN 配置" "$SAAS_CONFIG_DIR" "dir" "saas-cdn"
+    [[ -d "$CONFIG_DIR" ]] && _scan_add "域名管理配置" "$CONFIG_DIR" "dir" "domain-configs"
+    [[ -f /etc/fail2ban/jail.local ]] && _scan_add "Fail2ban 规则" "/etc/fail2ban/jail.local" "file" "fail2ban/jail.local"
+    [[ -d "$CERT_PATH_PREFIX" ]] && _scan_add "SSL 证书" "$CERT_PATH_PREFIX" "dir" "certs"
+    [[ -d "$CERT_HOOKS_DIR" ]] && _scan_add "证书续签 Hooks" "$CERT_HOOKS_DIR" "dir" "cert-hooks"
+    command -v crontab >/dev/null 2>&1 && _scan_add "Crontab 定时任务" "crontab" "cmd" "crontab.bak"
+    
+    # --- Docker ---
+    if command_exists docker; then
+        # Docker 运行时配置 (daemon.json/镜像加速等)
+        [[ -d /etc/docker ]] && _scan_add "Docker 配置" "/etc/docker" "dir" "docker-config"
+        # Docker Compose 项目目录 (包含 compose 文件+挂载数据)
+        for dc_dir in /opt /root /home/*; do
+            for dc_file in "$dc_dir"/*/docker-compose.{yml,yaml} "$dc_dir"/*/compose.{yml,yaml}; do
+                [[ -f "$dc_file" ]] || continue
+                local pdir=$(dirname "$dc_file")
+                _scan_add "Docker: $(basename "$pdir")" "$pdir" "dir" "docker-$(basename "$pdir")"
+            done
+        done 2>/dev/null
+    fi
+    
+    # --- 常见应用自动发现 ---
+    [[ -d /etc/x-ui ]]              && _scan_add "3X-UI 面板"        "/etc/x-ui"              "dir" "x-ui"
+    [[ -d /usr/local/x-ui ]]        && _scan_add "3X-UI 程序目录"    "/usr/local/x-ui"        "dir" "x-ui-app"
+    [[ -d /opt/alist ]]             && _scan_add "Alist"             "/opt/alist"             "dir" "alist"
+    [[ -d /opt/1panel ]]            && _scan_add "1Panel"            "/opt/1panel"            "dir" "1panel"
+    [[ -d /root/.acme.sh ]]         && _scan_add "ACME.sh 证书"     "/root/.acme.sh"         "dir" "acme-sh"
+    [[ -d /etc/hysteria ]]          && _scan_add "Hysteria"          "/etc/hysteria"          "dir" "hysteria"
+    [[ -d /usr/local/etc/xray ]]    && _scan_add "Xray"             "/usr/local/etc/xray"    "dir" "xray"
+    [[ -d /usr/local/etc/v2ray ]]   && _scan_add "V2Ray"            "/usr/local/etc/v2ray"   "dir" "v2ray"
+    [[ -d /etc/sing-box ]]          && _scan_add "Sing-box"          "/etc/sing-box"          "dir" "sing-box"
+    [[ -d /etc/caddy ]]             && _scan_add "Caddy"             "/etc/caddy"             "dir" "caddy"
+    [[ -d /etc/haproxy ]]           && _scan_add "HAProxy"           "/etc/haproxy"           "dir" "haproxy"
+    [[ -d /etc/frp ]]               && _scan_add "FRP 内网穿透"      "/etc/frp"               "dir" "frp"
+    [[ -d /etc/nezha ]]             && _scan_add "哪吒监控"          "/etc/nezha"             "dir" "nezha"
+    [[ -d /opt/nezha ]]             && _scan_add "哪吒监控(opt)"     "/opt/nezha"             "dir" "nezha-opt"
+    [[ -f "$CONFIG_FILE" ]]         && _scan_add "脚本自身配置"      "$CONFIG_FILE"           "file" "script-config"
+    [[ -f /usr/local/bin/ddns-update.sh ]] && _scan_add "DDNS更新脚本" "/usr/local/bin/ddns-update.sh" "file" "ddns-update.sh"
+    
+    local total=${#scan_names[@]}
+    if [[ $total -eq 0 ]]; then
+        print_warn "未发现任何可备份项。"
+        pause; return 1
+    fi
+    
+    # ========== 第二步：交互选择 ==========
+    echo -e "${C_CYAN}发现 ${total} 项可备份内容:${C_RESET}"
+    draw_line
+    local i
+    for ((i=0; i<total; i++)); do
+        local mark="✓"; [[ "${scan_selected[$i]}" -eq 0 ]] && mark=" "
+        printf "  [${C_GREEN}%s${C_RESET}] %2d. %-28s ${C_GRAY}%s${C_RESET}\n" "$mark" "$((i+1))" "${scan_names[$i]}" "${scan_paths[$i]}"
+    done
+    draw_line
+    echo -e "  ${C_GRAY}输入序号切换选中 | a=全选 | n=全不选 | Enter=开始备份 | 0=取消${C_RESET}"
+    echo ""
+    
+    while true; do
+        read -e -r -p "操作: " sel_input
+        case "$sel_input" in
+            "") break ;;
+            0) return ;;
+            a|A) for ((i=0; i<total; i++)); do scan_selected[$i]=1; done ;;
+            n|N) for ((i=0; i<total; i++)); do scan_selected[$i]=0; done ;;
+            *)
+                if [[ "$sel_input" =~ ^[0-9]+$ ]] && (( sel_input >= 1 && sel_input <= total )); then
+                    local ti=$((sel_input - 1))
+                    scan_selected[$ti]=$(( 1 - scan_selected[ti] ))
+                else
+                    print_warn "无效输入"; continue
+                fi ;;
+        esac
+        for ((i=0; i<total; i++)); do
+            local mark="✓"; [[ "${scan_selected[$i]}" -eq 0 ]] && mark=" "
+            printf "  [${C_GREEN}%s${C_RESET}] %2d. %-28s\n" "$mark" "$((i+1))" "${scan_names[$i]}"
+        done
+        echo ""
+    done
+    
+    local selected_count=0
+    for ((i=0; i<total; i++)); do
+        [[ "${scan_selected[$i]}" -eq 1 ]] && selected_count=$((selected_count + 1))
+    done
+    [[ $selected_count -eq 0 ]] && { print_warn "未选择任何项。"; pause; return; }
+    
+    # ========== 第三步：执行备份 ==========
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local backup_name="${SCRIPT_NAME}-backup-${timestamp}"
+    local backup_file="${BACKUP_LOCAL_DIR}/${backup_name}.tar.gz"
+    local tmp_dir=$(mktemp -d "/tmp/${SCRIPT_NAME}-backup.XXXXXX")
+    trap "rm -rf '$tmp_dir'" RETURN
+    
+    mkdir -p "$BACKUP_LOCAL_DIR" "${tmp_dir}/data"
+    
+    print_info "正在收集 $selected_count 项备份数据..."
+    local items_backed=0
+    
+    for ((i=0; i<total; i++)); do
+        [[ "${scan_selected[$i]}" -eq 0 ]] && continue
+        local name="${scan_names[$i]}" path="${scan_paths[$i]}"
+        local type="${scan_types[$i]}" tag="${scan_tags[$i]}"
+        
+        case "$type" in
+            dir)
+                cp -r "$path" "${tmp_dir}/data/${tag}" 2>/dev/null && {
+                    echo -e "  ${C_GREEN}✓${C_RESET} $name"
+                    items_backed=$((items_backed + 1))
+                } || echo -e "  ${C_RED}✗${C_RESET} $name (失败)"
+                ;;
+            file)
+                mkdir -p "${tmp_dir}/data/$(dirname "$tag")" 2>/dev/null
+                cp -L "$path" "${tmp_dir}/data/${tag}" 2>/dev/null && {
+                    echo -e "  ${C_GREEN}✓${C_RESET} $name"
+                    items_backed=$((items_backed + 1))
+                } || echo -e "  ${C_RED}✗${C_RESET} $name (失败)"
+                ;;
+            cmd)
+                if [[ "$tag" == "crontab.bak" ]]; then
+                    crontab -l 2>/dev/null > "${tmp_dir}/data/crontab.bak" && {
+                        echo -e "  ${C_GREEN}✓${C_RESET} $name"; items_backed=$((items_backed + 1))
+                    }
+                elif [[ "$tag" == "docker-volumes" ]]; then
+                    mkdir -p "${tmp_dir}/data/docker-volumes"
+                    local vol
+                    for vol in $(docker volume ls -q 2>/dev/null); do
+                        local vp=$(docker volume inspect "$vol" --format '{{.Mountpoint}}' 2>/dev/null)
+                        [[ -n "$vp" && -d "$vp" ]] && cp -r "$vp" "${tmp_dir}/data/docker-volumes/${vol}" 2>/dev/null || true
+                    done
+                    echo -e "  ${C_GREEN}✓${C_RESET} $name"; items_backed=$((items_backed + 1))
+                fi ;;
+        esac
+    done
+    
+    # 元信息
+    printf "VERSION=%s\nDATE=%s\nHOSTNAME=%s\nITEMS=%d\n" \
+        "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)" "$items_backed" \
+        > "${tmp_dir}/data/backup_meta.txt"
+    
+    print_info "正在压缩..."
+    tar -czf "$backup_file" -C "${tmp_dir}/data" . 2>/dev/null || {
+        print_error "压缩失败"; pause; return 1
+    }
+    
+    local file_size=$(du -h "$backup_file" 2>/dev/null | awk '{print $1}')
+    echo ""
+    print_success "备份完成！"
+    echo -e "  文件: ${C_GREEN}$backup_file${C_RESET}"
+    echo -e "  大小: $file_size | 项目: $items_backed 项"
+    
+    # WebDAV 上传
+    if [[ -f "$BACKUP_CONFIG_FILE" ]]; then
+        source "$BACKUP_CONFIG_FILE" 2>/dev/null
+        if [[ -n "$WEBDAV_URL" ]]; then
+            echo ""
+            if confirm "是否上传到 WebDAV 远程存储?"; then
+                backup_webdav_upload "$backup_file"
+            fi
+        fi
+    fi
+    
+    log_action "Backup created: $backup_file ($file_size, $items_backed items)"
+    pause
+}
+
+backup_webdav_upload() {
+    local file="$1"
+    [[ ! -f "$file" ]] && { print_error "文件不存在: $file"; return 1; }
+    
+    if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
+        print_error "WebDAV 未配置。请先使用菜单配置 WebDAV 参数。"
+        return 1
+    fi
+    
+    source "$BACKUP_CONFIG_FILE" 2>/dev/null
+    if [[ -z "$WEBDAV_URL" || -z "$WEBDAV_USER" || -z "$WEBDAV_PASS" ]]; then
+        print_error "WebDAV 配置不完整。"
+        return 1
+    fi
+    
+    local upload_file="$file"
+    local filename=$(basename "$file")
+    local encrypted=0
+    
+    # 加密选项
+    if [[ "${WEBDAV_ENCRYPT:-}" == "true" ]] || confirm "是否加密后再上传? (AES-256, 推荐启用)"; then
+        if ! command_exists openssl; then
+            print_warn "openssl 未安装，跳过加密直接上传。"
+        else
+            local enc_pass="${WEBDAV_ENC_KEY:-}"
+            if [[ -z "$enc_pass" ]]; then
+                read -s -r -p "设置加密密码 (用于解密恢复): " enc_pass
+                echo ""
+                if [[ -z "$enc_pass" ]]; then
+                    print_warn "密码为空，跳过加密。"
+                else
+                    echo ""
+                    print_guide "提示: 可在 WebDAV 配置中设置 WEBDAV_ENC_KEY 免去每次输入。"
+                fi
+            fi
+            if [[ -n "$enc_pass" ]]; then
+                upload_file="${file}.enc"
+                print_info "正在加密..."
+                if openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+                    -in "$file" -out "$upload_file" -pass "pass:${enc_pass}" 2>/dev/null; then
+                    filename="${filename}.enc"
+                    encrypted=1
+                    local enc_size=$(du -h "$upload_file" 2>/dev/null | awk '{print $1}')
+                    print_success "加密完成 (加密后: $enc_size)"
+                else
+                    print_error "加密失败，使用明文上传。"
+                    upload_file="$file"
+                fi
+            fi
+        fi
+    fi
+    
+    local upload_url="${WEBDAV_URL%/}/${filename}"
+    print_info "正在上传: ${filename}..."
+    
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -T "$upload_file" \
+        -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
+        --connect-timeout 10 \
+        --max-time 600 \
+        "$upload_url" 2>/dev/null)
+    
+    # 清理加密临时文件
+    [[ $encrypted -eq 1 ]] && rm -f "$upload_file"
+    
+    if [[ "$http_code" =~ ^(200|201|204)$ ]]; then
+        print_success "上传成功！(HTTP $http_code)"
+        [[ $encrypted -eq 1 ]] && print_info "文件已加密传输 (AES-256-CBC)。恢复时需要解密密码。"
+        log_action "Backup uploaded to WebDAV: $filename (encrypted=$encrypted)"
+    else
+        print_error "上传失败 (HTTP $http_code)"
+        return 1
+    fi
+}
+
+backup_webdav_config() {
+    print_title "WebDAV 远程存储配置"
+    
+    if [[ -f "$BACKUP_CONFIG_FILE" ]]; then
+        source "$BACKUP_CONFIG_FILE" 2>/dev/null
+        echo -e "当前配置:"
+        echo -e "  URL:  ${C_CYAN}${WEBDAV_URL:-未设置}${C_RESET}"
+        echo -e "  用户: ${C_CYAN}${WEBDAV_USER:-未设置}${C_RESET}"
+        echo -e "  密码: ${C_CYAN}${WEBDAV_PASS:+****}${C_RESET}"
+        echo -e "  加密: ${C_CYAN}${WEBDAV_ENCRYPT:-false}${C_RESET}"
+        [[ -n "${WEBDAV_ENC_KEY:-}" ]] && echo -e "  密钥: ${C_CYAN}****${C_RESET}"
+        echo ""
+    fi
+    
+    echo "1. 设置/修改 WebDAV 参数"
+    echo "2. 测试 WebDAV 连通性"
+    echo "3. 配置传输加密"
+    echo "4. 清除 WebDAV 配置"
+    echo "0. 返回"
+    echo ""
+    read -e -r -p "选择: " wc
+    
+    case $wc in
+        1)
+            local url user pass
+            echo ""
+            print_guide "输入 WebDAV 地址 (例如 https://dav.jianguoyun.com/dav/backups)"
+            read -e -r -p "WebDAV URL: " url
+            [[ -z "$url" ]] && { print_warn "已取消"; pause; return; }
+            read -e -r -p "用户名: " user
+            [[ -z "$user" ]] && { print_warn "已取消"; pause; return; }
+            read -s -r -p "密码/应用密钥: " pass
+            echo ""
+            [[ -z "$pass" ]] && { print_warn "已取消"; pause; return; }
+            
+            write_file_atomic "$BACKUP_CONFIG_FILE" "# WebDAV 备份配置
+# Generated by $SCRIPT_NAME $VERSION
+WEBDAV_URL=\"$url\"
+WEBDAV_USER=\"$user\"
+WEBDAV_PASS=\"$pass\"
+WEBDAV_ENCRYPT=\"false\"
+WEBDAV_ENC_KEY=\"\""
+            chmod 600 "$BACKUP_CONFIG_FILE"
+            print_success "WebDAV 配置已保存。"
+            ;;
+        2)
+            if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
+                print_error "未配置 WebDAV"; pause; return
+            fi
+            source "$BACKUP_CONFIG_FILE" 2>/dev/null
+            print_info "正在测试连通性..."
+            local code
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+                -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
+                --connect-timeout 10 \
+                -X PROPFIND "$WEBDAV_URL" 2>/dev/null)
+            if [[ "$code" =~ ^(200|207|301|405)$ ]]; then
+                print_success "连接成功 (HTTP $code)"
+            else
+                print_error "连接失败 (HTTP $code)"
+            fi
+            ;;
+        3)
+            if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
+                print_error "未配置 WebDAV"; pause; return
+            fi
+            source "$BACKUP_CONFIG_FILE" 2>/dev/null
+            echo ""
+            echo -e "当前加密状态: $( [[ "${WEBDAV_ENCRYPT:-}" == "true" ]] && echo -e "${C_GREEN}已启用${C_RESET}" || echo -e "${C_YELLOW}未启用${C_RESET}" )"
+            echo ""
+            echo "  1. 启用加密上传 (每次上传前自动 AES-256-CBC 加密)"
+            echo "  2. 关闭加密上传"
+            echo "  3. 设置加密密钥 (免去每次输入)"
+            echo ""
+            read -e -r -p "选择: " ec
+            case $ec in
+                1)
+                    sed -i 's/^WEBDAV_ENCRYPT=.*/WEBDAV_ENCRYPT="true"/' "$BACKUP_CONFIG_FILE" 2>/dev/null
+                    print_success "加密已启用。上传时将自动加密。"
+                    ;;
+                2)
+                    sed -i 's/^WEBDAV_ENCRYPT=.*/WEBDAV_ENCRYPT="false"/' "$BACKUP_CONFIG_FILE" 2>/dev/null
+                    print_success "加密已关闭。"
+                    ;;
+                3)
+                    read -s -r -p "输入加密密钥: " ekey
+                    echo ""
+                    if [[ -n "$ekey" ]]; then
+                        sed -i "s/^WEBDAV_ENC_KEY=.*/WEBDAV_ENC_KEY=\"$ekey\"/" "$BACKUP_CONFIG_FILE" 2>/dev/null
+                        print_success "加密密钥已保存。"
+                    fi
+                    ;;
+            esac
+            ;;
+        4)
+            if [[ -f "$BACKUP_CONFIG_FILE" ]]; then
+                rm -f "$BACKUP_CONFIG_FILE"
+                print_success "WebDAV 配置已清除。"
+            else
+                print_warn "无配置可清除。"
+            fi
+            ;;
+    esac
+    pause
+}
+
+backup_schedule() {
+    print_title "定时备份设置"
+    
+    local current_cron=""
+    current_cron=$(crontab -l 2>/dev/null | grep "${SCRIPT_NAME}.*--backup" || true)
+    
+    if [[ -n "$current_cron" ]]; then
+        echo -e "当前定时备份: ${C_GREEN}已启用${C_RESET}"
+        echo -e "  ${C_GRAY}$current_cron${C_RESET}"
+        echo ""
+        echo "1. 修改定时频率"
+        echo "2. 停用定时备份"
+        echo "0. 返回"
+    else
+        echo -e "当前定时备份: ${C_YELLOW}未启用${C_RESET}"
+        echo ""
+        echo "1. 启用定时备份"
+        echo "0. 返回"
+    fi
+    echo ""
+    read -e -r -p "选择: " sc
+    
+    case $sc in
+        1)
+            echo ""
+            echo "选择备份频率:"
+            echo "  1. 每日 4:00 AM"
+            echo "  2. 每周日 4:00 AM"
+            echo "  3. 每月1日 4:00 AM"
+            echo ""
+            read -e -r -p "选择 [1]: " freq
+            freq=${freq:-1}
+            
+            local cron_expr=""
+            case $freq in
+                1) cron_expr="0 4 * * *" ;;
+                2) cron_expr="0 4 * * 0" ;;
+                3) cron_expr="0 4 1 * *" ;;
+                *) print_error "无效选项"; pause; return ;;
+            esac
+            
+            # 获取脚本实际路径
+            local script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+            
+            local cron_tmp=$(mktemp)
+            trap "rm -f '$cron_tmp'" RETURN
+            crontab -l 2>/dev/null | grep -v "${SCRIPT_NAME}.*--backup" > "$cron_tmp" || true
+            echo "$cron_expr bash $script_path --backup >/dev/null 2>&1" >> "$cron_tmp"
+            crontab "$cron_tmp" && print_success "定时备份已设置。" || print_error "crontab 设置失败"
+            rm -f "$cron_tmp"
+            trap - RETURN
+            ;;
+        2)
+            local cron_tmp=$(mktemp)
+            trap "rm -f '$cron_tmp'" RETURN
+            crontab -l 2>/dev/null | grep -v "${SCRIPT_NAME}.*--backup" > "$cron_tmp" || true
+            crontab "$cron_tmp" && print_success "定时备份已停用。" || print_error "crontab 设置失败"
+            rm -f "$cron_tmp"
+            trap - RETURN
+            ;;
+    esac
+    pause
+}
+
+backup_restore() {
+    print_title "恢复备份"
+    
+    echo "选择恢复来源:"
+    echo "  1. 本地备份"
+    echo "  2. WebDAV 远程备份"
+    echo "  0. 返回"
+    echo ""
+    read -e -r -p "选择: " src
+    
+    local restore_file=""
+    
+    case $src in
+        1)
+            # 列出本地备份
+            if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR" 2>/dev/null)" ]]; then
+                print_warn "本地无备份文件。"
+                pause; return
+            fi
+            echo ""
+            echo -e "${C_CYAN}本地备份列表:${C_RESET}"
+            local i=1 files=()
+            for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null); do
+                local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+                local fname=$(basename "$f")
+                echo "  $i. $fname ($fsize)"
+                files+=("$f")
+                i=$((i + 1))
+                [[ $i -gt 20 ]] && break
+            done
+            echo "  0. 返回"
+            echo ""
+            read -e -r -p "选择要恢复的备份序号: " idx
+            [[ "$idx" == "0" || -z "$idx" ]] && return
+            if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -ge 1 && $idx -le ${#files[@]} ]]; then
+                restore_file="${files[$((idx - 1))]}"
+            else
+                print_error "无效序号"; pause; return
+            fi
+            ;;
+        2)
+            if [[ ! -f "$BACKUP_CONFIG_FILE" ]]; then
+                print_error "WebDAV 未配置。请先配置 WebDAV 参数。"
+                pause; return
+            fi
+            source "$BACKUP_CONFIG_FILE" 2>/dev/null
+            
+            print_info "正在获取远程备份列表..."
+            local remote_list
+            remote_list=$(curl -s -u "${WEBDAV_USER}:${WEBDAV_PASS}" --connect-timeout 10 \
+                -X PROPFIND "$WEBDAV_URL" 2>/dev/null | grep -oP "${SCRIPT_NAME}-backup-[^<\"]+\.tar\.gz(\.enc)?" | sort -ur | head -20)
+            
+            if [[ -z "$remote_list" ]]; then
+                print_warn "远程无备份文件或无法连接。"
+                pause; return
+            fi
+            
+            echo ""
+            echo -e "${C_CYAN}远程备份列表:${C_RESET}"
+            local i=1 rfiles=()
+            while IFS= read -r fname; do
+                echo "  $i. $fname"
+                rfiles+=("$fname")
+                i=$((i + 1))
+            done <<< "$remote_list"
+            echo "  0. 返回"
+            echo ""
+            read -e -r -p "选择要恢复的备份序号: " idx
+            [[ "$idx" == "0" || -z "$idx" ]] && return
+            if [[ "$idx" =~ ^[0-9]+$ ]] && [[ $idx -ge 1 && $idx -le ${#rfiles[@]} ]]; then
+                local remote_fname="${rfiles[$((idx - 1))]}"
+                restore_file="/tmp/${remote_fname}"
+                print_info "正在下载 ${remote_fname}..."
+                if ! curl -s -u "${WEBDAV_USER}:${WEBDAV_PASS}" \
+                    -o "$restore_file" --connect-timeout 10 --max-time 300 \
+                    "${WEBDAV_URL%/}/${remote_fname}" 2>/dev/null; then
+                    print_error "下载失败"
+                    pause; return
+                fi
+                print_success "下载完成。"
+            else
+                print_error "无效序号"; pause; return
+            fi
+            ;;
+        *) return ;;
+    esac
+    
+    [[ -z "$restore_file" || ! -f "$restore_file" ]] && { print_error "备份文件不存在"; pause; return; }
+    
+    # 如果是加密文件，先解密
+    if [[ "$restore_file" == *.enc ]]; then
+        print_warn "检测到加密备份文件，需要解密。"
+        local dec_pass="${WEBDAV_ENC_KEY:-}"
+        if [[ -z "$dec_pass" ]]; then
+            read -s -r -p "输入解密密码: " dec_pass
+            echo ""
+        fi
+        [[ -z "$dec_pass" ]] && { print_error "密码不能为空"; pause; return; }
+        
+        local dec_file="${restore_file%.enc}"
+        print_info "正在解密..."
+        if ! openssl enc -aes-256-cbc -d -salt -pbkdf2 -iter 100000 \
+            -in "$restore_file" -out "$dec_file" -pass "pass:${dec_pass}" 2>/dev/null; then
+            print_error "解密失败，密码可能不正确。"
+            rm -f "$dec_file"
+            pause; return
+        fi
+        restore_file="$dec_file"
+        print_success "解密完成。"
+    fi
+    
+    echo ""
+    print_warn "恢复操作将覆盖现有配置。"
+    if ! confirm "确认恢复? (建议先备份当前配置)"; then
+        pause; return
+    fi
+    
+    local tmp_restore=$(mktemp -d "/tmp/${SCRIPT_NAME}-restore.XXXXXX")
+    trap "rm -rf '$tmp_restore'" RETURN
+    
+    print_info "正在解压..."
+    if ! tar -xzf "$restore_file" -C "$tmp_restore" 2>/dev/null; then
+        print_error "解压失败，文件可能已损坏。"
+        pause; return 1
+    fi
+    
+    # 逐项恢复
+    local restored=0
+    
+    [[ -d "${tmp_restore}/nginx" ]] && {
+        cp -r "${tmp_restore}/nginx/"* /etc/nginx/ 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} /etc/nginx"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/wireguard" ]] && {
+        cp -r "${tmp_restore}/wireguard/"* /etc/wireguard/ 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} /etc/wireguard"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/ddns" ]] && {
+        mkdir -p "$DDNS_CONFIG_DIR"
+        cp -r "${tmp_restore}/ddns/"* "$DDNS_CONFIG_DIR/" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $DDNS_CONFIG_DIR"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/saas-cdn" ]] && {
+        mkdir -p "$SAAS_CONFIG_DIR"
+        cp -r "${tmp_restore}/saas-cdn/"* "$SAAS_CONFIG_DIR/" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $SAAS_CONFIG_DIR"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/fail2ban" ]] && {
+        cp "${tmp_restore}/fail2ban/jail.local" /etc/fail2ban/ 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} /etc/fail2ban/jail.local"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/certs" ]] && {
+        mkdir -p "$CERT_PATH_PREFIX"
+        cp -r "${tmp_restore}/certs/"* "$CERT_PATH_PREFIX/" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $CERT_PATH_PREFIX"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/cert-hooks" ]] && {
+        mkdir -p "$CERT_HOOKS_DIR"
+        cp -r "${tmp_restore}/cert-hooks/"* "$CERT_HOOKS_DIR/" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $CERT_HOOKS_DIR"
+        restored=$((restored + 1))
+    }
+    
+    [[ -d "${tmp_restore}/domain-configs" ]] && {
+        mkdir -p "$CONFIG_DIR"
+        cp -r "${tmp_restore}/domain-configs/"* "$CONFIG_DIR/" 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} $CONFIG_DIR"
+        restored=$((restored + 1))
+    }
+    
+    [[ -f "${tmp_restore}/crontab.bak" ]] && {
+        if confirm "是否恢复 crontab? (将替换当前所有 cron 定时任务)"; then
+            crontab "${tmp_restore}/crontab.bak" 2>/dev/null
+            echo -e "  ${C_GREEN}✓${C_RESET} crontab"
+            restored=$((restored + 1))
+        fi
+    }
+    
+    [[ -f "${tmp_restore}/ddns-update.sh" ]] && {
+        cp "${tmp_restore}/ddns-update.sh" /usr/local/bin/ 2>/dev/null
+        chmod +x /usr/local/bin/ddns-update.sh 2>/dev/null
+        echo -e "  ${C_GREEN}✓${C_RESET} ddns-update.sh"
+    }
+    
+    rm -rf "$tmp_restore"
+    trap - RETURN
+    
+    echo ""
+    print_success "恢复完成！共恢复 $restored 项。"
+    
+    # 尝试重载服务
+    if command_exists nginx && [[ -d "${tmp_restore}/nginx" ]]; then
+        nginx -t >/dev/null 2>&1 && {
+            is_systemd && systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null
+            print_info "Nginx 已重载。"
+        }
+    fi
+    
+    log_action "Backup restored from: $(basename "$restore_file") ($restored items)"
+    pause
+}
+
+backup_list() {
+    print_title "备份文件列表"
+    
+    if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null)" ]]; then
+        print_warn "本地无备份文件。"
+        echo -e "  备份目录: ${C_GRAY}$BACKUP_LOCAL_DIR${C_RESET}"
+        pause; return
+    fi
+    
+    echo -e "${C_CYAN}本地备份:${C_RESET}"
+    draw_line
+    for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | head -20); do
+        local fsize=$(du -h "$f" 2>/dev/null | awk '{print $1}')
+        local fdate=$(stat -c '%y' "$f" 2>/dev/null | cut -d'.' -f1 || stat -f '%Sm' "$f" 2>/dev/null)
+        printf "  %-50s %8s  %s\n" "$(basename "$f")" "$fsize" "$fdate"
+    done
+    draw_line
+    
+    local total=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
+    local total_size=$(du -sh "$BACKUP_LOCAL_DIR" 2>/dev/null | awk '{print $1}')
+    echo -e "  共 ${C_GREEN}${total}${C_RESET} 个备份, 占用 ${total_size}"
+    
+    pause
+}
+
+backup_clean() {
+    print_title "清理旧备份"
+    
+    if [[ ! -d "$BACKUP_LOCAL_DIR" ]] || [[ -z "$(ls -A "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null)" ]]; then
+        print_warn "本地无备份文件。"
+        pause; return
+    fi
+    
+    local total=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
+    echo "当前共 $total 个备份。"
+    echo ""
+    echo "1. 保留最近 5 个，删除其余"
+    echo "2. 保留最近 10 个，删除其余"
+    echo "3. 删除全部备份"
+    echo "0. 返回"
+    echo ""
+    read -e -r -p "选择: " cc
+    
+    local keep=0
+    case $cc in
+        1) keep=5 ;;
+        2) keep=10 ;;
+        3) keep=0 ;;
+        *) return ;;
+    esac
+    
+    if [[ $keep -eq 0 ]]; then
+        confirm "确认删除全部备份?" || return
+        rm -f "$BACKUP_LOCAL_DIR"/*.tar.gz
+        print_success "全部备份已清除。"
+    else
+        local count=0
+        for f in $(ls -t "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null); do
+            count=$((count + 1))
+            if [[ $count -gt $keep ]]; then
+                rm -f "$f"
+            fi
+        done
+        local deleted=$((count > keep ? count - keep : 0))
+        print_success "已清理 $deleted 个旧备份，保留最近 $keep 个。"
+    fi
+    
+    log_action "Backup cleanup: kept=$keep"
+    pause
+}
+
+menu_backup() {
+    while true; do
+        print_title "备份与恢复 (支持 WebDAV)"
+        
+        local backup_count=$(ls -1 "$BACKUP_LOCAL_DIR"/*.tar.gz 2>/dev/null | wc -l)
+        local webdav_status="未配置"
+        [[ -f "$BACKUP_CONFIG_FILE" ]] && source "$BACKUP_CONFIG_FILE" 2>/dev/null && [[ -n "$WEBDAV_URL" ]] && webdav_status="已配置"
+        
+        echo -e "本地备份: ${C_GREEN}${backup_count}${C_RESET} 个 | WebDAV: ${C_GREEN}${webdav_status}${C_RESET}"
+        echo ""
+        
+        echo "1. 立即创建备份"
+        echo "2. 恢复备份"
+        echo "3. 查看备份列表"
+        echo "4. 清理旧备份"
+        echo ""
+        echo "5. 配置 WebDAV 远程存储"
+        echo "6. 定时备份设置"
+        echo ""
+        echo "0. 返回主菜单"
+        echo ""
+        read -e -r -p "选择: " bc
+        
+        case $bc in
+            1) backup_create ;;
+            2) backup_restore ;;
+            3) backup_list ;;
+            4) backup_clean ;;
+            5) backup_webdav_config ;;
+            6) backup_schedule ;;
+            0|q) break ;;
+            *) print_error "无效选项" ;;
+        esac
+    done
+}
+
 main() {
+    # 支持 --backup 命令行参数（用于定时任务）
+    if [[ "${1:-}" == "--backup" ]]; then
+        check_root
+        check_os
+        init_environment
+        backup_create
+        exit 0
+    fi
+    
     check_root
     check_os
     init_environment
@@ -7168,9 +8320,9 @@ main() {
     
     while true; do
         show_main_menu
-        read -e -r -p "请选择功能 [0-10]: " choice
-        
-                case $choice in
+        read -e -r -p "请选择功能 [0-11]: " choice
+
+        case $choice in
             1)
                 if [[ "$PLATFORM" == "openwrt" ]]; then
                     feature_blocked "基础依赖安装 (apt-get)"
@@ -7221,7 +8373,11 @@ main() {
                     menu_docker
                 fi
                 ;;
+
             9)
+                wg_main_menu
+                ;;
+            10)
                 print_title "操作日志 (最近 50 条)"
                 if [[ -f "$LOG_FILE" ]]; then
                     tail -n 50 "$LOG_FILE"
@@ -7230,8 +8386,8 @@ main() {
                 fi
                 pause
                 ;;
-            10)
-                wg_main_menu
+            11)
+                menu_backup
                 ;;
             0|q|Q)
                 echo ""
