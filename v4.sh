@@ -1981,6 +1981,9 @@ _install_certbot_dns_cf_snap() {
     fi
     ln -sf /snap/bin/certbot /usr/bin/certbot
 
+    # 授权插件 root 权限（snap 强制要求）
+    snap set certbot trust-plugin-with-root=ok 2>/dev/null || true
+
     print_info "snap 安装 certbot-dns-cloudflare..."
     if ! snap install certbot-dns-cloudflare 2>&1; then
         print_error "snap install certbot-dns-cloudflare 失败"
