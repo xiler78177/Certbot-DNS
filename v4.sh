@@ -1755,9 +1755,62 @@ net_dns() {
         cat /etc/resolv.conf
     fi
     
-    echo -e "\n${C_YELLOW}输入新 DNS IP (空格隔开)，输入 0 取消${C_RESET}"
-    read -e -r -p "DNS: " dns
-    [[ -z "$dns" || "$dns" == "0" ]] && return
+    echo ""
+    echo -e "${C_CYAN}━━━ DNS 预设方案 ━━━${C_RESET}"
+    echo ""
+    echo -e "  ${C_YELLOW}── 境外通用 ──${C_RESET}"
+    echo "  1. Cloudflare          1.1.1.1 1.0.0.1"
+    echo "  2. Google              8.8.8.8 8.8.4.4"
+    echo "  3. Cloudflare + Google 1.1.1.1 8.8.8.8"
+    echo ""
+    echo -e "  ${C_YELLOW}── 境内通用 ──${C_RESET}"
+    echo "  4. 阿里 DNS            223.5.5.5 223.6.6.6"
+    echo "  5. 腾讯 DNS            119.29.29.29 119.28.28.28"
+    echo "  6. 114 DNS             114.114.114.114 114.114.115.115"
+    echo ""
+    echo -e "  ${C_YELLOW}── IPv6 ──${C_RESET}"
+    echo "  7. Cloudflare IPv6     2606:4700:4700::1111 2606:4700:4700::1001"
+    echo "  8. Google IPv6         2001:4860:4860::8888 2001:4860:4860::8844"
+    echo "  9. 阿里 IPv6           2400:3200::1 2400:3200:baba::1"
+    echo ""
+    echo -e "  ${C_YELLOW}── 混合方案 ──${C_RESET}"
+    echo "  10. 境外双栈 (CF v4+v6)       1.1.1.1 2606:4700:4700::1111"
+    echo "  11. 境内双栈 (阿里 v4+v6)     223.5.5.5 2400:3200::1"
+    echo "  12. 境内+境外混合              223.5.5.5 1.1.1.1"
+    echo ""
+    echo "  0. 自定义输入"
+    echo ""
+    
+    read -e -r -p "选择方案 [0]: " dns_choice
+    dns_choice=${dns_choice:-0}
+    
+    local dns=""
+    case $dns_choice in
+        1)  dns="1.1.1.1 1.0.0.1" ;;
+        2)  dns="8.8.8.8 8.8.4.4" ;;
+        3)  dns="1.1.1.1 8.8.8.8" ;;
+        4)  dns="223.5.5.5 223.6.6.6" ;;
+        5)  dns="119.29.29.29 119.28.28.28" ;;
+        6)  dns="114.114.114.114 114.114.115.115" ;;
+        7)  dns="2606:4700:4700::1111 2606:4700:4700::1001" ;;
+        8)  dns="2001:4860:4860::8888 2001:4860:4860::8844" ;;
+        9)  dns="2400:3200::1 2400:3200:baba::1" ;;
+        10) dns="1.1.1.1 2606:4700:4700::1111" ;;
+        11) dns="223.5.5.5 2400:3200::1" ;;
+        12) dns="223.5.5.5 1.1.1.1" ;;
+        0)
+            echo -e "${C_YELLOW}输入 DNS IP (空格隔开)，输入 0 取消${C_RESET}"
+            read -e -r -p "DNS: " dns
+            [[ -z "$dns" || "$dns" == "0" ]] && return
+            ;;
+        *) print_error "无效选择"; pause; return ;;
+    esac
+    
+    [[ -z "$dns" ]] && return
+    
+    echo ""
+    echo -e "${C_CYAN}将设置 DNS 为:${C_RESET} $dns"
+    if ! confirm "确认修改?"; then return; fi
     
     for ip in $dns; do
         if ! validate_ip "$ip"; then
@@ -1766,8 +1819,7 @@ net_dns() {
         fi
     done
     
-        if [[ "$PLATFORM" == "openwrt" ]]; then
-        # OpenWrt 使用 uci 修改，防止重启后被覆盖
+    if [[ "$PLATFORM" == "openwrt" ]]; then
         uci delete network.wan.dns 2>/dev/null || true
         for ip in $dns; do
             uci add_list network.wan.dns="$ip"
@@ -1828,9 +1880,114 @@ menu_net() {
     done
 }
 
+# ============================================================
+# Web 环境依赖自检 + 自动修复
+# ============================================================
+
+_web_dep_check_results=()
+
+_web_dep_verify() {
+    local name="$1" check_cmd="$2"
+    if eval "$check_cmd" >/dev/null 2>&1; then
+        _web_dep_check_results+=("${C_GREEN}✓${C_RESET} $name")
+        return 0
+    else
+        _web_dep_check_results+=("${C_RED}✗${C_RESET} $name")
+        return 1
+    fi
+}
+
+_web_dep_fix() {
+    local name="$1" check_cmd="$2" install_func="$3"
+    if ! eval "$check_cmd" >/dev/null 2>&1; then
+        print_info "修复: $name ..."
+        if eval "$install_func"; then
+            if eval "$check_cmd" >/dev/null 2>&1; then
+                print_success "$name 修复成功"
+                return 0
+            fi
+        fi
+        print_error "$name 修复失败"
+        return 1
+    fi
+    return 0
+}
+
+_purge_snap_certbot() {
+    if snap list certbot &>/dev/null 2>&1; then
+        print_info "检测到 snap 版 certbot，正在清理..."
+        snap remove certbot 2>/dev/null || true
+        snap remove certbot-dns-cloudflare 2>/dev/null || true
+        rm -f /usr/bin/certbot /snap/bin/certbot 2>/dev/null || true
+        if snap list 2>/dev/null | wc -l | grep -q "^1$"; then
+            print_info "snap 中无其他软件包，清理 snapd..."
+            systemctl stop snapd snapd.socket 2>/dev/null || true
+            apt-get purge -y snapd 2>/dev/null || true
+            rm -rf /snap /var/snap /var/lib/snapd ~/snap 2>/dev/null || true
+            print_success "snapd 已清理"
+        fi
+        log_action "Purged snap certbot"
+    fi
+}
+
+_install_certbot_apt() {
+    _purge_snap_certbot
+    update_apt_cache
+    apt-get install -y certbot >/dev/null 2>&1
+}
+
+_install_certbot_snap() {
+    install_package "snapd" "silent" || return 1
+    snap install --classic certbot >/dev/null 2>&1 || return 1
+    ln -sf /snap/bin/certbot /usr/bin/certbot
+}
+
+_install_certbot_dns_cf_apt() {
+    _purge_snap_certbot
+    update_apt_cache
+    if ! dpkg -s certbot &>/dev/null; then
+        apt-get install -y certbot >/dev/null 2>&1 || return 1
+    fi
+    apt-get install -y python3-certbot-dns-cloudflare >/dev/null 2>&1
+}
+
+_install_certbot_dns_cf_snap() {
+    install_package "snapd" "silent" || return 1
+    if ! snap list certbot &>/dev/null; then
+        snap install --classic certbot >/dev/null 2>&1 || return 1
+        ln -sf /snap/bin/certbot /usr/bin/certbot
+    fi
+    snap install certbot-dns-cloudflare >/dev/null 2>&1 || return 1
+    snap connect certbot:plugin certbot-dns-cloudflare >/dev/null 2>&1 || true
+}
+
+_install_certbot_dns_cf() {
+    if _install_certbot_dns_cf_apt; then
+        certbot plugins 2>/dev/null | grep -q dns-cloudflare && return 0
+    fi
+    print_warn "apt 安装插件失败，降级使用 snap..."
+    _install_certbot_dns_cf_snap
+}
+
+_install_nginx() {
+    update_apt_cache
+    apt-get install -y nginx >/dev/null 2>&1 || return 1
+    is_systemd && systemctl enable --now nginx >/dev/null 2>&1 || true
+}
+
+_check_certbot_dns_cf() {
+    command_exists certbot || return 1
+    certbot plugins 2>/dev/null | grep -q dns-cloudflare
+}
+
+_check_nginx_dirs() {
+    [[ -d /etc/nginx/sites-available && -d /etc/nginx/sites-enabled ]]
+}
+
 web_env_check() {
+    # === OpenWrt 精简模式 ===
     if [[ "$PLATFORM" == "openwrt" ]]; then
-                for pkg in jq curl openssl-util ca-bundle; do
+        for pkg in jq curl openssl-util ca-bundle; do
             if ! opkg list-installed 2>/dev/null | grep -q "^${pkg} "; then
                 opkg update >/dev/null 2>&1
                 opkg install "$pkg" >/dev/null 2>&1 || true
@@ -1855,31 +2012,92 @@ web_env_check() {
         chmod 700 "$CONFIG_DIR"
         return 0
     fi
-    command_exists jq || install_package "jq"
-    command_exists nginx || install_package "nginx"
-    is_systemd && (systemctl enable --now nginx >/dev/null 2>&1 || true)
-    
-    if ! command_exists certbot; then
-        print_info "安装 Certbot..."
-        update_apt_cache
-        if ! apt-get install -y certbot python3-certbot-dns-cloudflare >/dev/null 2>&1; then
-            print_warn "Apt 安装失败，尝试 Snap..."
-            install_package "snapd" "silent" || true
-            if command_exists snap; then
-                snap install --classic certbot || return 1
-                snap install certbot-dns-cloudflare || return 1
-                snap connect certbot:plugin certbot-dns-cloudflare
-                ln -sf /snap/bin/certbot /usr/bin/certbot
-            else
-                print_error "Certbot 安装失败。"
+
+    # === Debian/Ubuntu 完整自检 ===
+    echo ""
+    print_info "Web 环境依赖自检..."
+    echo ""
+
+    local deps=(
+        "jq|command_exists jq|install_package jq silent"
+        "nginx|command_exists nginx|_install_nginx"
+        "nginx 目录结构|_check_nginx_dirs|mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets"
+        "certbot|command_exists certbot|_install_certbot_apt || _install_certbot_snap"
+        "certbot dns-cloudflare 插件|_check_certbot_dns_cf|_install_certbot_dns_cf"
+    )
+
+    # 第一轮: 检查
+    _web_dep_check_results=()
+    local need_fix=0
+
+    for dep in "${deps[@]}"; do
+        IFS='|' read -r name check_cmd install_func <<< "$dep"
+        if ! _web_dep_verify "$name" "$check_cmd"; then
+            need_fix=1
+        fi
+    done
+
+    echo -e "${C_CYAN}依赖检查结果:${C_RESET}"
+    for r in "${_web_dep_check_results[@]}"; do
+        echo -e "  $r"
+    done
+    echo ""
+
+    # 第二轮: 修复
+    if [[ $need_fix -eq 1 ]]; then
+        print_warn "检测到缺失依赖，正在自动修复..."
+        echo ""
+
+        local fix_failed=0
+        for dep in "${deps[@]}"; do
+            IFS='|' read -r name check_cmd install_func <<< "$dep"
+            if ! _web_dep_fix "$name" "$check_cmd" "$install_func"; then
+                fix_failed=1
+            fi
+        done
+
+        echo ""
+
+        # 第三轮: 最终验证
+        if [[ $fix_failed -eq 1 ]]; then
+            print_error "部分依赖修复失败，最终验证:"
+            local final_ok=1
+            for dep in "${deps[@]}"; do
+                IFS='|' read -r name check_cmd install_func <<< "$dep"
+                if eval "$check_cmd" >/dev/null 2>&1; then
+                    echo -e "  ${C_GREEN}✓${C_RESET} $name"
+                else
+                    echo -e "  ${C_RED}✗${C_RESET} $name"
+                    final_ok=0
+                fi
+            done
+            echo ""
+            if [[ $final_ok -eq 0 ]]; then
+                print_error "关键依赖缺失，无法继续。请手动修复后重试。"
+                echo ""
+                echo "手动修复参考:"
+                echo "  apt-get update"
+                echo "  apt-get install -y certbot python3-certbot-dns-cloudflare nginx jq"
+                echo ""
+                echo "或使用 snap:"
+                echo "  snap install --classic certbot"
+                echo "  snap install certbot-dns-cloudflare"
+                echo "  snap connect certbot:plugin certbot-dns-cloudflare"
                 return 1
             fi
         fi
+
+        print_success "所有依赖已就绪"
+    else
+        print_success "所有依赖检查通过"
     fi
-    
+
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets
     mkdir -p "$CONFIG_DIR"
     chmod 700 "$CONFIG_DIR"
+
+    echo ""
+    return 0
 }
 
 # ============================================================
