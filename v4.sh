@@ -1962,10 +1962,17 @@ _install_certbot_dns_cf_snap() {
 }
 
 _install_certbot_dns_cf() {
-    if _install_certbot_dns_cf_apt; then
-        certbot plugins 2>/dev/null | grep -q dns-cloudflare && return 0
+    # 先尝试 apt 安装
+    _install_certbot_dns_cf_apt || true
+
+    # 检查 apt 装的版本是否可用（版本号 >= 1.0）
+    if _check_certbot_dns_cf; then
+        return 0
     fi
-    print_warn "apt 安装插件失败，降级使用 snap..."
+
+    # apt 版本不可用（如 20.04 的 0.39），切换 snap
+    print_warn "apt 版本不兼容，切换 snap 安装..."
+    apt-get remove -y certbot python3-certbot-dns-cloudflare 2>/dev/null || true
     _install_certbot_dns_cf_snap
 }
 
@@ -1977,7 +1984,14 @@ _install_nginx() {
 
 _check_certbot_dns_cf() {
     command_exists certbot || return 1
-    certbot plugins 2>/dev/null | grep -q dns-cloudflare
+    certbot plugins 2>/dev/null | grep -q dns-cloudflare || return 1
+    # Ubuntu 20.04: certbot-dns-cloudflare 0.39 与 cloudflare 2.1 不兼容
+    local cb_ver=$(certbot --version 2>&1 | grep -oP '[\d.]+')
+    if [[ "${cb_ver%%.*}" == "0" ]]; then
+        print_warn "certbot $cb_ver 版本过旧，不支持 API Token"
+        return 1
+    fi
+    return 0
 }
 
 _check_nginx_dirs() {
