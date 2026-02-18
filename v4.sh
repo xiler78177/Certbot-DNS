@@ -1047,9 +1047,10 @@ menu_ufw() {
 
 f2b_setup() {
     print_title "Fail2ban 安装与配置"
+    
+    # ========== 依赖安装 ==========
     install_package "fail2ban" "silent"
     install_package "rsyslog" "silent"
-    install_package "ipset" "silent"
     
     local backend="auto"
     if is_systemd; then
@@ -1057,6 +1058,84 @@ f2b_setup() {
         systemctl restart rsyslog || true
         backend="systemd"
     fi
+
+    # ========== 封禁后端自检 ==========
+    # Fail2ban 本身只负责监控日志和判定，实际封禁 IP 需要底层防火墙工具
+    # 支持链路: nftables > iptables+ipset > iptables-multiport > 不可用
+    print_info "正在检测封禁后端..."
+    
+    local banaction=""
+    local ban_backend_info=""
+    
+    # 优先级 1: nftables (Debian 11+/Ubuntu 22.04+ 默认)
+    if command_exists nft && nft list ruleset &>/dev/null 2>&1; then
+        banaction="nftables-allports"
+        ban_backend_info="nftables (原生内核防火墙)"
+        print_success "检测到 nftables - 使用 nftables-allports"
+    fi
+    
+    # 优先级 2: iptables + ipset (传统方案，高性能)
+    if [[ -z "$banaction" ]] && command_exists iptables; then
+        # iptables 存在，尝试安装 ipset 配合使用
+        if ! command_exists ipset; then
+            print_info "正在安装 ipset (高性能封禁集合)..."
+            install_package "ipset" "silent"
+        fi
+        if command_exists ipset; then
+            # 验证 ipset 能否正常创建/销毁测试集合
+            if ipset create _f2b_test hash:ip timeout 1 &>/dev/null; then
+                ipset destroy _f2b_test &>/dev/null
+                banaction="iptables-ipset-proto6-allports"
+                ban_backend_info="iptables + ipset (高性能集合)"
+                print_success "检测到 iptables + ipset"
+            else
+                # ipset 命令存在但无法使用 (可能是内核模块问题)
+                print_warn "ipset 命令存在但无法正常工作，回退到 iptables-multiport"
+                banaction="iptables-multiport"
+                ban_backend_info="iptables-multiport (逐条规则)"
+            fi
+        else
+            # ipset 安装失败，使用 iptables 基础模式
+            banaction="iptables-multiport"
+            ban_backend_info="iptables-multiport (逐条规则，无 ipset)"
+            print_warn "ipset 不可用，回退到 iptables-multiport"
+        fi
+    fi
+    
+    # 优先级 3: 如果 iptables 也不存在，尝试安装
+    if [[ -z "$banaction" ]]; then
+        print_warn "未检测到 nftables 或 iptables!"
+        print_info "尝试安装 iptables..."
+        install_package "iptables" "silent"
+        
+        if command_exists iptables; then
+            install_package "ipset" "silent"
+            if command_exists ipset && ipset create _f2b_test hash:ip timeout 1 &>/dev/null 2>&1; then
+                ipset destroy _f2b_test &>/dev/null
+                banaction="iptables-ipset-proto6-allports"
+                ban_backend_info="iptables + ipset (新安装)"
+            else
+                banaction="iptables-multiport"
+                ban_backend_info="iptables-multiport (新安装)"
+            fi
+            print_success "iptables 安装成功"
+        else
+            # 全部失败 - 中止
+            echo ""
+            print_error "无法找到或安装任何可用的封禁后端!"
+            echo ""
+            echo -e "  Fail2ban 需要以下工具之一来执行 IP 封禁:"
+            echo -e "  ${C_CYAN}1.${C_RESET} nftables    (Debian 11+/Ubuntu 22.04+ 推荐)"
+            echo -e "  ${C_CYAN}2.${C_RESET} iptables    (传统方案，搭配 ipset 更佳)"
+            echo ""
+            echo -e "  请手动安装后重试: ${C_GREEN}apt install -y iptables ipset${C_RESET}"
+            echo -e "  或: ${C_GREEN}apt install -y nftables${C_RESET}"
+            pause; return 1
+        fi
+    fi
+    
+    echo ""
+
     read -e -r -p "监控 SSH 端口 [$CURRENT_SSH_PORT]: " port
     port=${port:-$CURRENT_SSH_PORT}
     if ! validate_port "$port"; then
@@ -1137,7 +1216,7 @@ f2b_setup() {
     echo "  最大重试:     $maxretry 次"
     echo "  检测窗口:     $findtime"
     echo "  封禁时间:     $bantime"
-    echo "  封禁方式:     自动检测 (iptables-ipset 或 nftables)"
+    echo "  封禁方式:     $ban_backend_info"
     [[ "$bantime" == "-1" ]] && echo -e "  ${C_YELLOW}提示: 永久封禁建议定期检查规则数量${C_RESET}"
     draw_line
     
@@ -1160,14 +1239,6 @@ f2b_setup() {
         fi
     fi
 
-        # 自动检测 nftables 环境，选择合适的 banaction
-    local banaction="iptables-ipset-proto6-allports"
-    if command_exists nft && nft list ruleset &>/dev/null 2>&1; then
-        if ! command_exists iptables || iptables -V 2>&1 | grep -qi "nf_tables"; then
-            banaction="nftables-allports"
-            print_info "检测到 nftables 环境，使用 nftables-allports"
-        fi
-    fi
 
     local conf_content="[DEFAULT]
 bantime = $bantime
