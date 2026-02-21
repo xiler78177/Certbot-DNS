@@ -8352,8 +8352,11 @@ MESHWD_TAIL
             local remote_script=$(mktemp)
             # 复用主体，替换路由段
             sed "s|^EXPECTED_LANS=.*|EXPECTED_LANS=\"${remote_lans}\"|" "$watchdog_script" > "$remote_script"
+            # 确保目标目录存在
+            ssh $ssh_opts "$ssh_target" "mkdir -p /usr/local/bin" 2>/dev/null
             if scp ${_cm:+-o ControlPath=${_cm}} -P "${ssh_port}" -o StrictHostKeyChecking=accept-new \
-                "$remote_script" "${ssh_target}:/usr/local/bin/wg-mesh-watchdog.sh" 2>/dev/null; then
+                "$remote_script" "${ssh_target}:/usr/local/bin/wg-mesh-watchdog.sh" 2>/dev/null || \
+                ssh $ssh_opts "$ssh_target" "cat > /usr/local/bin/wg-mesh-watchdog.sh" < "$remote_script" 2>/dev/null; then
                 ssh $ssh_opts "$ssh_target" "
                     chmod +x /usr/local/bin/wg-mesh-watchdog.sh
                     (crontab -l 2>/dev/null | grep -v wg-mesh-watchdog; echo '* * * * * /usr/local/bin/wg-mesh-watchdog.sh >/dev/null 2>&1') | crontab -
