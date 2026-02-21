@@ -8422,14 +8422,19 @@ wg_cluster_deploy_node() {
     ' 2>/dev/null)
     # 提取远程系统类型 (用于后续步骤分支判断)
     local remote_os=""
-    if echo "$install_result" | grep -qoP ':(openwrt|ubuntu|debian|centos|rhel|rocky|alma|fedora|alpine)'; then
-        remote_os=$(echo "$install_result" | grep -oP ':(openwrt|ubuntu|debian|centos|rhel|rocky|alma|fedora|alpine)' | tail -1 | tr -d ':')
-    fi
+    case "$install_result" in
+        *:openwrt*)  remote_os="openwrt" ;;
+        *:ubuntu*|*:debian*) remote_os="debian" ;;
+        *:centos*|*:rhel*|*:rocky*|*:alma*) remote_os="rhel" ;;
+        *:fedora*)   remote_os="fedora" ;;
+        *:alpine*)   remote_os="alpine" ;;
+    esac
     case "$install_result" in
         *ALREADY_INSTALLED*) print_success "WireGuard 已安装 (跳过)" ;;
         *INSTALL_OK*) print_success "WireGuard 安装成功" ;;
         *UNSUPPORTED_OS*)
-            print_error "不支持的远程系统: $(echo "$install_result" | grep -oP 'UNSUPPORTED_OS:\K.*')"
+            local unsup_os="${install_result##*UNSUPPORTED_OS:}"
+            print_error "不支持的远程系统: $unsup_os"
             pause; return 1 ;;
         *)
             print_error "WireGuard 安装失败"
