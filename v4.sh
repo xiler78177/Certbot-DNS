@@ -8382,7 +8382,7 @@ wg_cluster_deploy_node() {
 
         # 检查是否已安装
         if command -v wg >/dev/null 2>&1; then
-            echo "ALREADY_INSTALLED"
+            echo "ALREADY_INSTALLED:$OS_ID"
             exit 0
         fi
         case "$OS_ID" in
@@ -8408,15 +8408,23 @@ wg_cluster_deploy_node() {
                 ;;
             openwrt)
                 opkg update >/dev/null 2>&1
-                opkg install wireguard-tools >/dev/null 2>&1
+                if ! lsmod | grep -q wireguard; then
+                    opkg install kmod-wireguard >/dev/null 2>&1 || true
+                fi
+                opkg install wireguard-tools luci-proto-wireguard >/dev/null 2>&1
                 ;;
             *)
                 echo "UNSUPPORTED_OS:$OS_ID"
                 exit 1
                 ;;
         esac
-        command -v wg >/dev/null 2>&1 && echo "INSTALL_OK" || echo "INSTALL_FAIL"
+        command -v wg >/dev/null 2>&1 && echo "INSTALL_OK:$OS_ID" || echo "INSTALL_FAIL"
     ' 2>/dev/null)
+    # 提取远程系统类型 (用于后续步骤分支判断)
+    local remote_os=""
+    if echo "$install_result" | grep -qoP ':(openwrt|ubuntu|debian|centos|rhel|rocky|alma|fedora|alpine)'; then
+        remote_os=$(echo "$install_result" | grep -oP ':(openwrt|ubuntu|debian|centos|rhel|rocky|alma|fedora|alpine)' | tail -1 | tr -d ':')
+    fi
     case "$install_result" in
         *ALREADY_INSTALLED*) print_success "WireGuard 已安装 (跳过)" ;;
         *INSTALL_OK*) print_success "WireGuard 安装成功" ;;
@@ -8428,16 +8436,22 @@ wg_cluster_deploy_node() {
             echo "  远程输出: $install_result"
             pause; return 1 ;;
     esac
+    [[ "$remote_os" == "openwrt" ]] && print_info "检测到远程节点为 OpenWrt，将使用 uci 部署方式"
 
     # ── Step 3: 开启 IP 转发 ──
     print_info "[3/6] 配置 IP 转发..."
-    ssh $ssh_opts "$ssh_target" '
-        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-        grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || {
-            sed -i "/net.ipv4.ip_forward/d" /etc/sysctl.conf 2>/dev/null
-            echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-        }
-    ' 2>/dev/null
+    if [[ "$remote_os" == "openwrt" ]]; then
+        # OpenWrt 作为路由器默认已开启 IP 转发，确认即可
+        ssh $ssh_opts "$ssh_target" 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true' 2>/dev/null
+    else
+        ssh $ssh_opts "$ssh_target" '
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+            grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || {
+                sed -i "/net.ipv4.ip_forward/d" /etc/sysctl.conf 2>/dev/null
+                echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+            }
+        ' 2>/dev/null
+    fi
     print_success "IP 转发已开启"
 
     # ── Step 4: 生成新节点独立密钥并上传 wg0.conf ──
@@ -8477,8 +8491,76 @@ wg_cluster_deploy_node() {
         fi
         pi=$((pi+1))
     done
-    local tmp_conf=$(mktemp)
-    cat > "$tmp_conf" << WGCONF_EOF
+
+    if [[ "$remote_os" == "openwrt" ]]; then
+        # ── OpenWrt: 通过 uci 命令配置 WireGuard 接口 ──
+        # 构建 uci peers 命令
+        local uci_peers_cmds=""
+        pi=0
+        local peer_idx=0
+        while [[ $pi -lt $pc ]]; do
+            if [[ "$(wg_db_get ".peers[$pi].enabled")" == "true" ]]; then
+                local p_name=$(wg_db_get ".peers[$pi].name")
+                local p_pubkey=$(wg_db_get ".peers[$pi].public_key")
+                local p_psk=$(wg_db_get ".peers[$pi].preshared_key")
+                local p_ip=$(wg_db_get ".peers[$pi].ip")
+                local p_is_gw=$(wg_db_get ".peers[$pi].is_gateway // false")
+                local p_lan=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+                local peer_section="wg_peer${peer_idx}"
+                uci_peers_cmds+="uci set network.${peer_section}=wireguard_wg0
+uci set network.${peer_section}.description='${p_name}'
+uci set network.${peer_section}.public_key='${p_pubkey}'
+uci set network.${peer_section}.preshared_key='${p_psk}'
+uci delete network.${peer_section}.allowed_ips 2>/dev/null; true
+uci add_list network.${peer_section}.allowed_ips='${p_ip}/32'
+"
+                if [[ "$p_is_gw" == "true" && -n "$p_lan" ]]; then
+                    local IFS_BAK="$IFS"
+                    IFS=','
+                    for cidr in $p_lan; do
+                        cidr=$(echo "$cidr" | xargs)
+                        [[ -n "$cidr" ]] && uci_peers_cmds+="uci add_list network.${peer_section}.allowed_ips='${cidr}'
+"
+                    done
+                    IFS="$IFS_BAK"
+                fi
+                uci_peers_cmds+="uci set network.${peer_section}.route_allowed_ips='1'
+uci set network.${peer_section}.persistent_keepalive='25'
+"
+                peer_idx=$((peer_idx+1))
+            fi
+            pi=$((pi+1))
+        done
+
+        local uci_result
+        uci_result=$(ssh $ssh_opts "$ssh_target" "
+            # 清理旧配置
+            uci delete network.wg0 2>/dev/null; true
+            uci commit network 2>/dev/null; true
+            ifdown wg0 2>/dev/null; true
+            # 创建 WireGuard 接口
+            uci set network.wg0=interface
+            uci set network.wg0.proto='wireguard'
+            uci set network.wg0.private_key='${node_privkey}'
+            uci set network.wg0.listen_port='${node_port}'
+            uci delete network.wg0.addresses 2>/dev/null; true
+            uci add_list network.wg0.addresses='${node_ip}/${mask}'
+            # 添加 peers
+            ${uci_peers_cmds}
+            uci commit network
+            echo 'UCI_OK'
+        " 2>/dev/null)
+        if [[ "$uci_result" == *"UCI_OK"* ]]; then
+            print_success "uci 配置已写入"
+        else
+            print_error "uci 配置写入失败"
+            echo "  远程输出: $uci_result"
+            pause; return 1
+        fi
+    else
+        # ── 标准 Linux: 生成 wg-quick 配置文件 ──
+        local tmp_conf=$(mktemp)
+        cat > "$tmp_conf" << WGCONF_EOF
 [Interface]
 PrivateKey = ${node_privkey}
 Address = ${node_ip}/${mask}
@@ -8487,14 +8569,15 @@ PostUp = IFACE=\$(ip route show default | awk '{print \$5; exit}'); iptables -I 
 PostDown = IFACE=\$(ip route show default | awk '{print \$5; exit}'); iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s ${server_subnet} -o \$IFACE -j MASQUERADE
 $(printf '%b' "$peers_block")
 WGCONF_EOF
-    if scp -o ControlPath="${cm_socket}" -P "${node_ssh_port}" -o StrictHostKeyChecking=accept-new \
-        "$tmp_conf" "${ssh_target}:/etc/wireguard/wg0.conf" 2>/dev/null; then
-        print_success "配置已上传"
-    else
-        print_error "配置上传失败"
-        rm -f "$tmp_conf"; pause; return 1
+        if scp -o ControlPath="${cm_socket}" -P "${node_ssh_port}" -o StrictHostKeyChecking=accept-new \
+            "$tmp_conf" "${ssh_target}:/etc/wireguard/wg0.conf" 2>/dev/null; then
+            print_success "配置已上传"
+        else
+            print_error "配置上传失败"
+            rm -f "$tmp_conf"; pause; return 1
+        fi
+        rm -f "$tmp_conf"
     fi
-    rm -f "$tmp_conf"
     # ── Step 5: 启动 WG + 防火墙 + 创建数据库 ──
     print_info "[5/6] 启动 WireGuard 并初始化数据库..."
 
@@ -8563,20 +8646,64 @@ WGCONF_EOF
     echo "$backup_db_content" > "$tmp_db"
 
     local start_result
-    start_result=$(ssh $ssh_opts "$ssh_target" "
-        chmod 600 /etc/wireguard/wg0.conf
-        # 停止旧实例
-        ip link show wg0 &>/dev/null && wg-quick down wg0 2>/dev/null || true
-        # 启动
-        wg-quick up wg0 2>/dev/null
-        systemctl enable wg-quick@wg0 2>/dev/null || true
-        # 防火墙
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-            ufw allow ${node_port}/udp comment 'WireGuard' >/dev/null 2>&1
-        fi
-        # 验证
-        ip link show wg0 &>/dev/null && echo 'WG_UP' || echo 'WG_DOWN'
-    " 2>/dev/null)
+    if [[ "$remote_os" == "openwrt" ]]; then
+        # ── OpenWrt: 配置防火墙 zone + 启动接口 ──
+        start_result=$(ssh $ssh_opts "$ssh_target" "
+            # 清理旧防火墙配置
+            uci delete firewall.wg_zone 2>/dev/null; true
+            uci delete firewall.wg_fwd_lan 2>/dev/null; true
+            uci delete firewall.wg_fwd_wg 2>/dev/null; true
+            uci delete firewall.wg_allow 2>/dev/null; true
+            # 防火墙 zone
+            uci set firewall.wg_zone=zone
+            uci set firewall.wg_zone.name='wg'
+            uci set firewall.wg_zone.input='ACCEPT'
+            uci set firewall.wg_zone.output='ACCEPT'
+            uci set firewall.wg_zone.forward='ACCEPT'
+            uci set firewall.wg_zone.masq='1'
+            uci add_list firewall.wg_zone.network='wg0'
+            # LAN <-> WG 转发
+            uci set firewall.wg_fwd_lan=forwarding
+            uci set firewall.wg_fwd_lan.src='lan'
+            uci set firewall.wg_fwd_lan.dest='wg'
+            uci set firewall.wg_fwd_wg=forwarding
+            uci set firewall.wg_fwd_wg.src='wg'
+            uci set firewall.wg_fwd_wg.dest='lan'
+            # 允许 WAN 入站 WireGuard 端口
+            uci set firewall.wg_allow=rule
+            uci set firewall.wg_allow.name='Allow-WireGuard'
+            uci set firewall.wg_allow.src='wan'
+            uci set firewall.wg_allow.dest_port='${node_port}'
+            uci set firewall.wg_allow.proto='udp'
+            uci set firewall.wg_allow.target='ACCEPT'
+            uci commit firewall
+            /etc/init.d/firewall reload 2>/dev/null || true
+            # 启动 WireGuard 接口
+            ifdown wg0 2>/dev/null; true
+            /etc/init.d/network reload 2>/dev/null
+            sleep 2
+            ifup wg0 2>/dev/null
+            sleep 2
+            # 验证
+            ip link show wg0 &>/dev/null && echo 'WG_UP' || echo 'WG_DOWN'
+        " 2>/dev/null)
+    else
+        # ── 标准 Linux: wg-quick + systemctl + ufw ──
+        start_result=$(ssh $ssh_opts "$ssh_target" "
+            chmod 600 /etc/wireguard/wg0.conf
+            # 停止旧实例
+            ip link show wg0 &>/dev/null && wg-quick down wg0 2>/dev/null || true
+            # 启动
+            wg-quick up wg0 2>/dev/null
+            systemctl enable wg-quick@wg0 2>/dev/null || true
+            # 防火墙
+            if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+                ufw allow ${node_port}/udp comment 'WireGuard' >/dev/null 2>&1
+            fi
+            # 验证
+            ip link show wg0 &>/dev/null && echo 'WG_UP' || echo 'WG_DOWN'
+        " 2>/dev/null)
+    fi
 
     if [[ "$start_result" == *"WG_UP"* ]]; then
         print_success "WireGuard 已启动"
@@ -8597,7 +8724,11 @@ WGCONF_EOF
         fi
     else
         print_error "WireGuard 启动失败"
-        echo "  请 SSH 到节点检查: journalctl -u wg-quick@wg0"
+        if [[ "$remote_os" == "openwrt" ]]; then
+            echo "  请 SSH 到节点检查: wg show; logread | grep -i wireguard"
+        else
+            echo "  请 SSH 到节点检查: journalctl -u wg-quick@wg0"
+        fi
     fi
     rm -f "$tmp_db"
 
@@ -9113,13 +9244,81 @@ wg_cluster_mesh_setup() {
         local tmp_conf=$(mktemp)
         printf '%b' "$mesh_conf" > "$tmp_conf"
         if [[ $idx -eq 0 ]]; then
-            cp "$tmp_conf" "/etc/wireguard/${mesh_iface}.conf"
-            chmod 600 "/etc/wireguard/${mesh_iface}.conf"
-            ip link show "$mesh_iface" &>/dev/null && wg-quick down "$mesh_iface" 2>/dev/null
-            wg-quick up "$mesh_iface" 2>/dev/null
-            systemctl enable "wg-quick@${mesh_iface}" 2>/dev/null || true
-            if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-                ufw allow "${mesh_port}/udp" comment "WG-Mesh" >/dev/null 2>&1
+            if [[ "$PLATFORM" == "openwrt" ]]; then
+                # ── 本地节点是 OpenWrt: 使用 uci 配置 Mesh ──
+                uci delete network.${mesh_iface} 2>/dev/null; true
+                uci set network.${mesh_iface}=interface
+                uci set network.${mesh_iface}.proto='wireguard'
+                uci set network.${mesh_iface}.private_key="${mesh_privkeys[$idx]}"
+                uci set network.${mesh_iface}.listen_port="${mesh_port}"
+                uci delete network.${mesh_iface}.addresses 2>/dev/null; true
+                uci add_list network.${mesh_iface}.addresses="${node_ips[$idx]}/32"
+                # 添加 mesh peers
+                local mj=0
+                local mesh_peer_idx=0
+                while [[ $mj -lt $total ]]; do
+                    if [[ $idx -ne $mj ]]; then
+                        local mpa=$idx mpb=$mj
+                        [[ $mpa -gt $mpb ]] && { mpa=$mj; mpb=$idx; }
+                        local mpsk=$(_mesh_get_psk "${mpa}_${mpb}")
+                        local msection="mesh_peer${mesh_peer_idx}"
+                        local remote_mp=$((${node_ports[$mj]} + 1))
+                        uci set network.${msection}=wireguard_${mesh_iface}
+                        uci set network.${msection}.description="${node_names[$mj]}"
+                        uci set network.${msection}.public_key="${mesh_pubkeys[$mj]}"
+                        uci set network.${msection}.preshared_key="${mpsk}"
+                        uci delete network.${msection}.allowed_ips 2>/dev/null; true
+                        uci add_list network.${msection}.allowed_ips="${node_ips[$mj]}/32"
+                        [[ -n "${node_lans[$mj]}" ]] && uci add_list network.${msection}.allowed_ips="${node_lans[$mj]}"
+                        uci set network.${msection}.endpoint_host="${node_eps[$mj]}"
+                        uci set network.${msection}.endpoint_port="${remote_mp}"
+                        uci set network.${msection}.persistent_keepalive='25'
+                        uci set network.${msection}.route_allowed_ips='1'
+                        mesh_peer_idx=$((mesh_peer_idx+1))
+                    fi
+                    mj=$((mj+1))
+                done
+                # Mesh 防火墙 zone
+                uci delete firewall.mesh_zone 2>/dev/null; true
+                uci delete firewall.mesh_fwd_lan 2>/dev/null; true
+                uci delete firewall.mesh_fwd_mesh 2>/dev/null; true
+                uci delete firewall.mesh_allow 2>/dev/null; true
+                uci set firewall.mesh_zone=zone
+                uci set firewall.mesh_zone.name='mesh'
+                uci set firewall.mesh_zone.input='ACCEPT'
+                uci set firewall.mesh_zone.output='ACCEPT'
+                uci set firewall.mesh_zone.forward='ACCEPT'
+                uci set firewall.mesh_zone.masq='1'
+                uci add_list firewall.mesh_zone.network="${mesh_iface}"
+                uci set firewall.mesh_fwd_lan=forwarding
+                uci set firewall.mesh_fwd_lan.src='lan'
+                uci set firewall.mesh_fwd_lan.dest='mesh'
+                uci set firewall.mesh_fwd_mesh=forwarding
+                uci set firewall.mesh_fwd_mesh.src='mesh'
+                uci set firewall.mesh_fwd_mesh.dest='lan'
+                uci set firewall.mesh_allow=rule
+                uci set firewall.mesh_allow.name='Allow-WG-Mesh'
+                uci set firewall.mesh_allow.src='wan'
+                uci set firewall.mesh_allow.dest_port="${mesh_port}"
+                uci set firewall.mesh_allow.proto='udp'
+                uci set firewall.mesh_allow.target='ACCEPT'
+                uci commit network
+                uci commit firewall
+                /etc/init.d/firewall reload 2>/dev/null || true
+                ifdown "${mesh_iface}" 2>/dev/null; true
+                /etc/init.d/network reload 2>/dev/null
+                sleep 2
+                ifup "${mesh_iface}" 2>/dev/null
+            else
+                # ── 本地节点是标准 Linux ──
+                cp "$tmp_conf" "/etc/wireguard/${mesh_iface}.conf"
+                chmod 600 "/etc/wireguard/${mesh_iface}.conf"
+                ip link show "$mesh_iface" &>/dev/null && wg-quick down "$mesh_iface" 2>/dev/null
+                wg-quick up "$mesh_iface" 2>/dev/null
+                systemctl enable "wg-quick@${mesh_iface}" 2>/dev/null || true
+                if command_exists ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+                    ufw allow "${mesh_port}/udp" comment "WG-Mesh" >/dev/null 2>&1
+                fi
             fi
             print_success "${node_names[$idx]}: Mesh 已部署 (本地, 端口 ${mesh_port}/udp)"
         else
@@ -9130,20 +9329,108 @@ wg_cluster_mesh_setup() {
                 local ssh_opts=$(wg_ssh_opts "${node_ssh_ports[$idx]}")
             fi
             local ssh_target="${node_ssh_users[$idx]}@${node_ssh_hosts[$idx]}"
-            if scp ${_cm_sock:+-o ControlPath=${_cm_sock}} -P "${node_ssh_ports[$idx]}" -o StrictHostKeyChecking=accept-new \
-                "$tmp_conf" "${ssh_target}:/etc/wireguard/${mesh_iface}.conf" 2>/dev/null; then
+
+            # 检测远程节点系统类型
+            local remote_mesh_os=""
+            remote_mesh_os=$(ssh $ssh_opts "$ssh_target" '
+                if [ -f /etc/os-release ]; then . /etc/os-release; echo "$ID"; elif [ -f /etc/openwrt_release ]; then echo "openwrt"; else echo "unknown"; fi
+            ' 2>/dev/null)
+
+            if [[ "$remote_mesh_os" == "openwrt" ]]; then
+                # ── 远程 OpenWrt 节点: 使用 uci 配置 Mesh ──
+                # 构建 uci peers 命令
+                local uci_mesh_peers=""
+                local mj=0
+                local mesh_peer_idx=0
+                while [[ $mj -lt $total ]]; do
+                    if [[ $idx -ne $mj ]]; then
+                        local mpa=$idx mpb=$mj
+                        [[ $mpa -gt $mpb ]] && { mpa=$mj; mpb=$idx; }
+                        local mpsk=$(_mesh_get_psk "${mpa}_${mpb}")
+                        local msection="mesh_peer${mesh_peer_idx}"
+                        local remote_mp=$((${node_ports[$mj]} + 1))
+                        local m_allowed="${node_ips[$mj]}/32"
+                        uci_mesh_peers+="uci set network.${msection}=wireguard_${mesh_iface}
+uci set network.${msection}.description='${node_names[$mj]}'
+uci set network.${msection}.public_key='${mesh_pubkeys[$mj]}'
+uci set network.${msection}.preshared_key='${mpsk}'
+uci delete network.${msection}.allowed_ips 2>/dev/null; true
+uci add_list network.${msection}.allowed_ips='${m_allowed}'
+"
+                        [[ -n "${node_lans[$mj]}" ]] && uci_mesh_peers+="uci add_list network.${msection}.allowed_ips='${node_lans[$mj]}'
+"
+                        uci_mesh_peers+="uci set network.${msection}.endpoint_host='${node_eps[$mj]}'
+uci set network.${msection}.endpoint_port='${remote_mp}'
+uci set network.${msection}.persistent_keepalive='25'
+uci set network.${msection}.route_allowed_ips='1'
+"
+                        mesh_peer_idx=$((mesh_peer_idx+1))
+                    fi
+                    mj=$((mj+1))
+                done
                 ssh $ssh_opts "$ssh_target" "
-                    chmod 600 /etc/wireguard/${mesh_iface}.conf
-                    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-                    ip link show ${mesh_iface} &>/dev/null && wg-quick down ${mesh_iface} 2>/dev/null
-                    wg-quick up ${mesh_iface} 2>/dev/null
-                    systemctl enable wg-quick@${mesh_iface} 2>/dev/null || true
-                    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active' && \
-                        ufw allow ${mesh_port}/udp comment 'WG-Mesh' >/dev/null 2>&1 || true
+                    # 清理旧 Mesh 配置
+                    uci delete network.${mesh_iface} 2>/dev/null; true
+                    uci commit network 2>/dev/null; true
+                    ifdown ${mesh_iface} 2>/dev/null; true
+                    # 创建 Mesh 接口
+                    uci set network.${mesh_iface}=interface
+                    uci set network.${mesh_iface}.proto='wireguard'
+                    uci set network.${mesh_iface}.private_key='${mesh_privkeys[$idx]}'
+                    uci set network.${mesh_iface}.listen_port='${mesh_port}'
+                    uci delete network.${mesh_iface}.addresses 2>/dev/null; true
+                    uci add_list network.${mesh_iface}.addresses='${node_ips[$idx]}/32'
+                    # 添加 Mesh peers
+                    ${uci_mesh_peers}
+                    # Mesh 防火墙
+                    uci delete firewall.mesh_zone 2>/dev/null; true
+                    uci delete firewall.mesh_fwd_lan 2>/dev/null; true
+                    uci delete firewall.mesh_fwd_mesh 2>/dev/null; true
+                    uci delete firewall.mesh_allow 2>/dev/null; true
+                    uci set firewall.mesh_zone=zone
+                    uci set firewall.mesh_zone.name='mesh'
+                    uci set firewall.mesh_zone.input='ACCEPT'
+                    uci set firewall.mesh_zone.output='ACCEPT'
+                    uci set firewall.mesh_zone.forward='ACCEPT'
+                    uci set firewall.mesh_zone.masq='1'
+                    uci add_list firewall.mesh_zone.network='${mesh_iface}'
+                    uci set firewall.mesh_fwd_lan=forwarding
+                    uci set firewall.mesh_fwd_lan.src='lan'
+                    uci set firewall.mesh_fwd_lan.dest='mesh'
+                    uci set firewall.mesh_fwd_mesh=forwarding
+                    uci set firewall.mesh_fwd_mesh.src='mesh'
+                    uci set firewall.mesh_fwd_mesh.dest='lan'
+                    uci set firewall.mesh_allow=rule
+                    uci set firewall.mesh_allow.name='Allow-WG-Mesh'
+                    uci set firewall.mesh_allow.src='wan'
+                    uci set firewall.mesh_allow.dest_port='${mesh_port}'
+                    uci set firewall.mesh_allow.proto='udp'
+                    uci set firewall.mesh_allow.target='ACCEPT'
+                    uci commit network
+                    uci commit firewall
+                    /etc/init.d/firewall reload 2>/dev/null || true
+                    /etc/init.d/network reload 2>/dev/null
+                    sleep 2
+                    ifup ${mesh_iface} 2>/dev/null
                 " 2>/dev/null
-                print_success "${node_names[$idx]}: Mesh 已部署 (SSH, 端口 ${mesh_port}/udp)"
+                print_success "${node_names[$idx]}: Mesh 已部署 (SSH/uci, 端口 ${mesh_port}/udp)"
             else
-                print_error "${node_names[$idx]}: SSH 部署失败"
+                # ── 远程标准 Linux 节点: 使用 wg-quick ──
+                if scp ${_cm_sock:+-o ControlPath=${_cm_sock}} -P "${node_ssh_ports[$idx]}" -o StrictHostKeyChecking=accept-new \
+                    "$tmp_conf" "${ssh_target}:/etc/wireguard/${mesh_iface}.conf" 2>/dev/null; then
+                    ssh $ssh_opts "$ssh_target" "
+                        chmod 600 /etc/wireguard/${mesh_iface}.conf
+                        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+                        ip link show ${mesh_iface} &>/dev/null && wg-quick down ${mesh_iface} 2>/dev/null
+                        wg-quick up ${mesh_iface} 2>/dev/null
+                        systemctl enable wg-quick@${mesh_iface} 2>/dev/null || true
+                        command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active' && \
+                            ufw allow ${mesh_port}/udp comment 'WG-Mesh' >/dev/null 2>&1 || true
+                    " 2>/dev/null
+                    print_success "${node_names[$idx]}: Mesh 已部署 (SSH, 端口 ${mesh_port}/udp)"
+                else
+                    print_error "${node_names[$idx]}: SSH 部署失败"
+                fi
             fi
         fi
         rm -f "$tmp_conf"
