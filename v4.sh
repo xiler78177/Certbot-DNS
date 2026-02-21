@@ -4211,7 +4211,16 @@ wg_db_set() {
     local tmp
     tmp=$(mktemp "${WG_DB_DIR}/.tmp.XXXXXX") || { print_error "无法创建临时文件"; return 1; }
     (
-        flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
+        if [[ "$PLATFORM" == "openwrt" ]]; then
+            local _retry=0
+            while ! flock -n 200 2>/dev/null; do
+                _retry=$((_retry+1))
+                [[ $_retry -ge 10 ]] && { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
+                sleep 0.5
+            done
+        else
+            flock -w 5 200 || { rm -f "$tmp"; print_error "无法获取数据库锁"; return 1; }
+        fi
         if jq "$@" "$WG_DB_FILE" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$WG_DB_FILE"; chmod 600 "$WG_DB_FILE"
         else
@@ -7484,6 +7493,105 @@ wg_setup_watchdog() {
         fi
     fi
 
+    # ── OpenWrt 平台: 生成专用看门狗 (#!/bin/sh + ifup/ifdown) ──
+    if [[ "$PLATFORM" == "openwrt" ]]; then
+        cat > "$watchdog_script" << 'WDEOF_OPENWRT'
+#!/bin/sh
+LOG="logger -t wg-watchdog"
+
+# 检测接口存活
+if ! ifstatus wg0 &>/dev/null; then
+    $LOG "wg0 down, restarting"
+    ifup wg0
+    exit 0
+fi
+
+# 检测 wg show 是否正常
+if ! wg show wg0 &>/dev/null; then
+    $LOG "wg show failed, restarting"
+    ifdown wg0; sleep 1; ifup wg0
+    exit 0
+fi
+WDEOF_OPENWRT
+        if [[ "$role" == "server" ]]; then
+            # 服务端: peer 僵死检测
+            cat >> "$watchdog_script" << 'WDEOF_OWT_SVR'
+
+# 服务端: peer 僵死检测
+STALE_THRESHOLD=600
+PEER_COUNT=$(wg show wg0 dump 2>/dev/null | tail -n +2 | wc -l)
+if [ "$PEER_COUNT" -gt 0 ]; then
+    NOW=$(date +%s)
+    ANY_ALIVE=0
+    wg show wg0 dump 2>/dev/null | tail -n +2 | while IFS='	' read _ _ _ _ LAST_HS _; do
+        [ "$LAST_HS" = "0" ] && continue
+        AGE=$((NOW - LAST_HS))
+        [ "$AGE" -lt "$STALE_THRESHOLD" ] && { ANY_ALIVE=1; break; }
+    done
+    if [ "$ANY_ALIVE" -eq 0 ] 2>/dev/null; then
+        if [ -f /tmp/.wg-watchdog-stale ]; then
+            $LOG "all peers stale 2x, restarting"
+            ifdown wg0; sleep 1; ifup wg0
+            rm -f /tmp/.wg-watchdog-stale
+        else
+            $LOG "all peers stale, flagging"
+            touch /tmp/.wg-watchdog-stale
+        fi
+    else
+        rm -f /tmp/.wg-watchdog-stale 2>/dev/null
+    fi
+fi
+WDEOF_OWT_SVR
+        else
+            # 客户端: DNS 重解析 + ping 保活
+            cat >> "$watchdog_script" << 'WDEOF_OWT_CLI'
+
+# 客户端: DNS 重解析
+EP_HOST=$(uci get network.wg_server.endpoint_host 2>/dev/null)
+echo "$EP_HOST" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && EP_HOST=""
+if [ -n "$EP_HOST" ]; then
+    RESOLVED=$(nslookup "$EP_HOST" 2>/dev/null | awk '/^Address:/{a=$2} END{if(a) print a}')
+    CURRENT=$(wg show wg0 endpoints 2>/dev/null | awk '{print $2}' | cut -d: -f1 | head -1)
+    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CURRENT" ]; then
+        $LOG "DNS changed: $CURRENT -> $RESOLVED"
+        PUB=$(wg show wg0 endpoints | awk '{print $1}' | head -1)
+        PORT=$(uci get network.wg_server.endpoint_port 2>/dev/null)
+        wg set wg0 peer "$PUB" endpoint "${RESOLVED}:${PORT}"
+    fi
+fi
+
+# 客户端: ping 保活
+VIP=$(uci get network.wg_server.allowed_ips 2>/dev/null | awk '{print $1}' | cut -d/ -f1)
+VIP=$(echo "$VIP" | awk -F. '{print $1"."$2"."$3".1"}')
+if [ -n "$VIP" ] && ! ping -c 2 -W 3 "$VIP" &>/dev/null; then
+    if [ -f /tmp/.wg-wd-fail ]; then
+        $LOG "ping $VIP failed twice, restarting"
+        ifdown wg0; sleep 1; ifup wg0
+        rm -f /tmp/.wg-wd-fail
+    else
+        touch /tmp/.wg-wd-fail
+    fi
+else
+    rm -f /tmp/.wg-wd-fail 2>/dev/null
+fi
+WDEOF_OWT_CLI
+        fi
+        chmod +x "$watchdog_script"
+        cron_add_job "wg-watchdog.sh" "* * * * * $watchdog_script >/dev/null 2>&1"
+        echo ""
+        print_success "看门狗已启用 (每分钟检测)"
+        echo -e "  脚本: ${C_CYAN}${watchdog_script}${C_RESET}"
+        echo -e "  角色: ${C_CYAN}${role}${C_RESET}"
+        if [[ "$role" == "server" ]]; then
+            echo "  检测: 接口存活 → wg show → peer 僵死检测"
+        else
+            echo "  检测: 接口存活 → DNS重解析 → ping 保活"
+        fi
+        log_action "WireGuard watchdog enabled (role=$role platform=openwrt)"
+        [[ "$auto_mode" != "true" ]] && pause
+        return 0
+    fi
+
     # 客户端 endpoint 域名
     local endpoint_host=""
     if [[ "$role" == "client" ]]; then
@@ -8369,15 +8477,16 @@ wg_cluster_deploy_node() {
     print_info "[2/6] 安装 WireGuard..."
     local install_result
     install_result=$(ssh $ssh_opts "$ssh_target" '
-        set -e
-        # 检测系统
-        if [ -f /etc/os-release ]; then
+        # 检测系统 (优先检测 openwrt_release，与本地 detect_platform 一致)
+        if [ -f /etc/openwrt_release ]; then
+            OS_ID="openwrt"
+        elif [ -f /etc/os-release ]; then
             . /etc/os-release
             OS_ID="$ID"
-        elif [ -f /etc/openwrt_release ]; then
-            OS_ID="openwrt"
+            # fallback: ID 为空但有 opkg 则视为 openwrt
+            [ -z "$OS_ID" ] && command -v opkg >/dev/null 2>&1 && OS_ID="openwrt"
         else
-            OS_ID="unknown"
+            command -v opkg >/dev/null 2>&1 && OS_ID="openwrt" || OS_ID="unknown"
         fi
 
         # 检查是否已安装
@@ -8429,6 +8538,27 @@ wg_cluster_deploy_node() {
         *:fedora*)   remote_os="fedora" ;;
         *:alpine*)   remote_os="alpine" ;;
     esac
+    # 如果自动检测失败，让用户手动选择
+    if [[ -z "$remote_os" ]]; then
+        print_warn "无法自动检测远程系统类型"
+        echo "  请手动选择远程节点的系统类型:"
+        echo "  1. Debian/Ubuntu"
+        echo "  2. OpenWrt"
+        echo "  3. CentOS/RHEL/Rocky/Alma"
+        echo "  4. Fedora"
+        echo "  5. Alpine"
+        echo "  0. 取消部署"
+        read -e -r -p "选择 [0-5]: " os_choice
+        case "$os_choice" in
+            1) remote_os="debian" ;;
+            2) remote_os="openwrt" ;;
+            3) remote_os="rhel" ;;
+            4) remote_os="fedora" ;;
+            5) remote_os="alpine" ;;
+            *) print_warn "已取消"; pause; return 1 ;;
+        esac
+        print_info "已手动选择: $remote_os"
+    fi
     case "$install_result" in
         *ALREADY_INSTALLED*) print_success "WireGuard 已安装 (跳过)" ;;
         *INSTALL_OK*) print_success "WireGuard 安装成功" ;;
