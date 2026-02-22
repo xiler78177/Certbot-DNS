@@ -5644,6 +5644,19 @@ wg_cluster_sync() {
             local ssh_opts="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${ssh_port}"
         fi
         if ssh $ssh_opts "${ssh_user}@${ssh_host}" "mkdir -p /etc/wireguard" 2>/dev/null; then
+            # 检测远程节点系统类型（优先从 DB 读取，否则 SSH 检测）
+            local remote_os=$(wg_db_get ".cluster.nodes[$i].os // empty")
+            if [[ -z "$remote_os" || "$remote_os" == "null" ]]; then
+                remote_os=$(ssh $ssh_opts "${ssh_user}@${ssh_host}" '
+                    if [ -f /etc/openwrt_release ]; then echo "openwrt"
+                    elif [ -f /etc/os-release ]; then . /etc/os-release; echo "$ID"
+                    else echo "unknown"; fi
+                ' 2>/dev/null)
+                # 回写 DB 缓存
+                [[ -n "$remote_os" && "$remote_os" != "null" ]] && \
+                    wg_db_set --argjson idx "$i" --arg os "$remote_os" '.cluster.nodes[$idx].os = $os' 2>/dev/null || true
+            fi
+
             # 读取目标节点自己的私钥（各节点保留独立密钥，避免 FlClash 会话冲突）
             local target_privkey
             target_privkey=$(ssh $ssh_opts "${ssh_user}@${ssh_host}" \
@@ -5652,6 +5665,11 @@ wg_cluster_sync() {
             if [[ -z "$target_privkey" || "$target_privkey" == "null" ]]; then
                 target_privkey=$(ssh $ssh_opts "${ssh_user}@${ssh_host}" \
                     "grep -m1 '^PrivateKey' /etc/wireguard/wg0.conf 2>/dev/null | awk '{print \$3}'" 2>/dev/null)
+            fi
+            # OpenWrt: 从 uci 读取私钥
+            if [[ -z "$target_privkey" || "$target_privkey" == "null" ]] && [[ "$remote_os" == "openwrt" ]]; then
+                target_privkey=$(ssh $ssh_opts "${ssh_user}@${ssh_host}" \
+                    "uci get network.wg0.private_key 2>/dev/null" 2>/dev/null)
             fi
             # 最终回退到主机密钥（兼容极端情况）
             [[ -z "$target_privkey" || "$target_privkey" == "null" ]] && \
@@ -5663,9 +5681,79 @@ wg_cluster_sync() {
                 node_pubkey_sync=$(printf '%s' "$target_privkey" | wg pubkey 2>/dev/null || echo "$server_pubkey")
             fi
 
-            # 生成完整配置（使用目标节点自己的私钥）
-            local tmp_conf=$(mktemp)
-            cat > "$tmp_conf" << WGCONF_EOF
+            # ── 部署 WireGuard 配置 ──
+            local sync_ok="false"
+            if [[ "$remote_os" == "openwrt" ]]; then
+                # ── OpenWrt: 通过 uci 配置 ──
+                local uci_peers_cmds=""
+                pi=0
+                local peer_idx=0
+                while [[ $pi -lt $pc ]]; do
+                    if [[ "$(wg_db_get ".peers[$pi].enabled")" == "true" ]]; then
+                        local p_name=$(wg_db_get ".peers[$pi].name")
+                        local p_pubkey=$(wg_db_get ".peers[$pi].public_key")
+                        local p_psk=$(wg_db_get ".peers[$pi].preshared_key")
+                        local p_ip=$(wg_db_get ".peers[$pi].ip")
+                        local p_is_gw=$(wg_db_get ".peers[$pi].is_gateway // false")
+                        local p_lan=$(wg_db_get ".peers[$pi].lan_subnets // empty")
+                        local peer_section="wg_peer${peer_idx}"
+                        uci_peers_cmds+="uci set network.${peer_section}=wireguard_wg0
+uci set network.${peer_section}.description='${p_name}'
+uci set network.${peer_section}.public_key='${p_pubkey}'
+uci set network.${peer_section}.preshared_key='${p_psk}'
+uci delete network.${peer_section}.allowed_ips 2>/dev/null; true
+uci add_list network.${peer_section}.allowed_ips='${p_ip}/32'
+"
+                        if [[ "$p_is_gw" == "true" && -n "$p_lan" ]]; then
+                            local IFS_BAK="$IFS"; IFS=','
+                            for cidr in $p_lan; do
+                                cidr=$(echo "$cidr" | xargs)
+                                [[ -n "$cidr" ]] && uci_peers_cmds+="uci add_list network.${peer_section}.allowed_ips='${cidr}'
+"
+                            done
+                            IFS="$IFS_BAK"
+                        fi
+                        uci_peers_cmds+="uci set network.${peer_section}.route_allowed_ips='1'
+uci set network.${peer_section}.persistent_keepalive='25'
+"
+                        peer_idx=$((peer_idx+1))
+                    fi
+                    pi=$((pi+1))
+                done
+
+                ssh $ssh_opts "${ssh_user}@${ssh_host}" "
+                    uci delete network.wg0 2>/dev/null; true
+                    while uci -q get network.@wireguard_wg0[0] >/dev/null 2>&1; do
+                        uci delete network.@wireguard_wg0[0] 2>/dev/null; true
+                    done
+                    uci set network.wg0=interface
+                    uci set network.wg0.proto='wireguard'
+                    uci set network.wg0.private_key='${target_privkey}'
+                    uci set network.wg0.listen_port='${node_port_db:-${server_port}}'
+                    uci delete network.wg0.addresses 2>/dev/null; true
+                    uci add_list network.wg0.addresses='${node_ip}/${mask}'
+                    ${uci_peers_cmds}
+                    uci commit network
+                    ifdown wg0 2>/dev/null; true
+                    /etc/init.d/network reload 2>/dev/null
+                    sleep 2
+                    ifup wg0 2>/dev/null
+                " 2>/dev/null && sync_ok="true" || print_error "${name}: uci 配置失败"
+                # wg0.conf 备份（方便私钥读取）
+                local tmp_conf=$(mktemp)
+                cat > "$tmp_conf" << WGCONF_EOF
+[Interface]
+PrivateKey = ${target_privkey}
+Address = ${node_ip}/${mask}
+ListenPort = ${node_port_db:-${server_port}}
+$(printf '%b' "$peers_block")
+WGCONF_EOF
+                scp ${_cm:+-o ControlPath=${_cm}} -P "${ssh_port}" -o StrictHostKeyChecking=accept-new \
+                    "$tmp_conf" "${ssh_user}@${ssh_host}:/etc/wireguard/wg0.conf" 2>/dev/null || true
+            else
+                # ── 标准 Linux: wg-quick 配置 ──
+                local tmp_conf=$(mktemp)
+                cat > "$tmp_conf" << WGCONF_EOF
 [Interface]
 PrivateKey = ${target_privkey}
 Address = ${node_ip}/${mask}
@@ -5674,14 +5762,30 @@ PostUp = IFACE=\$(ip route show default | awk '{print \$5; exit}'); iptables -I 
 PostDown = IFACE=\$(ip route show default | awk '{print \$5; exit}'); iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -s ${server_subnet} -o \$IFACE -j MASQUERADE
 $(printf '%b' "$peers_block")
 WGCONF_EOF
-            if scp ${_cm:+-o ControlPath=${_cm}} -P "${ssh_port}" -o StrictHostKeyChecking=accept-new "$tmp_conf" \
-                "${ssh_user}@${ssh_host}:/etc/wireguard/wg0.conf" 2>/dev/null; then
+                if scp ${_cm:+-o ControlPath=${_cm}} -P "${ssh_port}" -o StrictHostKeyChecking=accept-new "$tmp_conf" \
+                    "${ssh_user}@${ssh_host}:/etc/wireguard/wg0.conf" 2>/dev/null; then
+                    ssh $ssh_opts "${ssh_user}@${ssh_host}" "
+                        chmod 600 /etc/wireguard/wg0.conf
+                        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+                        grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+                        if ip link show wg0 &>/dev/null; then
+                            wg-quick down wg0 2>/dev/null
+                            wg-quick up wg0 2>/dev/null
+                        else
+                            wg-quick up wg0 2>/dev/null
+                            systemctl enable wg-quick@wg0 2>/dev/null || true
+                        fi
+                    " 2>/dev/null && sync_ok="true"
+                else
+                    print_error "${name}: SCP 上传失败"
+                fi
+            fi
 
-                # 构建目标节点的 cluster.nodes（包含本机 + 除目标自己以外的所有其他节点）
+            # ── 同步数据库到节点（两种路径通用）──
+            if [[ "$sync_ok" == "true" ]]; then
                 local target_cluster_nodes
                 target_cluster_nodes=$(wg_db_get --arg skip_name "$name" \
                     '[.cluster.nodes[] | select(.name != $skip_name)]')
-                # 加入本机信息（含本机公钥）
                 local my_node_json
                 my_node_json=$(jq -n \
                     --arg name "$(hostname -s)" \
@@ -5695,7 +5799,6 @@ WGCONF_EOF
                     '{name:$name, endpoint:$ep, port:$port, ip:$ip, public_key:$pubkey, ssh_host:$ssh_host, ssh_port:$ssh_port, ssh_user:$ssh_user}')
                 target_cluster_nodes=$(echo "$target_cluster_nodes" | jq --argjson me "$my_node_json" '. + [$me]')
 
-                # 同步完整数据库到节点（使用节点自己的密钥对）
                 local backup_db_content
                 backup_db_content=$(jq -n \
                     --arg role "server" \
@@ -5729,29 +5832,13 @@ WGCONF_EOF
                     }')
                 local tmp_db=$(mktemp)
                 echo "$backup_db_content" > "$tmp_db"
-                # 先创建数据库目录
                 ssh $ssh_opts "${ssh_user}@${ssh_host}" "mkdir -p /etc/wireguard/db" 2>/dev/null || true
                 scp ${_cm:+-o ControlPath=${_cm}} -P "${ssh_port}" -o StrictHostKeyChecking=accept-new \
                     "$tmp_db" "${ssh_user}@${ssh_host}:/etc/wireguard/db/wg-data.json" 2>/dev/null || \
                     print_warn "${name}: 数据库同步失败 (不影响运行)"
+                ssh $ssh_opts "${ssh_user}@${ssh_host}" "chmod 600 /etc/wireguard/db/wg-data.json 2>/dev/null || true" 2>/dev/null
                 rm -f "$tmp_db"
-
-                ssh $ssh_opts "${ssh_user}@${ssh_host}" "
-                    chmod 600 /etc/wireguard/wg0.conf
-                    chmod 600 /etc/wireguard/db/wg-data.json 2>/dev/null || true
-                    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-                    grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-                    if ip link show wg0 &>/dev/null; then
-                        wg-quick down wg0 2>/dev/null
-                        wg-quick up wg0 2>/dev/null
-                    else
-                        wg-quick up wg0 2>/dev/null
-                        systemctl enable wg-quick@wg0 2>/dev/null || true
-                    fi
-                " 2>/dev/null
                 print_success "${name}: 同步成功 (配置+数据库+集群信息)"
-            else
-                print_error "${name}: SCP 上传失败"
             fi
         else
             print_error "${name}: SSH 连接失败"
@@ -8880,9 +8967,10 @@ WGCONF_EOF
               --arg ssh_host "$node_ssh_host" \
               --argjson ssh_port "$node_ssh_port" \
               --arg ssh_user "$node_ssh_user" \
+              --arg os "${remote_os:-}" \
     '.cluster.enabled = true | .cluster.nodes += [{
         name: $name, endpoint: $ep, port: $port, ip: $ip, public_key: $pubkey,
-        ssh_host: $ssh_host, ssh_port: $ssh_port, ssh_user: $ssh_user
+        ssh_host: $ssh_host, ssh_port: $ssh_port, ssh_user: $ssh_user, os: $os
     }]'
     if [[ "$do_mesh" == "true" && -n "${node_lan:-}" ]]; then
         local ni=$(wg_db_get '.cluster.nodes | length')
